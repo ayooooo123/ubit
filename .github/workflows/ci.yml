@@ -1,9 +1,13 @@
-name: Build & Verify (macOS + Linux x86_64 & arm64)
+name: Build, Verify & Release (macOS + Linux + Termux/Android)
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
+
+permissions:
+  contents: write
 
 jobs:
   macos-arm64:
@@ -17,43 +21,79 @@ jobs:
           ./dist/ubit version
           ./dist/ubit --llms
           ./dist/ubit sites --json
+      - name: Upload macOS release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: darwin-bundle
+          path: dist/ubit-*-darwin-arm64.tar.gz
 
-  linux:
+  linux-and-android:
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
-      - name: Install aarch64 cross-compiler
-        run: sudo apt-get update && sudo apt-get install -y g++-aarch64-linux-gnu file
-      - name: Build Linux amd64 and arm64 archives
+      - name: Install aarch64 cross-compiler & binutils
+        run: sudo apt-get update && sudo apt-get install -y g++-aarch64-linux-gnu file binutils
+      - name: Build Linux (amd64, arm64) and Android/Termux (android-arm64) archives
         run: ./linux/build_linux.sh
-      - name: Verify Linux amd64 CLI & Agent Contract
+      - name: Verify Linux amd64 & Android Bionic ELF linkage
         run: |
-          mkdir -p /tmp/test-amd64
-          tar -xzf dist/ubit-0.3.1-linux-amd64.tar.gz -C /tmp/test-amd64
-          ldd /tmp/test-amd64/ubit
+          mkdir -p /tmp/test-amd64 /tmp/test-android
+          tar -xzf dist/ubit-*-linux-amd64.tar.gz -C /tmp/test-amd64
+          tar -xzf dist/ubit-*-android-arm64.tar.gz -C /tmp/test-android
+          file /tmp/test-amd64/ubit /tmp/test-android/ubit
+          readelf -d /tmp/test-android/ubit | grep NEEDED
+          ! readelf -d /tmp/test-android/ubit | grep -q 'libc++_shared'
           /tmp/test-amd64/ubit version
           /tmp/test-amd64/ubit --llms
           /tmp/test-amd64/ubit sites --json
-      - name: Upload Linux release archives
+      - name: Upload Linux & Android release archives
         uses: actions/upload-artifact@v4
         with:
-          name: linux-bundles
-          path: dist/ubit-*-linux-*.tar.gz
+          name: linux-and-android-bundles
+          path: |
+            dist/ubit-*-linux-*.tar.gz
+            dist/ubit-*-android-arm64.tar.gz
 
   linux-arm64-verify:
-    needs: linux
+    needs: linux-and-android
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: linux-bundles
+          name: linux-and-android-bundles
           path: dist
       - name: Verify native Linux arm64 binary
         run: |
           mkdir -p /tmp/test-arm64
-          tar -xzf dist/ubit-0.3.1-linux-arm64.tar.gz -C /tmp/test-arm64
+          tar -xzf dist/ubit-*-linux-arm64.tar.gz -C /tmp/test-arm64
           uname -m
           ldd /tmp/test-arm64/ubit
           /tmp/test-arm64/ubit version
-          /tmp/test-arm64/ubit --llms | head -n 15
           /tmp/test-arm64/ubit sites --json
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [macos-arm64, linux-and-android, linux-arm64-verify]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: darwin-bundle
+          path: release-assets
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-and-android-bundles
+          path: release-assets
+      - name: Generate SHA256SUMS and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cp install.sh release-assets/install.sh
+          (cd release-assets && sha256sum ubit-*.tar.gz > SHA256SUMS && cat SHA256SUMS)
+          TAG="${GITHUB_REF_NAME}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" release-assets/* --title "uBit $TAG" --generate-notes
+          fi

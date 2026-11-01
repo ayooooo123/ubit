@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installs uBit on macOS (arm64) and Linux (x86_64 / amd64 & aarch64 / arm64) without requiring root.
+# Installs uBit on macOS (arm64), Linux (x86_64 & arm64), and Android / Termux (arm64) without requiring root.
 #
 #   curl -fsSL https://github.com/ayooooo123/ubit/releases/latest/download/install.sh | sh
 set -eu
@@ -11,7 +11,7 @@ BASE_URL="${UBIT_DOWNLOAD_URL:-https://github.com/$REPO/releases/latest/download
 OS="$(uname -s)"
 ARCH_RAW="$(uname -m)"
 
-WORK="$(mktemp -d)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/ubit-install.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 verify_sha256() {
@@ -29,6 +29,33 @@ verify_sha256() {
   fi
 }
 
+# 1. Android / Termux (Bionic arm64)
+if [ -n "${TERMUX_VERSION:-}" ] || [ "$(uname -o 2>/dev/null || true)" = "Android" ] || [ -d "/data/data/com.termux/files/usr" ]; then
+  case "$ARCH_RAW" in
+    aarch64|arm64) ;;
+    *) echo "install.sh: prebuilt Termux/Android release targets arm64 ($ARCH_RAW detected)" >&2; exit 1 ;;
+  esac
+
+  PREFIX_DIR="${PREFIX:-/data/data/com.termux/files/usr}"
+  if command -v pkg >/dev/null 2>&1 && [ ! -e "$PREFIX_DIR/lib/libssl.so.3" ] && [ ! -e "$PREFIX_DIR/lib/libssl.so" ]; then
+    echo "▸ Installing OpenSSL runtime in Termux…"
+    pkg install -y openssl
+  fi
+
+  ARCHIVE="ubit-${VERSION}-android-arm64.tar.gz"
+  echo "▸ Downloading uBit ${VERSION} (Termux / Android arm64)…"
+  curl -fsSL "${BASE_URL}/${ARCHIVE}" -o "$WORK/$ARCHIVE"
+  verify_sha256 "$ARCHIVE"
+
+  tar -xzf "$WORK/$ARCHIVE" -C "$WORK"
+  mkdir -p "$PREFIX_DIR/bin"
+  install -m 0755 "$WORK/ubit" "$PREFIX_DIR/bin/ubit"
+  echo "✓ Installed $PREFIX_DIR/bin/ubit"
+  echo "  Tip: run 'termux-setup-storage' so uBit saves directly into ~/storage/downloads."
+  exit 0
+fi
+
+# 2. macOS (arm64)
 if [ "$OS" = "Darwin" ]; then
   if [ "$ARCH_RAW" = "x86_64" ] && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ]; then
     ARCH_RAW="arm64"
@@ -58,6 +85,7 @@ if [ "$OS" = "Darwin" ]; then
   exit 0
 fi
 
+# 3. Standard Linux (x86_64 & arm64 glibc)
 if [ "$OS" = "Linux" ]; then
   case "$ARCH_RAW" in
     x86_64|amd64) TARGET_ARCH="amd64" ;;

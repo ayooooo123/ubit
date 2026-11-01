@@ -240,8 +240,10 @@ struct SectionRange {
 
 struct AppPaths {
     static fs::path home_dir() {
-        const char* h = std::getenv("HOME");
-        return fs::path(h && *h ? h : "/tmp");
+        if (const char* h = std::getenv("HOME"); h && *h) return fs::path(h);
+        if (fs::exists("/data/data/com.termux/files/home")) return "/data/data/com.termux/files/home";
+        if (const char* t = std::getenv("TMPDIR"); t && *t) return fs::path(t);
+        return "/tmp";
     }
     static fs::path config_dir() {
         if (const char* custom = std::getenv("UBIT_CONFIG_DIR"); custom && *custom) return fs::path(custom);
@@ -249,6 +251,9 @@ struct AppPaths {
         return home_dir() / ".config" / "uBit";
     }
     static fs::path downloads_dir() {
+        fs::path termux_dl = home_dir() / "storage" / "downloads";
+        if (fs::exists(termux_dl)) return termux_dl;
+        if (::access("/sdcard/Download", W_OK) == 0) return "/sdcard/Download";
         fs::path d = home_dir() / "Downloads";
         return fs::exists(d) ? d : home_dir();
     }

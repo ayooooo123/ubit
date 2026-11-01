@@ -6,7 +6,7 @@ Download video and audio from the web — a **~1 MB** native desktop app and **a
 
 ---
 
-## Install (macOS Apple Silicon + Linux `x86_64` & `arm64`)
+## Install (macOS Apple Silicon + Linux `x86_64` & `arm64` + Termux / Android `arm64`)
 
 ```sh
 curl -fsSL https://github.com/ayooooo123/ubit/releases/latest/download/install.sh | sh
@@ -27,6 +27,7 @@ npx skills add https://github.com/ayooooo123/ubit
 | macOS `arm64` executable / `.tar.gz` | 17.45 MB / 8.06 MB | **1.62 MB / 869 KB (9.3× smaller)** |
 | Linux `x86_64` (`amd64`) binary / `.tar.gz` | ~18 MB / 8.20 MB | **952 KB / 391 KB (20.9× smaller)** |
 | Linux `arm64` (`aarch64`) binary / `.tar.gz` | ~17 MB / 7.50 MB | **915 KB / 375 KB (20.0× smaller)** |
+| Termux / Android `arm64` Bionic / `.tar.gz` | *(Not supported)* | **935 KB / 381 KB (`libc.so` + `libm.so` + `libdl.so` only)** |
 | Linux dynamic runtime linkage (`ldd`) | Go runtime + WebKitGTK | **`libc.so.6` + `libm.so.6` only (`dlopen` TLS/zlib)** |
 | Embedded JS AST parser bloat | 158.5 KB (`yt-dlp/ejs`) | **0 B** |
 | CLI downloading (`get`) | $19 Pro paywall | **Free & unlocked** |

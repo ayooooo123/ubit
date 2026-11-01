@@ -86,23 +86,26 @@ struct DynRuntime {
         return inst;
     }
 
-    DynRuntime() {
-        void* h_crypto = nullptr;
-        for (const char* name : {"libcrypto.so.3", "libcrypto.so.1.1", "libcrypto.so"}) {
-            h_crypto = dlopen(name, RTLD_LAZY | RTLD_GLOBAL);
-            if (h_crypto) break;
+    static void* dlopen_any(std::initializer_list<const char*> names, int flags) {
+        std::vector<std::string> prefixes = {""};
+        if (const char* pfx = std::getenv("PREFIX"); pfx && *pfx) {
+            prefixes.push_back(std::string(pfx) + "/lib/");
         }
-        void* h_ssl = nullptr;
-        for (const char* name : {"libssl.so.3", "libssl.so.1.1", "libssl.so"}) {
-            h_ssl = dlopen(name, RTLD_LAZY | RTLD_GLOBAL);
-            if (h_ssl) break;
+        prefixes.push_back("/data/data/com.termux/files/usr/lib/");
+        prefixes.push_back("/system/lib64/");
+        for (const auto& pre : prefixes) {
+            for (const char* n : names) {
+                std::string full = pre + n;
+                if (void* h = dlopen(full.c_str(), flags)) return h;
+            }
         }
-        void* h_z = nullptr;
-        for (const char* name : {"libz.so.1", "libz.so"}) {
-            h_z = dlopen(name, RTLD_LAZY | RTLD_LOCAL);
-            if (h_z) break;
-        }
+        return nullptr;
+    }
 
+    DynRuntime() {
+        void* h_crypto = dlopen_any({"libcrypto.so.3", "libcrypto.so.1.1", "libcrypto.so"}, RTLD_LAZY | RTLD_GLOBAL);
+        void* h_ssl    = dlopen_any({"libssl.so.3", "libssl.so.1.1", "libssl.so"}, RTLD_LAZY | RTLD_GLOBAL);
+        void* h_z      = dlopen_any({"libz.so.1", "libz.so"}, RTLD_LAZY | RTLD_LOCAL);
         if (h_ssl) {
             TLS_client_method_fn = (decltype(TLS_client_method_fn))dlsym(h_ssl, "TLS_client_method");
             if (!TLS_client_method_fn) TLS_client_method_fn = (decltype(TLS_client_method_fn))dlsym(h_ssl, "SSLv23_client_method");

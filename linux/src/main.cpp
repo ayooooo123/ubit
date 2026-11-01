@@ -500,6 +500,11 @@ setInterval(refresh,800);refresh();
     // Launch native desktop window (chromeless --app= or xdg-open)
     std::thread([app_url]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        if (std::system("command -v termux-open-url >/dev/null 2>&1") == 0) {
+            std::string cmd = "termux-open-url \"" + app_url + "\" >/dev/null 2>&1 &";
+            (void)std::system(cmd.c_str());
+            return;
+        }
         const char* browsers[] = {"chromium", "chromium-browser", "google-chrome", "brave-browser", "microsoft-edge"};
         for (const char* b : browsers) {
             std::string check = "command -v " + std::string(b) + " >/dev/null 2>&1";

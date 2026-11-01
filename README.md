@@ -1,12 +1,12 @@
 # uBit (`ubit` / `uBit.app`)
 
-Download video and audio from the web — a **1.6 MB** native macOS app and an **agent-ready CLI** in one pure-Swift binary. No Python, no `yt-dlp`, no FFmpeg required, and zero Pro paywalls.
+Download video and audio from the web — a **~1 MB** native desktop app and **agent-ready CLI** for **macOS (`arm64`)** and **Linux (`x86_64` & `arm64`)**. No Python, no `yt-dlp`, no FFmpeg required for MP4/M4A, and zero Pro paywalls.
 
 - **[Agent & Automation Docs (`docs/agents.md`)](docs/agents.md)** · **[Agent Skill (`skills/ubit/SKILL.md`)](skills/ubit/SKILL.md)** · **[`llms.txt`](llms.txt)** · **[Architecture (`AGENTS.md`)](AGENTS.md)**
 
 ---
 
-## Install (macOS Apple Silicon)
+## Install (macOS Apple Silicon + Linux `x86_64` & `arm64`)
 
 ```sh
 curl -fsSL https://github.com/ayooooo123/ubit/releases/latest/download/install.sh | sh
@@ -20,15 +20,15 @@ npx skills add https://github.com/ayooooo123/ubit
 
 ---
 
-## Size & Capability Comparison vs. Downbit 0.2.4 (`arm64`)
+## Size & Capability Comparison vs. Downbit 0.2.4
 
-| Metric / Capability | Downbit 0.2.4 (`arm64`) | uBit 0.3.0 (`arm64`) |
+| Metric / Capability | Downbit 0.2.4 | uBit 0.3.1 |
 | --- | ---: | ---: |
-| Main executable (`Contents/MacOS/*`) | 17,450,944 B (17.45 MB) | **1,615,360 B (1.62 MB — 10.8× smaller)** |
-| Unpacked `.app` bundle | 18.02 MB | **1.60 MiB (11.2× smaller)** |
-| Release `.tar.gz` archive | 8,055,425 B (8.06 MB) | **~883 KB (9.1× smaller)** |
-| Embedded JS AST parser bloat | 158.5 KB (`yt-dlp/ejs`) | **0 B (native `JavaScriptCore`)** |
-| App icon (`AppIcon.icns`) | 947 KB | **60 KB (programmatic vector)** |
+| macOS `arm64` executable / `.tar.gz` | 17.45 MB / 8.06 MB | **1.62 MB / 869 KB (9.3× smaller)** |
+| Linux `x86_64` (`amd64`) binary / `.tar.gz` | ~18 MB / 8.20 MB | **952 KB / 391 KB (20.9× smaller)** |
+| Linux `arm64` (`aarch64`) binary / `.tar.gz` | ~17 MB / 7.50 MB | **915 KB / 375 KB (20.0× smaller)** |
+| Linux dynamic runtime linkage (`ldd`) | Go runtime + WebKitGTK | **`libc.so.6` + `libm.so.6` only (`dlopen` TLS/zlib)** |
+| Embedded JS AST parser bloat | 158.5 KB (`yt-dlp/ejs`) | **0 B** |
 | CLI downloading (`get`) | $19 Pro paywall | **Free & unlocked** |
 | Max concurrent downloads / connections | 2 / 4 (Free), 8 / 16 (Pro) | **16 / 32 + dynamic work-stealing** |
 | Keyframe section trimming (`--section`) | $19 Pro paywall | **Free (`sidx` byte-range fast cut)** |

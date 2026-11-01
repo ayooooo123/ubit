@@ -7,7 +7,7 @@ on:
 
 jobs:
   macos-arm64:
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Compile macOS uBit.app and CLI
@@ -28,10 +28,8 @@ jobs:
         run: ./linux/build_linux.sh
       - name: Verify Linux amd64 CLI & Agent Contract
         run: |
-          mkdir -p /tmp/test-amd64 /tmp/test-arm64
+          mkdir -p /tmp/test-amd64
           tar -xzf dist/ubit-0.3.1-linux-amd64.tar.gz -C /tmp/test-amd64
-          tar -xzf dist/ubit-0.3.1-linux-arm64.tar.gz -C /tmp/test-arm64
-          file /tmp/test-amd64/ubit /tmp/test-arm64/ubit
           ldd /tmp/test-amd64/ubit
           /tmp/test-amd64/ubit version
           /tmp/test-amd64/ubit --llms
@@ -41,3 +39,21 @@ jobs:
         with:
           name: linux-bundles
           path: dist/ubit-*-linux-*.tar.gz
+
+  linux-arm64-verify:
+    needs: linux
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-bundles
+          path: dist
+      - name: Verify native Linux arm64 binary
+        run: |
+          mkdir -p /tmp/test-arm64
+          tar -xzf dist/ubit-0.3.1-linux-arm64.tar.gz -C /tmp/test-arm64
+          uname -m
+          ldd /tmp/test-arm64/ubit
+          /tmp/test-arm64/ubit version
+          /tmp/test-arm64/ubit --llms | head -n 15
+          /tmp/test-arm64/ubit sites --json

@@ -12,7 +12,7 @@ namespace ubit {
 
 namespace fs = std::filesystem;
 
-inline constexpr const char* UBIT_VERSION = "0.3.1";
+inline constexpr const char* UBIT_VERSION = "0.3.2";
 
 struct ByteRange {
     int64_t start = 0;

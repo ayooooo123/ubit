@@ -5,7 +5,7 @@ set -eu
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 LSRC="$ROOT/linux/src/main.cpp"
 DIST="$ROOT/dist"
-VERSION="0.3.1"
+VERSION="0.3.2"
 
 mkdir -p "$DIST"
 

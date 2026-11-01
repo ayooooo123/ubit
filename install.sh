@@ -5,7 +5,7 @@
 set -eu
 
 REPO="ayooooo123/ubit"
-VERSION="${UBIT_VERSION:-0.3.1}"
+VERSION="${UBIT_VERSION:-0.3.2}"
 BASE_URL="${UBIT_DOWNLOAD_URL:-https://github.com/$REPO/releases/latest/download}"
 
 OS="$(uname -s)"
@@ -30,7 +30,7 @@ verify_sha256() {
 }
 
 # 1. Android / Termux (Bionic arm64)
-if [ -n "${TERMUX_VERSION:-}" ] || [ "$(uname -o 2>/dev/null || true)" = "Android" ] || [ -d "/data/data/com.termux/files/usr" ]; then
+if [ -n "${TERMUX_VERSION:-}" ] || [ "$(uname -o 2>/dev/null || true)" = "Android" ] || [ -d "/data/data/com.termux/files/usr" ] || { [ -e "/system/bin/linker64" ] && [ ! -e "/lib/ld-linux-aarch64.so.1" ]; }; then
   case "$ARCH_RAW" in
     aarch64|arm64) ;;
     *) echo "install.sh: prebuilt Termux/Android release targets arm64 ($ARCH_RAW detected)" >&2; exit 1 ;;
@@ -48,10 +48,20 @@ if [ -n "${TERMUX_VERSION:-}" ] || [ "$(uname -o 2>/dev/null || true)" = "Androi
   verify_sha256 "$ARCHIVE"
 
   tar -xzf "$WORK/$ARCHIVE" -C "$WORK"
-  mkdir -p "$PREFIX_DIR/bin"
-  install -m 0755 "$WORK/ubit" "$PREFIX_DIR/bin/ubit"
-  echo "✓ Installed $PREFIX_DIR/bin/ubit"
-  echo "  Tip: run 'termux-setup-storage' so uBit saves directly into ~/storage/downloads."
+  if [ -d "$PREFIX_DIR" ] && { [ -w "$PREFIX_DIR/bin" ] || mkdir -p "$PREFIX_DIR/bin" 2>/dev/null; }; then
+    install -m 0755 "$WORK/ubit" "$PREFIX_DIR/bin/ubit"
+    echo "✓ Installed $PREFIX_DIR/bin/ubit"
+    # Remove or replace any stale glibc binary in ~/.local/bin/ubit that would shadow $PREFIX/bin/ubit on PATH
+    if [ -e "$HOME/.local/bin/ubit" ] || [ -L "$HOME/.local/bin/ubit" ]; then
+      ln -sf "$PREFIX_DIR/bin/ubit" "$HOME/.local/bin/ubit"
+      echo "✓ Updated $HOME/.local/bin/ubit -> $PREFIX_DIR/bin/ubit"
+    fi
+  else
+    mkdir -p "$HOME/.local/bin"
+    install -m 0755 "$WORK/ubit" "$HOME/.local/bin/ubit"
+    echo "✓ Installed $HOME/.local/bin/ubit"
+  fi
+  echo "  Tip: run 'hash -r' in your current shell if needed, and 'termux-setup-storage' to save into ~/storage/downloads."
   exit 0
 fi
 

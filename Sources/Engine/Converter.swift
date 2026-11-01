@@ -135,7 +135,16 @@ public enum MediaConverter {
         if FileManager.default.fileExists(atPath: outputURL.path) {
             try FileManager.default.removeItem(at: outputURL)
         }
-        try await session.export(to: outputURL, as: fileType)
+        if #available(macOS 15.0, *) {
+            try await session.export(to: outputURL, as: fileType)
+        } else {
+            session.outputURL = outputURL
+            session.outputFileType = fileType
+            await withCheckedContinuation { cont in
+                session.exportAsynchronously { cont.resume() }
+            }
+            if let err = session.error { throw err }
+        }
     }
 
     private static func decodeAndEncodeNativeAudio(inputURL: URL, outputURL: URL, format: String) async throws {

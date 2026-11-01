@@ -30,11 +30,11 @@ public final class ThumbnailCache: ObservableObject {
                 }
                 try? AppPaths.ensureAppSupport()
                 try? jpg.write(to: diskFile, options: .atomic)
-                if let img = NSImage(data: jpg) {
-                    await MainActor.run {
+                await MainActor.run {
+                    if let img = NSImage(data: jpg) {
                         self.mem[urlString] = img
-                        self.inFlight.remove(urlString)
                     }
+                    self.inFlight.remove(urlString)
                 }
             }
         }

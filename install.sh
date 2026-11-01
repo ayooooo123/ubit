@@ -1,5 +1,5 @@
 #!/bin/sh
-# Installs uBit.app and the `ubit` CLI on macOS (arm64) without requiring root.
+# Installs uBit on macOS (arm64) and Linux (x86_64 / amd64 & aarch64 / arm64) without requiring root.
 #
 #   curl -fsSL https://github.com/ayooooo123/ubit/releases/latest/download/install.sh | sh
 set -eu
@@ -8,47 +8,86 @@ REPO="ayooooo123/ubit"
 VERSION="${UBIT_VERSION:-0.3.1}"
 BASE_URL="${UBIT_DOWNLOAD_URL:-https://github.com/$REPO/releases/latest/download}"
 
-[ "$(uname -s)" = "Darwin" ] || { echo "install.sh: uBit requires macOS" >&2; exit 1; }
-ARCH="$(uname -m)"
-if [ "$ARCH" = "x86_64" ] && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ]; then
-  ARCH="arm64"
-fi
-[ "$ARCH" = "arm64" ] || { echo "install.sh: prebuilt release targets Apple Silicon (arm64); run ./build.sh from source" >&2; exit 1; }
+OS="$(uname -s)"
+ARCH_RAW="$(uname -m)"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-ARCHIVE="ubit-${VERSION}-darwin-arm64.tar.gz"
-echo "▸ Downloading uBit ${VERSION}…"
-curl -fsSL "${BASE_URL}/${ARCHIVE}" -o "$WORK/$ARCHIVE"
-
-if curl -fsSL "${BASE_URL}/SHA256SUMS" -o "$WORK/SHA256SUMS" 2>/dev/null; then
-  EXPECTED="$(awk -v f="$ARCHIVE" '$2 == f { print $1 }' "$WORK/SHA256SUMS")"
-  if [ -n "$EXPECTED" ]; then
-    ACTUAL="$(shasum -a 256 "$WORK/$ARCHIVE" | awk '{ print $1 }')"
-    [ "$EXPECTED" = "$ACTUAL" ] || { echo "install.sh: SHA-256 mismatch for $ARCHIVE" >&2; exit 1; }
+verify_sha256() {
+  FILE_NAME="$1"
+  if curl -fsSL "${BASE_URL}/SHA256SUMS" -o "$WORK/SHA256SUMS" 2>/dev/null; then
+    EXPECTED="$(awk -v f="$FILE_NAME" '$2 == f { print $1 }' "$WORK/SHA256SUMS")"
+    if [ -n "$EXPECTED" ]; then
+      if command -v sha256sum >/dev/null 2>&1; then
+        ACTUAL="$(sha256sum "$WORK/$FILE_NAME" | awk '{ print $1 }')"
+      else
+        ACTUAL="$(shasum -a 256 "$WORK/$FILE_NAME" | awk '{ print $1 }')"
+      fi
+      [ "$EXPECTED" = "$ACTUAL" ] || { echo "install.sh: SHA-256 mismatch for $FILE_NAME" >&2; exit 1; }
+    fi
   fi
+}
+
+if [ "$OS" = "Darwin" ]; then
+  if [ "$ARCH_RAW" = "x86_64" ] && [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || echo 0)" = "1" ]; then
+    ARCH_RAW="arm64"
+  fi
+  [ "$ARCH_RAW" = "arm64" ] || { echo "install.sh: prebuilt macOS release targets arm64; run ./build.sh from source" >&2; exit 1; }
+  ARCHIVE="ubit-${VERSION}-darwin-arm64.tar.gz"
+  echo "▸ Downloading uBit ${VERSION} (macOS arm64)…"
+  curl -fsSL "${BASE_URL}/${ARCHIVE}" -o "$WORK/$ARCHIVE"
+  verify_sha256 "$ARCHIVE"
+
+  if [ -w "/Applications" ]; then
+    APP_DIR="/Applications"
+  else
+    APP_DIR="$HOME/Applications"
+    mkdir -p "$APP_DIR"
+  fi
+  rm -rf "$APP_DIR/uBit.app"
+  tar -xzf "$WORK/$ARCHIVE" -C "$APP_DIR"
+  xattr -dr com.apple.quarantine "$APP_DIR/uBit.app" 2>/dev/null || true
+
+  if [ -w "/usr/local/bin" ]; then BIN_DIR="/usr/local/bin"
+  else BIN_DIR="$HOME/.local/bin"; mkdir -p "$BIN_DIR"; fi
+
+  ln -sf "$APP_DIR/uBit.app/Contents/MacOS/ubit" "$BIN_DIR/ubit"
+  echo "✓ Installed $APP_DIR/uBit.app"
+  echo "✓ Linked CLI at $BIN_DIR/ubit"
+  exit 0
 fi
 
-if [ -w "/Applications" ]; then
-  APP_DIR="/Applications"
-else
-  APP_DIR="$HOME/Applications"
-  mkdir -p "$APP_DIR"
+if [ "$OS" = "Linux" ]; then
+  case "$ARCH_RAW" in
+    x86_64|amd64) TARGET_ARCH="amd64" ;;
+    aarch64|arm64) TARGET_ARCH="arm64" ;;
+    *) echo "install.sh: unsupported Linux architecture $ARCH_RAW" >&2; exit 1 ;;
+  esac
+
+  ARCHIVE="ubit-${VERSION}-linux-${TARGET_ARCH}.tar.gz"
+  echo "▸ Downloading uBit ${VERSION} (Linux ${TARGET_ARCH})…"
+  curl -fsSL "${BASE_URL}/${ARCHIVE}" -o "$WORK/$ARCHIVE"
+  verify_sha256 "$ARCHIVE"
+
+  tar -xzf "$WORK/$ARCHIVE" -C "$WORK"
+
+  if [ "$(id -u)" != "0" ]; then
+    BIN_DIR="$HOME/.local/bin"
+    DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+    mkdir -p "$BIN_DIR" "$DATA_HOME/applications"
+    install -m 0755 "$WORK/ubit" "$BIN_DIR/ubit"
+    if [ -f "$WORK/ubit.desktop" ]; then
+      sed "s|^Exec=ubit|Exec=\"$BIN_DIR/ubit\"|" "$WORK/ubit.desktop" > "$DATA_HOME/applications/ubit.desktop"
+    fi
+    echo "✓ Installed $BIN_DIR/ubit"
+  else
+    install -m 0755 "$WORK/ubit" /usr/local/bin/ubit
+    echo "✓ Installed /usr/local/bin/ubit"
+  fi
+  echo "  Run 'ubit --llms' for agent docs or 'ubit' to open the desktop UI."
+  exit 0
 fi
 
-rm -rf "$APP_DIR/uBit.app"
-tar -xzf "$WORK/$ARCHIVE" -C "$APP_DIR"
-xattr -dr com.apple.quarantine "$APP_DIR/uBit.app" 2>/dev/null || true
-
-if [ -w "/usr/local/bin" ]; then
-  BIN_DIR="/usr/local/bin"
-else
-  BIN_DIR="$HOME/.local/bin"
-  mkdir -p "$BIN_DIR"
-fi
-
-ln -sf "$APP_DIR/uBit.app/Contents/MacOS/ubit" "$BIN_DIR/ubit"
-echo "✓ Installed $APP_DIR/uBit.app"
-echo "✓ Linked CLI at $BIN_DIR/ubit"
-echo "  Run 'ubit --llms' for agent docs or 'ubit' to open the app."
+echo "install.sh: unsupported OS $OS" >&2
+exit 1

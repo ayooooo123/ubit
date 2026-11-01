@@ -1,4 +1,4 @@
-name: Build & Verify (macOS arm64)
+name: Build & Verify (macOS + Linux x86_64 & arm64)
 
 on:
   push:
@@ -6,14 +6,38 @@ on:
   pull_request:
 
 jobs:
-  build:
+  macos-arm64:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
-      - name: Compile uBit.app and CLI
+      - name: Compile macOS uBit.app and CLI
         run: ./build.sh
       - name: Verify CLI & Agent Contract
         run: |
           ./dist/ubit version
           ./dist/ubit --llms
           ./dist/ubit sites --json
+
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install aarch64 cross-compiler
+        run: sudo apt-get update && sudo apt-get install -y g++-aarch64-linux-gnu file
+      - name: Build Linux amd64 and arm64 archives
+        run: ./linux/build_linux.sh
+      - name: Verify Linux amd64 CLI & Agent Contract
+        run: |
+          mkdir -p /tmp/test-amd64 /tmp/test-arm64
+          tar -xzf dist/ubit-0.3.1-linux-amd64.tar.gz -C /tmp/test-amd64
+          tar -xzf dist/ubit-0.3.1-linux-arm64.tar.gz -C /tmp/test-arm64
+          file /tmp/test-amd64/ubit /tmp/test-arm64/ubit
+          ldd /tmp/test-amd64/ubit
+          /tmp/test-amd64/ubit version
+          /tmp/test-amd64/ubit --llms
+          /tmp/test-amd64/ubit sites --json
+      - name: Upload Linux release archives
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-bundles
+          path: dist/ubit-*-linux-*.tar.gz

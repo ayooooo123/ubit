@@ -1,0 +1,19 @@
+# uBit (ubit)
+
+> Ultra-small (~1.6 MB binary, ~862 KB archive), zero-paywall native macOS (`arm64`) video & audio downloader app and CLI with structured `--json` NDJSON streaming, `sidx` byte-range section trimming, pure-Swift ISO-BMFF MP4/M4A + MPEG-TS muxing, native AudioToolbox WAV/FLAC/MOV conversion, 35+ site extractors, and a built-in WebKit media-sniffer browser.
+
+## Agent & LLM Documentation
+
+- [Agent & Automation CLI Guide](docs/agents.md): Complete `--json` NDJSON event schema, exit codes (`0`, `1`, `2`, `130`), `--quiet` path capture, `--section` byte-range clip trimming, zero-FFmpeg `.wav` ASR extraction, and `UBIT_CONFIG_DIR` sandbox isolation.
+- [Installable Agent Skill (`SKILL.md`)](skills/ubit/SKILL.md): Ready-to-use skill definition for Claude Code, Codex, OMP, and `npx skills add https://github.com/ayooooo123/ubit`.
+- [Contributor & Codebase Guide (`AGENTS.md`)](AGENTS.md): File layout, zero-dependency architecture invariants, two-pass `co64` MP4 muxer rules, and E2E verification commands.
+- [Project Overview (`README.md`)](README.md): Size benchmarks vs. Downbit 0.2.4, install one-liner, and interactive CLI/GUI usage.
+
+## Quick Commands for Agents
+
+```sh
+ubit --llms
+ubit info --json "<url>"
+ubit get -q 720 --section 0:30-1:00 --no-library --quiet -o /tmp "<url>"
+ubit get -a --to wav --no-library --quiet -o /tmp "<url>"
+```

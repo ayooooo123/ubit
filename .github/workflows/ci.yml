@@ -1,0 +1,19 @@
+name: Build & Verify (macOS arm64)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile uBit.app and CLI
+        run: ./build.sh
+      - name: Verify CLI & Agent Contract
+        run: |
+          ./dist/ubit version
+          ./dist/ubit --llms
+          ./dist/ubit sites --json

@@ -5,7 +5,7 @@
 set -eu
 
 REPO="ayooooo123/ubit"
-VERSION="${UBIT_VERSION:-0.3.0}"
+VERSION="${UBIT_VERSION:-0.3.1}"
 BASE_URL="${UBIT_DOWNLOAD_URL:-https://github.com/$REPO/releases/latest/download}"
 
 [ "$(uname -s)" = "Darwin" ] || { echo "install.sh: uBit requires macOS" >&2; exit 1; }

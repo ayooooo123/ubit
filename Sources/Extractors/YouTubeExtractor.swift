@@ -60,116 +60,193 @@ public struct YouTubeExtractor: SiteExtractor {
     // MARK: - Video Extraction (Multi-Client InnerTube + SAPISIDHASH Auth + JSC Cipher Fallback)
 
     private struct YTClientProfile {
+        let label: String
         let name: String
         let version: String
         let clientNameHeader: String
         let userAgent: String
         let extraFields: [String: Any]
         let supportsCookies: Bool
+        let requiresJS: Bool
     }
 
+    /// Primary 2026 client: Apple VisionOS (`VISIONOS` 1.02, ID 101) — requires NO GVS PO token on HTTPS, DASH, or HLS, and NO JS cipher!
+    private static let visionOSProfile = YTClientProfile(
+        label: "visionos",
+        name: "VISIONOS",
+        version: "1.02",
+        clientNameHeader: "101",
+        userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15",
+        extraFields: [
+            "deviceMake": "Apple",
+            "deviceModel": "RealityDevice17,1",
+            "osName": "visionOS",
+            "osVersion": "26.5.23O471",
+        ],
+        supportsCookies: false,
+        requiresJS: false
+    )
+
     private static let iosProfile = YTClientProfile(
+        label: "ios",
         name: "IOS",
-        version: "20.03.02",
+        version: "21.26.4",
         clientNameHeader: "5",
-        userAgent: "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)",
+        userAgent: "com.google.ios.youtube/21.26.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
         extraFields: [
             "deviceMake": "Apple",
             "deviceModel": "iPhone16,2",
             "osName": "iPhone",
-            "osVersion": "18.2.1.22C161",
+            "osVersion": "18.3.2.22D82",
         ],
-        supportsCookies: false
+        supportsCookies: false,
+        requiresJS: false
+    )
+
+    /// Signed-in & age-restricted fallback: Samsung Smart TV (`TVHTML5` UKS9800, ID 7) — zero GVS PO token + supports SAPISIDHASH cookies!
+    private static let tvSamsungProfile = YTClientProfile(
+        label: "tv_samsung",
+        name: "TVHTML5",
+        version: "5.20260707",
+        clientNameHeader: "7",
+        userAgent: "Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1",
+        extraFields: [
+            "deviceMake": "Samsung",
+            "deviceModel": "UKS9800",
+            "osName": "Tizen",
+            "osVersion": "2.4.0",
+        ],
+        supportsCookies: true,
+        requiresJS: true
     )
 
     private static let webProfile = YTClientProfile(
+        label: "web",
         name: "WEB",
-        version: "2.20260201.01.00",
+        version: "2.20261029.11.00",
         clientNameHeader: "1",
         userAgent: HTTPClient.defaultBrowserUA,
         extraFields: [:],
-        supportsCookies: true
+        supportsCookies: true,
+        requiresJS: true
     )
 
-    private static let tvEmbeddedProfile = YTClientProfile(
-        name: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-        version: "2.0",
-        clientNameHeader: "85",
-        userAgent: HTTPClient.defaultBrowserUA,
-        extraFields: [:],
-        supportsCookies: true
-    )
+    private struct WatchContext {
+        var visitorData: String?
+        var jsURL: String?
+        var sts: Int?
+        var playerResponse: [String: Any]?
+    }
+
+    private func fetchWatchContext(videoID: String, client: HTTPClient) async -> WatchContext {
+        var ctx = WatchContext()
+        if let (html, _) = try? await client.fetchText(
+            url: "https://www.youtube.com/watch?v=\(videoID)&bpctr=9999999999&has_verified=1",
+            headers: ["Accept-Language": "en-US,en;q=0.9"]
+        ) {
+            ctx.visitorData = ExtractorUtils.firstMatch("\"VISITOR_DATA\"\\s*:\\s*\"([^\"]+)\"", in: html)
+            if let jsRel = ExtractorUtils.firstMatch("\"jsUrl\"\\s*:\\s*\"([^\"]+base\\.js)\"", in: html) {
+                ctx.jsURL = jsRel.hasPrefix("http") ? jsRel : "https://www.youtube.com\(jsRel)"
+            }
+            ctx.sts = ExtractorUtils.firstMatch("\"signatureTimestamp\"\\s*:\\s*(\\d+)", in: html).flatMap(Int.init)
+            if let ipr = ExtractorUtils.extractJSONAfter("var ytInitialPlayerResponse =", in: html) as? [String: Any] {
+                ctx.playerResponse = ipr
+            }
+        }
+        if ctx.visitorData == nil,
+           let (sw, _) = try? await client.fetchText(url: "https://www.youtube.com/sw.js_data", includeCookies: false) {
+            ctx.visitorData = ExtractorUtils.firstMatch("\"(Cgt[A-Za-z0-9_-]{10,})\"", in: sw)
+        }
+        return ctx
+    }
+
+    /// Verifies that YouTube's GVS CDN actually serves bytes near the END of the stream (catching >1.5MB PO-token 403 traps).
+    private func verifyTailRangePlayable(url: String, contentLength: Int64?, userAgent: String, client: HTTPClient) async -> Bool {
+        let clen = contentLength ?? 0
+        let probeStart = clen > 131_072 ? (clen - 4096) : 0
+        let probeEnd = clen > 131_072 ? (clen - 1) : 2047
+        do {
+            let chunk = try await client.fetchRangeBytes(
+                url: url,
+                range: ByteRange(start: probeStart, end: probeEnd),
+                headers: ["User-Agent": userAgent]
+            )
+            return !chunk.isEmpty
+        } catch {
+            return false
+        }
+    }
 
     private func extractVideo(videoID: String, client: HTTPClient) async throws -> MediaInfo {
-        // Fetch IOS (direct unthrottled 4K60/H264/AV1/AAC/Opus URLs) and WEB (captions, chapters, signed-in fallback) concurrently!
-        async let iosRespTask = callPlayer(videoID: videoID, profile: Self.iosProfile, client: client, sts: nil)
-        async let webRespTask = callPlayer(videoID: videoID, profile: Self.webProfile, client: client, sts: nil)
+        let watchCtx = await fetchWatchContext(videoID: videoID, client: client)
 
-        let iosResp = try? await iosRespTask
-        let webResp = try? await webRespTask
+        // Honor YouTube pre-roll ad slot wait if requested (avoids transient 403 before stream activation)
+        if let adSlots = watchCtx.playerResponse?["adSlots"] as? [Any], !adSlots.isEmpty,
+           let adJSON = try? JSONSerialization.data(withJSONObject: adSlots),
+           let adStr = String(data: adJSON, encoding: .utf8),
+           let skipMsStr = ExtractorUtils.firstMatch("\"skipOffsetMilliseconds\"\\s*:\\s*\"?(\\d+)\"?", in: adStr),
+           let skipMs = Int(skipMsStr), skipMs > 0 {
+            let waitMs = min(4000, skipMs)
+            try? await Task.sleep(nanoseconds: UInt64(waitMs) * 1_000_000)
+        }
 
-        var primaryResp = iosResp
-        var status = (iosResp?["playabilityStatus"] as? [String: Any])?["status"] as? String ?? ""
+        let candidateProfiles: [YTClientProfile] = [
+            Self.visionOSProfile,
+            Self.tvSamsungProfile,
+            Self.iosProfile,
+            Self.webProfile,
+        ]
 
-        if status != "OK" || (iosResp?["streamingData"] == nil) {
-            if let wr = webResp, ((wr["playabilityStatus"] as? [String: Any])?["status"] as? String) == "OK", wr["streamingData"] != nil {
-                primaryResp = wr
-                status = "OK"
-            } else if let tvResp = try? await callPlayer(videoID: videoID, profile: Self.tvEmbeddedProfile, client: client, sts: nil),
-                      ((tvResp["playabilityStatus"] as? [String: Any])?["status"] as? String) == "OK" {
-                primaryResp = tvResp
-                status = "OK"
+        var chosenResp: [String: Any]?
+        var chosenFormats: [MediaFormat] = []
+        var chosenHLSManifest: String?
+        var chosenHLSUA: String = Self.visionOSProfile.userAgent
+        var cachedSolver: JSPlayerCipherSolver?
+        var loadedSolver = false
+        var lastReason: String?
+
+        for profile in candidateProfiles {
+            guard let resp = try? await callPlayer(
+                videoID: videoID,
+                profile: profile,
+                visitorData: watchCtx.visitorData,
+                sts: profile.requiresJS ? watchCtx.sts : nil,
+                client: client
+            ) else { continue }
+
+            let pStatus = (resp["playabilityStatus"] as? [String: Any])?["status"] as? String ?? ""
+            if pStatus != "OK" && resp["streamingData"] == nil {
+                if let r = (resp["playabilityStatus"] as? [String: Any])?["reason"] as? String {
+                    lastReason = r
+                }
+                continue
             }
-        }
+            guard let sd = resp["streamingData"] as? [String: Any] else { continue }
 
-        guard let resp = primaryResp else {
-            throw ExtractorError.notFound("YouTube player request failed for \(videoID).")
-        }
-
-        if status != "OK" && resp["streamingData"] == nil {
-            let reason = ((resp["playabilityStatus"] as? [String: Any])?["reason"] as? String) ?? "Unavailable"
-            if reason.lowercased().contains("sign in") {
-                throw ExtractorError.loginRequired("YouTube")
+            if chosenHLSManifest == nil, let hlsM = sd["hlsManifestUrl"] as? String {
+                chosenHLSManifest = hlsM
+                chosenHLSUA = profile.userAgent
             }
-            throw ExtractorError.notFound("YouTube: \(reason)")
-        }
 
-        let details = (resp["videoDetails"] as? [String: Any]) ?? (webResp?["videoDetails"] as? [String: Any]) ?? [:]
-        let micro = ((webResp?["microformat"] ?? resp["microformat"]) as? [String: Any])?["playerMicroformatRenderer"] as? [String: Any]
-
-        let title = (details["title"] as? String) ?? videoID
-        let author = (details["author"] as? String)
-        let description = (details["shortDescription"] as? String) ?? ((micro?["description"] as? [String: Any])?["simpleText"] as? String)
-        let duration = (details["lengthSeconds"] as? String).flatMap(Double.init)
-        let isLive = (details["isLiveContent"] as? Bool == true) && ((details["isLive"] as? Bool == true) || duration == 0)
-        let uploadDate = (micro?["publishDate"] as? String).map { String($0.prefix(10)) }
-        let thumb = "https://i.ytimg.com/vi/\(videoID)/maxresdefault.jpg"
-
-        var formats: [MediaFormat] = []
-        var usedProfileUA = (primaryResp as NSDictionary? === iosResp as NSDictionary?) ? Self.iosProfile.userAgent : Self.webProfile.userAgent
-        if primaryResp == nil { usedProfileUA = Self.iosProfile.userAgent }
-
-        if let sd = resp["streamingData"] as? [String: Any] {
             let rawFmts = ((sd["formats"] as? [[String: Any]]) ?? []) + ((sd["adaptiveFormats"] as? [[String: Any]]) ?? [])
-            var needsPlayerJS = false
-            for f in rawFmts where f["url"] == nil && (f["signatureCipher"] != nil || f["cipher"] != nil) {
-                needsPlayerJS = true; break
+            let hasCipher = rawFmts.contains { $0["url"] == nil && ($0["signatureCipher"] != nil || $0["cipher"] != nil) }
+            let needsJS = hasCipher || (profile.requiresJS && !rawFmts.isEmpty)
+
+            if needsJS && !loadedSolver {
+                loadedSolver = true
+                cachedSolver = try? await loadPlayerCipherSolver(videoID: videoID, knownJSURL: watchCtx.jsURL, client: client)
             }
 
-            var playerJSSolver: JSPlayerCipherSolver?
-            if needsPlayerJS {
-                playerJSSolver = try? await loadPlayerCipherSolver(videoID: videoID, client: client)
-            }
-
+            var parsed: [MediaFormat] = []
             for f in rawFmts {
                 guard let itag = f["itag"] as? Int else { continue }
                 var streamURL = f["url"] as? String
                 if streamURL == nil, let cipherStr = (f["signatureCipher"] as? String) ?? (f["cipher"] as? String),
-                   let solver = playerJSSolver {
+                   let solver = cachedSolver {
                     streamURL = solver.resolveCipher(cipherStr)
                 }
                 guard var finalStreamURL = streamURL, !finalStreamURL.isEmpty else { continue }
-                if let solver = playerJSSolver {
+                if let solver = cachedSolver {
                     finalStreamURL = solver.transformNParam(in: finalStreamURL)
                 }
 
@@ -195,7 +272,7 @@ public struct YouTubeExtractor: SiteExtractor {
                     idxR = ByteRange(start: s, end: e)
                 }
 
-                formats.append(MediaFormat(
+                parsed.append(MediaFormat(
                     id: String(itag),
                     url: finalStreamURL,
                     ext: ext,
@@ -209,16 +286,54 @@ public struct YouTubeExtractor: SiteExtractor {
                     filesize: clen,
                     audioSampleRate: (f["audioSampleRate"] as? String).flatMap(Int.init),
                     qualityLabel: qLabel,
-                    headers: ["User-Agent": usedProfileUA],
+                    headers: ["User-Agent": profile.userAgent],
                     initRange: initR,
                     indexRange: idxR
                 ))
             }
 
-            // Live stream or fallback HLS manifest
-            if (isLive || formats.isEmpty),
-               let hlsManifest = (sd["hlsManifestUrl"] as? String) ?? ((webResp?["streamingData"] as? [String: Any])?["hlsManifestUrl"] as? String) {
-                if let hlsFmts = try? await HLSEngine.extractFormats(client: client, playlistURL: hlsManifest, headers: ["User-Agent": usedProfileUA], idPrefix: "hls") {
+            // Pre-flight tail-range probe to reject partial-preview GVS PO-token 403 streams BEFORE downloading!
+            if let probeTarget = parsed.first(where: { ($0.filesize ?? 0) > 2_000_000 }) ?? parsed.first {
+                let playable = await verifyTailRangePlayable(
+                    url: probeTarget.url,
+                    contentLength: probeTarget.filesize,
+                    userAgent: profile.userAgent,
+                    client: client
+                )
+                if playable {
+                    chosenResp = resp
+                    chosenFormats = parsed
+                    break
+                }
+            } else if sd["hlsManifestUrl"] != nil {
+                chosenResp = resp
+                break
+            }
+        }
+
+        let metaResp = chosenResp ?? watchCtx.playerResponse
+        guard let resp = metaResp else {
+            throw ExtractorError.notFound("YouTube player request failed for \(videoID).")
+        }
+
+        let details = (resp["videoDetails"] as? [String: Any])
+            ?? (watchCtx.playerResponse?["videoDetails"] as? [String: Any])
+            ?? [:]
+        let micro = ((watchCtx.playerResponse?["microformat"] ?? resp["microformat"]) as? [String: Any])?["playerMicroformatRenderer"] as? [String: Any]
+
+        let title = (details["title"] as? String) ?? videoID
+        let author = (details["author"] as? String)
+        let description = (details["shortDescription"] as? String) ?? ((micro?["description"] as? [String: Any])?["simpleText"] as? String)
+        let duration = (details["lengthSeconds"] as? String).flatMap(Double.init)
+        let isLive = (details["isLiveContent"] as? Bool == true) && ((details["isLive"] as? Bool == true) || duration == 0)
+        let uploadDate = (micro?["publishDate"] as? String).map { String($0.prefix(10)) }
+        let thumb = "https://i.ytimg.com/vi/\(videoID)/maxresdefault.jpg"
+
+        var formats = chosenFormats
+        // Append HLS m3u8 variants (live streams, or resilient fallback if all HTTPS streams were gated)
+        if let hlsManifest = chosenHLSManifest ?? ((watchCtx.playerResponse?["streamingData"] as? [String: Any])?["hlsManifestUrl"] as? String) {
+            if isLive || formats.isEmpty {
+                if let hlsFmts = try? await HLSEngine.extractFormats(client: client, playlistURL: hlsManifest, headers: ["User-Agent": chosenHLSUA], idPrefix: "hls") {
                     for var hf in hlsFmts {
                         hf.isLive = isLive
                         formats.append(hf)
@@ -227,9 +342,16 @@ public struct YouTubeExtractor: SiteExtractor {
             }
         }
 
-        // Subtitles from WEB response (or primary response)
+        if formats.isEmpty {
+            if let r = lastReason, r.lowercased().contains("sign in") {
+                throw ExtractorError.loginRequired("YouTube")
+            }
+            throw ExtractorError.notFound("YouTube: \(lastReason ?? "No playable non-DRM streams returned")")
+        }
+
+        // Subtitles from watch page player response (or chosen response)
         var subtitles: [SubtitleTrack] = []
-        let capSource = (webResp?["captions"] != nil) ? webResp : resp
+        let capSource = (watchCtx.playerResponse?["captions"] != nil) ? watchCtx.playerResponse : resp
         if let tracklist = ((capSource?["captions"] as? [String: Any])?["playerCaptionsTracklistRenderer"] as? [String: Any])?["captionTracks"] as? [[String: Any]] {
             for ct in tracklist {
                 guard let base = ct["baseUrl"] as? String,
@@ -263,19 +385,26 @@ public struct YouTubeExtractor: SiteExtractor {
         )
     }
 
-    private func callPlayer(videoID: String, profile: YTClientProfile, client: HTTPClient, sts: Int?) async throws -> [String: Any] {
+    private func callPlayer(
+        videoID: String,
+        profile: YTClientProfile,
+        visitorData: String?,
+        sts: Int?,
+        client: HTTPClient
+    ) async throws -> [String: Any] {
         var clientDict: [String: Any] = [
             "clientName": profile.name,
             "clientVersion": profile.version,
             "hl": "en",
             "gl": "US",
+            "userAgent": profile.userAgent,
         ]
+        if let visitorData, !visitorData.isEmpty {
+            clientDict["visitorData"] = visitorData
+        }
         for (k, v) in profile.extraFields { clientDict[k] = v }
 
-        var context: [String: Any] = ["client": clientDict]
-        if profile.name.contains("EMBEDDED") {
-            context["thirdParty"] = ["embedUrl": "https://www.youtube.com/"]
-        }
+        let context: [String: Any] = ["client": clientDict]
         var bodyObj: [String: Any] = [
             "videoId": videoID,
             "context": context,
@@ -283,7 +412,12 @@ public struct YouTubeExtractor: SiteExtractor {
             "racyCheckOk": true,
         ]
         if let sts {
-            bodyObj["playbackContext"] = ["contentPlaybackContext": ["signatureTimestamp": sts]]
+            bodyObj["playbackContext"] = [
+                "contentPlaybackContext": [
+                    "signatureTimestamp": sts,
+                    "html5Preference": "HTML5_PREF_WANTS",
+                ]
+            ]
         }
 
         let bodyData = try JSONSerialization.data(withJSONObject: bodyObj)
@@ -294,8 +428,10 @@ public struct YouTubeExtractor: SiteExtractor {
             "X-YouTube-Client-Version": profile.version,
             "Origin": "https://www.youtube.com",
         ]
+        if let visitorData, !visitorData.isEmpty {
+            headers["X-Goog-Visitor-Id"] = visitorData
+        }
 
-        // Attach SAPISIDHASH Authorization header when user has signed in via uBit Browser or cookies.txt!
         if profile.supportsCookies,
            let sapisid = client.cookies.cookieValue(named: "SAPISID", forDomain: "youtube.com")
                 ?? client.cookies.cookieValue(named: "__Secure-3PAPISID", forDomain: "youtube.com") {
@@ -501,12 +637,15 @@ public struct YouTubeExtractor: SiteExtractor {
 
     // MARK: - Lightweight Native JavaScriptCore Cipher Solver (0 KB Embedded JS AST Bloat!)
 
-    private func loadPlayerCipherSolver(videoID: String, client: HTTPClient) async throws -> JSPlayerCipherSolver? {
-        let (embedHTML, _) = try await client.fetchText(url: "https://www.youtube.com/embed/\(videoID)")
-        guard let jsRel = ExtractorUtils.firstMatch("\"jsUrl\":\"([^\"]+base\\.js)\"", in: embedHTML) else {
-            return nil
+    private func loadPlayerCipherSolver(videoID: String, knownJSURL: String?, client: HTTPClient) async throws -> JSPlayerCipherSolver? {
+        var resolvedJSURL = knownJSURL
+        if resolvedJSURL == nil {
+            let (embedHTML, _) = try await client.fetchText(url: "https://www.youtube.com/embed/\(videoID)")
+            if let jsRel = ExtractorUtils.firstMatch("\"jsUrl\":\"([^\"]+base\\.js)\"", in: embedHTML) {
+                resolvedJSURL = jsRel.hasPrefix("http") ? jsRel : "https://www.youtube.com\(jsRel)"
+            }
         }
-        let jsURL = jsRel.hasPrefix("http") ? jsRel : "https://www.youtube.com\(jsRel)"
+        guard let jsURL = resolvedJSURL else { return nil }
         let (jsCode, _) = try await client.fetchText(url: jsURL, includeCookies: false)
         return JSPlayerCipherSolver(playerJS: jsCode)
     }
@@ -516,11 +655,12 @@ private final class JSPlayerCipherSolver: @unchecked Sendable {
     private let lock = NSLock()
     private let ctx: JSContext?
     private var hasSigFn = false
+    private var hasNFn = false
 
     init(playerJS: String) {
         let context = JSContext()
         self.ctx = context
-        // Locate signature decipher function & helper object in base.js
+        // 1. Signature decipher function
         if let sigFnName = ExtractorUtils.firstMatch("\\b[cs]\\s*&&\\s*[adf]\\.set\\([^,]+,\\s*encodeURIComponent\\(([a-zA-Z0-9$]+)\\(", in: playerJS)
             ?? ExtractorUtils.firstMatch("([a-zA-Z0-9$]+)\\s*=\\s*function\\(\\s*a\\s*\\)\\s*\\{\\s*a\\s*=\\s*a\\.split\\(\\s*\"\"\\s*\\)", in: playerJS) {
             let escapedFn = NSRegularExpression.escapedPattern(for: sigFnName)
@@ -535,6 +675,20 @@ private final class JSPlayerCipherSolver: @unchecked Sendable {
                 script += "var __decipher = \(fnBody);"
                 context?.evaluateScript(script)
                 hasSigFn = true
+            }
+        }
+        // 2. Throttle `n`-challenge function extraction
+        if let nArrName = ExtractorUtils.firstMatch("\\.get\\(\"n\"\\)\\)&&\\(b=([a-zA-Z0-9$]+)(?:\\[(\\d+)\\])?\\([a-zA-Z0-9]\\)", in: playerJS) {
+            var fnName = nArrName
+            let escArr = NSRegularExpression.escapedPattern(for: nArrName)
+            if let realFn = ExtractorUtils.firstMatch("var\\s+\(escArr)\\s*=\\s*\\[([a-zA-Z0-9$]+)\\]", in: playerJS) {
+                fnName = realFn
+            }
+            let escFn = NSRegularExpression.escapedPattern(for: fnName)
+            if let nBody = ExtractorUtils.firstMatch("\(escFn)\\s*=\\s*(function\\([a-zA-Z0-9]\\)\\{[\\s\\S]*?return\\s+[a-zA-Z0-9]\\.join\\(\"\"\\)\\})", in: playerJS) {
+                context?.evaluateScript("var __nsolve = \(nBody);")
+                if context?.exception == nil { hasNFn = true }
+                context?.exception = nil
             }
         }
     }
@@ -558,6 +712,20 @@ private final class JSPlayerCipherSolver: @unchecked Sendable {
     }
 
     func transformNParam(in url: String) -> String {
-        url
+        guard hasNFn, var comps = URLComponents(string: url),
+              var items = comps.queryItems,
+              let idx = items.firstIndex(where: { $0.name == "n" }),
+              let oldN = items[idx].value else {
+            return url
+        }
+        lock.lock()
+        let newN = ctx?.objectForKeyedSubscript("__nsolve")?.call(withArguments: [oldN])?.toString()
+        lock.unlock()
+        if let newN, !newN.isEmpty, newN != "undefined", newN != oldN {
+            items[idx].value = newN
+            comps.queryItems = items
+            return comps.url?.absoluteString ?? url
+        }
+        return url
     }
 }

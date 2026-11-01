@@ -469,12 +469,15 @@ public final class HTTPClient: @unchecked Sendable {
         var curStart = initialRange.start
         let origEnd = initialRange.end
         var attempts = 0
+        let isGoogleVideo = url.contains("googlevideo.com")
+        let maxWindowBytes: Int64 = isGoogleVideo ? 8 * 1024 * 1024 : Int64.max
 
         while curStart <= origEnd {
             try Task.checkCancellation()
             do {
+                let reqEnd = (maxWindowBytes == Int64.max) ? origEnd : min(origEnd, curStart + maxWindowBytes - 1)
                 var hdrs = headers ?? [:]
-                hdrs["Range"] = "bytes=\(curStart)-\(origEnd)"
+                hdrs["Range"] = "bytes=\(curStart)-\(reqEnd)"
                 let req = try makeRequest(url: url, headers: hdrs)
                 let (bytes, resp) = try await session.bytes(for: req)
                 guard let http = resp as? HTTPURLResponse else {
@@ -514,7 +517,8 @@ public final class HTTPClient: @unchecked Sendable {
                     curStart += Int64(res.written)
                     if !res.keepGoing { return }
                 }
-                return
+                attempts = 0
+                if reqEnd >= origEnd { return }
             } catch is CancellationError {
                 await workQueue.failWorker(workerID: workerID)
                 throw CancellationError()

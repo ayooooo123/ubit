@@ -108,9 +108,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.3.0</string>
+	<string>0.3.1</string>
 	<key>CFBundleVersion</key>
-	<string>0.3.0</string>
+	<string>0.3.1</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -137,8 +137,8 @@ PLIST
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 codesign --force --deep --sign - "$APP"
 ln -sf "$MACOS/ubit" "$DIST/ubit"
-tar -czf "$DIST/ubit-0.3.0-darwin-arm64.tar.gz" -C "$DIST" uBit.app
+tar -czf "$DIST/ubit-0.3.1-darwin-arm64.tar.gz" -C "$DIST" uBit.app
 
-echo "✓ Built $APP and $DIST/ubit-0.3.0-darwin-arm64.tar.gz"
-ls -lh "$MACOS/ubit" "$RES/AppIcon.icns" "$DIST/ubit-0.3.0-darwin-arm64.tar.gz"
+echo "✓ Built $APP and $DIST/ubit-0.3.1-darwin-arm64.tar.gz"
+ls -lh "$MACOS/ubit" "$RES/AppIcon.icns" "$DIST/ubit-0.3.1-darwin-arm64.tar.gz"
 du -sh "$APP"

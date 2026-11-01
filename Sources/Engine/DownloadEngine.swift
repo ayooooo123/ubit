@@ -117,9 +117,8 @@ public enum FormatSelector {
 
         let ranked = pool.sorted { lhs, rhs in
             if options.preferCompatible {
-                let lCompat = lhs.isH264 || lhs.proto == .hls
-                let rCompat = rhs.isH264 || rhs.proto == .hls
-                if lCompat != rCompat { return lCompat }
+                // Prefer native ISO-BMFF MP4 / HLS containers (avc1, hvc1, av01) over WebM so zero-FFmpeg muxing & QuickTime work at full 1080p/4K
+                if lhs.isNativeMP4 != rhs.isNativeMP4 { return lhs.isNativeMP4 }
             }
             let lh = lhs.height ?? 0
             let rh = rhs.height ?? 0
@@ -127,12 +126,15 @@ public enum FormatSelector {
             let lfps = Int((lhs.fps ?? 30).rounded())
             let rfps = Int((rhs.fps ?? 30).rounded())
             if lfps != rfps { return lfps > rfps }
+            if options.preferCompatible && lhs.isH264 != rhs.isH264 {
+                // At identical resolution & fps, prefer H.264 for broadest hardware decode compatibility
+                return lhs.isH264
+            }
             let lbr = lhs.bitrate ?? lhs.filesize ?? 0
             let rbr = rhs.bitrate ?? rhs.filesize ?? 0
             if lbr != rbr { return lbr > rbr }
             return lhs.hasAudio && !rhs.hasAudio
         }
-
         let chosenVideo = ranked[0]
         if chosenVideo.hasAudio {
             return SelectedStreams(video: chosenVideo, audio: nil)
@@ -296,13 +298,21 @@ public final class DownloadEngine: @unchecked Sendable {
 
         func fetchStream(_ fmt: MediaFormat, to dest: URL, priorBytes: Int64, isVideoRole: Bool) async throws -> (baseSec: Double, isTS: Bool) {
             var currentFmt = fmt
-            for refreshAttempt in 0..<2 {
+            var blockedFormatIDs = Set<String>()
+            for refreshAttempt in 0..<3 {
                 do {
                     return try await fetchStreamOnce(currentFmt, to: dest, priorBytes: priorBytes, isVideoRole: isVideoRole)
                 } catch HTTPError.staleLink {
-                    guard refreshAttempt == 0 else { throw HTTPError.staleLink(403) }
+                    guard refreshAttempt < 2 else { throw HTTPError.staleLink(403) }
+                    if refreshAttempt == 1 {
+                        blockedFormatIDs.insert(currentFmt.id)
+                        try? FileManager.default.removeItem(at: dest.appendingPathExtension("part"))
+                        try? FileManager.default.removeItem(at: dest.appendingPathExtension("part.json"))
+                    }
                     let freshInfo = try await ExtractorRegistry.extract(url: url, client: client)
-                    let freshSel = try FormatSelector.select(from: freshInfo.formats, options: options)
+                    let remaining = freshInfo.formats.filter { !blockedFormatIDs.contains($0.id) }
+                    let candidatePool = remaining.isEmpty ? freshInfo.formats : remaining
+                    let freshSel = try FormatSelector.select(from: candidatePool, options: options)
                     if let updated = isVideoRole ? freshSel.video : (freshSel.audio ?? freshSel.video) {
                         currentFmt = updated
                         selected = freshSel

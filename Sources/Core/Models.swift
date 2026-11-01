@@ -1,6 +1,6 @@
 import Foundation
 
-public let UBIT_VERSION = "0.3.0"
+public let UBIT_VERSION = "0.3.1"
 public let UBIT_BUNDLE_ID = "app.ubit.mac"
 
 public enum StreamProtocol: String, Codable, Sendable {
@@ -95,6 +95,11 @@ public struct MediaFormat: Codable, Sendable {
     public var isH264: Bool {
         guard let v = vcodec?.lowercased() else { return ext == "mp4" && hasVideo }
         return v.contains("avc") || v.contains("h264")
+    }
+
+    /// True for ISO-BMFF MP4 (H.264, HEVC, AV1) and HLS streams that mux natively without FFmpeg on macOS.
+    public var isNativeMP4: Bool {
+        ext == "mp4" || proto == .hls
     }
 
     public var isAAC: Bool {

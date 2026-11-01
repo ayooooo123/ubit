@@ -5,9 +5,15 @@
 set -eu
 
 REPO="ayooooo123/ubit"
-VERSION="${UBIT_VERSION:-0.3.2}"
-BASE_URL="${UBIT_DOWNLOAD_URL:-https://github.com/$REPO/releases/latest/download}"
-
+if [ -n "${UBIT_VERSION:-}" ]; then
+  VERSION="${UBIT_VERSION#v}"
+else
+  RESOLVED_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
+  RESOLVED_TAG="${RESOLVED_URL##*/}"
+  VERSION="${RESOLVED_TAG#v}"
+  [ -n "$VERSION" ] && [ "$VERSION" != "latest" ] || VERSION="0.3.2"
+fi
+BASE_URL="${UBIT_DOWNLOAD_URL:-https://github.com/$REPO/releases/download/v${VERSION}}"
 OS="$(uname -s)"
 ARCH_RAW="$(uname -m)"
 

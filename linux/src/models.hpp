@@ -299,9 +299,11 @@ inline std::string expand_tilde(const std::string& p) {
 }
 
 inline bool is_android_fuse_storage(const fs::path& p) {
-    std::string s = p.string();
+    std::error_code ec;
+    fs::path resolved = fs::weakly_canonical(p, ec);
+    std::string s = ec ? p.string() : resolved.string();
     return s.rfind("/storage/", 0) == 0 || s.rfind("/sdcard/", 0) == 0 ||
-           s.rfind("/mnt/", 0) == 0 || s.find("/storage/downloads") != std::string::npos;
+           s.rfind("/mnt/", 0) == 0 || p.string().find("/storage/downloads") != std::string::npos;
 }
 
 /// Moves or streams `src` into `dst` safely across filesystems and Android Scoped Storage FUSE,
@@ -365,9 +367,17 @@ inline int64_t commit_file_verified(const fs::path& src, const fs::path& dst) {
         throw std::runtime_error("Output size verification failed for " + dst.string());
     }
 
-    if (is_android_fuse_storage(dst) && std::system("command -v termux-media-scan >/dev/null 2>&1") == 0) {
-        std::string scan_cmd = "termux-media-scan \"" + dst.string() + "\" >/dev/null 2>&1 &";
-        (void)std::system(scan_cmd.c_str());
+    if (is_android_fuse_storage(dst)) {
+        std::error_code ec_abs;
+        std::string abs_dst = fs::weakly_canonical(dst, ec_abs).string();
+        if (abs_dst.empty()) abs_dst = dst.string();
+        if (std::system("command -v termux-media-scan >/dev/null 2>&1") == 0) {
+            std::string scan_cmd = "termux-media-scan \"" + abs_dst + "\" >/dev/null 2>&1 &";
+            (void)std::system(scan_cmd.c_str());
+        } else if (::access("/system/bin/am", X_OK) == 0) {
+            std::string am_cmd = "/system/bin/am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d \"file://" + abs_dst + "\" >/dev/null 2>&1 &";
+            (void)std::system(am_cmd.c_str());
+        }
     }
     return expected_sz;
 }
@@ -419,7 +429,11 @@ inline std::string sanitize_filename(const std::string& raw) {
     while (!out.empty() && (out.front() == ' ' || out.front() == '.')) out.erase(out.begin());
     while (!out.empty() && out.back() == ' ') out.pop_back();
     if (out.empty()) out = "download";
-    if (out.size() > 200) out.resize(200);
+    if (out.size() > 200) {
+        size_t cut = 200;
+        while (cut > 0 && ((unsigned char)out[cut] & 0xC0) == 0x80) --cut;
+        out.resize(cut);
+    }
     return out;
 }
 

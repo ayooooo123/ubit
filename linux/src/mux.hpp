@@ -480,8 +480,10 @@ public:
         }
 
         for (FILE* fp : src_fps) if (fp) std::fclose(fp);
+        std::fflush(out);
+        ::fsync(fileno(out));
         std::fclose(out);
-        fs::rename(part, dest, ec);
+        commit_file_verified(part, dest);
     }
 
 private:
@@ -1142,9 +1144,10 @@ public:
                 for (int k = 0; k < 10 && !cancel_or_stop_live.load(); ++k)
                     std::this_thread::sleep_for(std::chrono::milliseconds((int)(std::max(1.0, target_dur * 0.5) * 100)));
             }
+            std::fflush(out);
+            ::fsync(fileno(out));
             std::fclose(out);
-            std::error_code ec;
-            fs::rename(part, dest, ec);
+            commit_file_verified(part, dest);
             return fmp4;
         }
 
@@ -1163,10 +1166,14 @@ public:
         std::vector<uint8_t> init_bytes;
         if (!init_url.empty()) init_bytes = client.fetch(init_url, "GET", hdrs).body;
 
-        fs::path seg_dir = dest.parent_path() / ("." + dest.filename().string() + ".segs");
+        fs::path seg_dir = dest.parent_path() / (dest.filename().string() + "_segs");
         std::error_code ec;
         fs::create_directories(seg_dir, ec);
-
+        struct SegDirGuard {
+            fs::path dir;
+            bool keep = false;
+            ~SegDirGuard() { if (!keep) { std::error_code e; fs::remove_all(dir, e); } }
+        } seg_guard{seg_dir, false};
         std::mutex mu;
         std::map<std::string, std::vector<uint8_t>> key_cache;
         std::atomic<size_t> next_idx{0};
@@ -1231,7 +1238,7 @@ public:
             });
         }
         for (auto& t : pool) t.join();
-        if (cancel_or_stop_live.load()) throw InterruptedException();
+        if (cancel_or_stop_live.load()) { seg_guard.keep = true; throw InterruptedException(); }
         if (failed.load()) throw std::runtime_error("HLS segment download failed");
 
         fs::path part = dest.string() + ".part";
@@ -1249,10 +1256,10 @@ public:
             if (head16.empty() && !sb.empty()) head16.assign(sb.begin(), sb.begin() + std::min<size_t>(16, sb.size()));
             if (!sb.empty()) std::fwrite(sb.data(), 1, sb.size(), out);
         }
+        std::fflush(out);
+        ::fsync(fileno(out));
         std::fclose(out);
-        fs::rename(part, dest, ec);
-        fs::remove_all(seg_dir, ec);
-
+        commit_file_verified(part, dest);
         bool is_fmp4 = !init_bytes.empty() || (head16.size() >= 8 && std::memcmp(&head16[4], "ftyp", 4) == 0);
         return is_fmp4;
     }

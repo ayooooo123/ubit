@@ -7,12 +7,13 @@
 #include <iomanip>
 #include <set>
 #include <sys/stat.h>
+#include <cerrno>
 
 namespace ubit {
 
 namespace fs = std::filesystem;
 
-inline constexpr const char* UBIT_VERSION = "0.3.2";
+inline constexpr const char* UBIT_VERSION = "0.3.3";
 
 struct ByteRange {
     int64_t start = 0;
@@ -239,11 +240,15 @@ struct SectionRange {
 // MARK: - App Paths & Format Helpers
 
 struct AppPaths {
+    static fs::path temp_root() {
+        if (const char* t = std::getenv("TMPDIR"); t && *t && ::access(t, W_OK) == 0) return fs::path(t);
+        if (::access("/data/data/com.termux/files/usr/tmp", W_OK) == 0) return "/data/data/com.termux/files/usr/tmp";
+        return "/tmp";
+    }
     static fs::path home_dir() {
         if (const char* h = std::getenv("HOME"); h && *h) return fs::path(h);
         if (fs::exists("/data/data/com.termux/files/home")) return "/data/data/com.termux/files/home";
-        if (const char* t = std::getenv("TMPDIR"); t && *t) return fs::path(t);
-        return "/tmp";
+        return temp_root();
     }
     static fs::path config_dir() {
         if (const char* custom = std::getenv("UBIT_CONFIG_DIR"); custom && *custom) return fs::path(custom);
@@ -252,9 +257,11 @@ struct AppPaths {
     }
     static fs::path downloads_dir() {
         fs::path termux_dl = home_dir() / "storage" / "downloads";
-        if (fs::exists(termux_dl)) return termux_dl;
+        if (fs::exists(termux_dl) && ::access(termux_dl.c_str(), W_OK) == 0) return termux_dl;
         if (::access("/sdcard/Download", W_OK) == 0) return "/sdcard/Download";
         fs::path d = home_dir() / "Downloads";
+        std::error_code ec;
+        fs::create_directories(d, ec);
         return fs::exists(d) ? d : home_dir();
     }
     static fs::path settings_file() { return config_dir() / "settings.json"; }
@@ -268,13 +275,101 @@ struct AppPaths {
         std::error_code ec;
         fs::create_directories(config_dir(), ec);
         fs::create_directories(work_dir(), ec);
+        auto now = fs::file_time_type::clock::now();
+        for (const auto& entry : fs::directory_iterator(work_dir(), ec)) {
+            std::error_code ec2;
+            auto mtime = fs::last_write_time(entry.path(), ec2);
+            if (!ec2 && (now - mtime) > std::chrono::hours(24)) {
+                fs::remove_all(entry.path(), ec2);
+            } else if (entry.is_directory(ec2) && fs::is_empty(entry.path(), ec2)) {
+                fs::remove_all(entry.path(), ec2);
+            }
+        }
     }
 };
 
 inline std::string expand_tilde(const std::string& p) {
     if (p == "~") return AppPaths::home_dir().string();
     if (p.rfind("~/", 0) == 0) return (AppPaths::home_dir() / p.substr(2)).string();
+    if ((p == "/tmp" || p.rfind("/tmp/", 0) == 0) && ::access("/tmp", W_OK) != 0) {
+        fs::path tr = AppPaths::temp_root();
+        return p == "/tmp" ? tr.string() : (tr / p.substr(5)).string();
+    }
     return p;
+}
+
+inline bool is_android_fuse_storage(const fs::path& p) {
+    std::string s = p.string();
+    return s.rfind("/storage/", 0) == 0 || s.rfind("/sdcard/", 0) == 0 ||
+           s.rfind("/mnt/", 0) == 0 || s.find("/storage/downloads") != std::string::npos;
+}
+
+/// Moves or streams `src` into `dst` safely across filesystems and Android Scoped Storage FUSE,
+/// guaranteeing `fsync`, removing `src`, and verifying `dst` has exact non-zero byte length.
+inline int64_t commit_file_verified(const fs::path& src, const fs::path& dst) {
+    std::error_code ec;
+    uintmax_t raw_sz = fs::file_size(src, ec);
+    if (ec || raw_sz == 0 || raw_sz == (uintmax_t)-1) {
+        throw std::runtime_error("Staged media file is empty (0 bytes): " + src.filename().string());
+    }
+    int64_t expected_sz = (int64_t)raw_sz;
+
+    fs::create_directories(dst.parent_path(), ec);
+    if (!fs::exists(dst.parent_path())) {
+        throw std::runtime_error("Cannot create output directory: " + dst.parent_path().string());
+    }
+
+    if (!is_android_fuse_storage(dst) && ::rename(src.c_str(), dst.c_str()) == 0) {
+        uintmax_t check_sz = fs::file_size(dst, ec);
+        if (!ec && (int64_t)check_sz == expected_sz) return expected_sz;
+    }
+
+    int in_fd = ::open(src.c_str(), O_RDONLY);
+    if (in_fd < 0) throw std::runtime_error("Cannot read staged file: " + src.string());
+
+    int out_fd = ::open(dst.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (out_fd < 0) {
+        ::close(in_fd);
+        throw std::runtime_error("Cannot write to output path (check storage permissions / run termux-setup-storage): " + dst.string());
+    }
+
+    std::vector<uint8_t> buf(262144);
+    int64_t total_written = 0;
+    while (true) {
+        ssize_t nr = ::read(in_fd, buf.data(), buf.size());
+        if (nr < 0) {
+            if (errno == EINTR) continue;
+            ::close(in_fd); ::close(out_fd); ::unlink(dst.c_str());
+            throw std::runtime_error("Read error while committing " + dst.filename().string());
+        }
+        if (nr == 0) break;
+        size_t off = 0;
+        while (off < (size_t)nr) {
+            ssize_t nw = ::write(out_fd, buf.data() + off, (size_t)nr - off);
+            if (nw < 0) {
+                if (errno == EINTR) continue;
+                ::close(in_fd); ::close(out_fd); ::unlink(dst.c_str());
+                throw std::runtime_error("Write failed (disk full or permission denied): " + dst.string());
+            }
+            off += (size_t)nw;
+        }
+        total_written += nr;
+    }
+    ::fsync(out_fd);
+    ::close(out_fd);
+    ::close(in_fd);
+    ::unlink(src.c_str());
+
+    struct stat st{};
+    if (::stat(dst.c_str(), &st) != 0 || st.st_size != expected_sz || total_written != expected_sz) {
+        throw std::runtime_error("Output size verification failed for " + dst.string());
+    }
+
+    if (is_android_fuse_storage(dst) && std::system("command -v termux-media-scan >/dev/null 2>&1") == 0) {
+        std::string scan_cmd = "termux-media-scan \"" + dst.string() + "\" >/dev/null 2>&1 &";
+        (void)std::system(scan_cmd.c_str());
+    }
+    return expected_sz;
 }
 
 inline std::string format_bytes(int64_t b) {
@@ -373,14 +468,20 @@ inline void write_file_atomic(const fs::path& p, const void* data, size_t len) {
     fs::create_directories(p.parent_path(), ec);
     fs::path tmp = p;
     tmp += ".tmp";
-    FILE* f = std::fopen(tmp.c_str(), "wb");
-    if (!f) throw std::runtime_error("Cannot write " + p.string());
-    if (len > 0 && std::fwrite(data, 1, len, f) != len) {
-        std::fclose(f);
-        throw std::runtime_error("Disk write failed: " + p.string());
+    int fd = ::open(tmp.c_str(), O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) throw std::runtime_error("Cannot write " + p.string());
+    size_t off = 0;
+    while (off < len) {
+        ssize_t nw = ::write(fd, (const uint8_t*)data + off, len - off);
+        if (nw <= 0) { ::close(fd); ::unlink(tmp.c_str()); throw std::runtime_error("Disk write failed: " + p.string()); }
+        off += (size_t)nw;
     }
-    std::fclose(f);
-    fs::rename(tmp, p, ec);
+    ::fsync(fd);
+    ::close(fd);
+    if (::rename(tmp.c_str(), p.c_str()) != 0) {
+        if (len > 0) commit_file_verified(tmp, p);
+        else ::unlink(tmp.c_str());
+    }
 }
 
 // MARK: - Settings
@@ -563,11 +664,16 @@ public:
                 if (on_progress) on_progress(done, total_size);
                 return true;
             });
+            std::fflush(f);
+            ::fsync(fileno(f));
             std::fclose(f);
             if (cancel_flag.load()) throw InterruptedException();
             if (r.status == 403 || r.status == 410) throw StaleLinkException(r.status);
             if (r.status < 200 || r.status >= 300) throw std::runtime_error("HTTP " + std::to_string(r.status));
-            fs::rename(part_path, dest, ec);
+            if (done <= 0 || (total_size > 0 && done < total_size)) {
+                throw std::runtime_error("Incomplete stream download (" + std::to_string(done) + " bytes)");
+            }
+            commit_file_verified(part_path, dest);
             fs::remove(state_path, ec);
             return;
         }
@@ -618,7 +724,7 @@ public:
 
         merge_completed();
         if (calc_done() >= total_size) {
-            fs::rename(part_path, dest, ec);
+            commit_file_verified(part_path, dest);
             fs::remove(state_path, ec);
             return;
         }
@@ -766,14 +872,16 @@ public:
 
         for (auto& t : threads) t.join();
         save_state();
+        ::fsync(fd);
         ::close(fd);
 
         if (cancel_flag.load()) throw InterruptedException();
         int fc = fatal_code.load();
         if (fc == 403 || fc == 410) throw StaleLinkException(fc);
         if (fc != 0) throw std::runtime_error(fatal_msg.empty() ? "Range download failed" : fatal_msg);
+        if (calc_done() < total_size) throw std::runtime_error("Incomplete range download");
 
-        fs::rename(part_path, dest, ec);
+        commit_file_verified(part_path, dest);
         fs::remove(state_path, ec);
     }
 };

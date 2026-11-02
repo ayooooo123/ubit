@@ -315,24 +315,43 @@ inline fs::path download_single_item(
         }
     };
 
-    fs::path v_tmp = final_path.parent_path() / ("." + final_path.stem().string() + ".v." + (sel.video ? sel.video->ext : "mp4"));
-    fs::path a_tmp = final_path.parent_path() / ("." + final_path.stem().string() + ".a." + (sel.audio ? sel.audio->ext : "m4a"));
+    // Stage all intermediate downloads, segments, and mux outputs in native ext4 work_dir/<job_hash>
+    // so Android Scoped Storage FUSE (~/storage/downloads) never sees .part / .segs / dotfile artifacts!
+    fs::path job_dir = AppPaths::work_dir() / ("job_" + sha256_hex(url + "|" + sel.display_quality()).substr(0, 14));
+    fs::create_directories(job_dir, ec);
+    struct JobDirGuard {
+        fs::path dir;
+        bool keep_for_resume = false;
+        ~JobDirGuard() {
+            if (!keep_for_resume) {
+                std::error_code e;
+                fs::remove_all(dir, e);
+            }
+        }
+    } job_guard{job_dir, false};
+
+    fs::path v_tmp = job_dir / ("video." + (sel.video ? sel.video->ext : "mp4"));
+    fs::path a_tmp = job_dir / ("audio." + (sel.audio ? sel.audio->ext : "m4a"));
     double v_base = 0.0, a_base = 0.0;
     bool v_ts = false, a_ts = false;
     int64_t v_bytes = 0;
 
-    if (sel.video) {
-        fetch_role(*sel.video, v_tmp, 0, true, v_base, v_ts);
-        v_bytes = (int64_t)fs::file_size(v_tmp, ec);
-        if (!sel.audio && !sel.video->audio_track_url.empty()) {
-            MediaFormat ha; ha.id = "hls-audio"; ha.url = sel.video->audio_track_url; ha.ext = "m4a"; ha.proto = "hls"; ha.vcodec = "none"; ha.acodec = "mp4a"; ha.headers = sel.video->headers;
-            fetch_role(ha, a_tmp, v_bytes, false, a_base, a_ts);
+    try {
+        if (sel.video) {
+            fetch_role(*sel.video, v_tmp, 0, true, v_base, v_ts);
+            v_bytes = (int64_t)fs::file_size(v_tmp, ec);
+            if (!sel.audio && !sel.video->audio_track_url.empty()) {
+                MediaFormat ha; ha.id = "hls-audio"; ha.url = sel.video->audio_track_url; ha.ext = "m4a"; ha.proto = "hls"; ha.vcodec = "none"; ha.acodec = "mp4a"; ha.headers = sel.video->headers;
+                fetch_role(ha, a_tmp, v_bytes, false, a_base, a_ts);
+            }
         }
+        if (sel.audio) {
+            fetch_role(*sel.audio, a_tmp, v_bytes, false, a_base, a_ts);
+        }
+    } catch (const InterruptedException&) {
+        job_guard.keep_for_resume = true;
+        throw;
     }
-    if (sel.audio) {
-        fetch_role(*sel.audio, a_tmp, v_bytes, false, a_base, a_ts);
-    }
-
     std::vector<uint8_t> cover_bytes;
     if ((settings.embed_metadata || settings.save_thumbnail) && !info.thumbnail.empty()) {
         auto ir = client.fetch(info.thumbnail, "GET", {}, "", false, 1);
@@ -371,13 +390,14 @@ inline fs::path download_single_item(
     bool raw_non_mp4_audio = !has_v && has_a && (a_src_ext == "mp3" || a_src_ext == "opus" || a_src_ext == "flac" || a_src_ext == "wav");
     bool webm_involved = (sel.video && sel.video->ext == "webm") || (sel.audio && sel.audio->ext == "webm");
 
+    fs::path staged_final = job_dir / ("output." + target_ext);
     if (raw_non_mp4_audio) {
-        if (a_src_ext == target_ext) fs::rename(a_tmp, final_path, ec);
-        else SponsorAndSubs::run_ffmpeg_convert(a_tmp, final_path, target_ext);
+        if (a_src_ext == target_ext) staged_final = a_tmp;
+        else SponsorAndSubs::run_ffmpeg_convert(a_tmp, staged_final, target_ext);
     } else if (!webm_involved) {
         fs::path mux_out = (target_ext == "mp4" || target_ext == "m4a")
-            ? final_path
-            : (AppPaths::work_dir() / ("mux_" + std::to_string(::getpid()) + (is_audio_out ? ".m4a" : ".mp4")));
+            ? staged_final
+            : (job_dir / ("muxed." + std::string(is_audio_out ? "m4a" : "mp4")));
 
         std::vector<MP4Track> all_tracks;
         std::vector<fs::path> src_files;
@@ -406,22 +426,20 @@ inline fs::path download_single_item(
             meta = {info.title, info.author, info.upload_date, info.webpage_url, info.description, cover_bytes, chapters};
         }
         MP4Muxer::write_mp4(std::move(all_tracks), src_files, mux_out, is_audio_out, meta);
-        if (mux_out != final_path) {
+        if (mux_out != staged_final) {
             if (cb.on_stage) cb.on_stage("Converting to " + target_ext);
-            SponsorAndSubs::run_ffmpeg_convert(mux_out, final_path, target_ext);
+            SponsorAndSubs::run_ffmpeg_convert(mux_out, staged_final, target_ext);
             fs::remove(mux_out, ec);
         }
     } else {
-        if (has_v && has_a) SponsorAndSubs::run_ffmpeg_convert(v_tmp, final_path, target_ext, &a_tmp);
-        else if (has_v) fs::rename(v_tmp, final_path, ec);
-        else if (has_a) fs::rename(a_tmp, final_path, ec);
+        if (has_v && has_a) SponsorAndSubs::run_ffmpeg_convert(v_tmp, staged_final, target_ext, &a_tmp);
+        else if (has_v) staged_final = v_tmp;
+        else if (has_a) staged_final = a_tmp;
     }
 
-    fs::remove(v_tmp, ec);
-    fs::remove(a_tmp, ec);
+    int64_t final_sz = commit_file_verified(staged_final, final_path);
     SponsorAndSubs::set_origin_xattr(final_path, info.webpage_url);
 
-    int64_t final_sz = (int64_t)fs::file_size(final_path, ec);
     double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (cb.on_done) cb.on_done(final_path, final_sz, secs);
     return final_path;

@@ -11,7 +11,7 @@ else
   RESOLVED_URL="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
   RESOLVED_TAG="${RESOLVED_URL##*/}"
   VERSION="${RESOLVED_TAG#v}"
-  [ -n "$VERSION" ] && [ "$VERSION" != "latest" ] || VERSION="0.3.2"
+  [ -n "$VERSION" ] && [ "$VERSION" != "latest" ] || VERSION="0.3.3"
 fi
 BASE_URL="${UBIT_DOWNLOAD_URL:-https://github.com/$REPO/releases/download/v${VERSION}}"
 OS="$(uname -s)"

@@ -1,6 +1,6 @@
 import Foundation
 
-public let UBIT_VERSION = "0.3.2"
+public let UBIT_VERSION = "0.3.3"
 public let UBIT_BUNDLE_ID = "app.ubit.mac"
 
 public enum StreamProtocol: String, Codable, Sendable {

@@ -15,9 +15,13 @@
 #include <cstdio>
 #include <cctype>
 #include <algorithm>
-#include <dlfcn.h>
 #include <unistd.h>
 #include <fcntl.h>
+#ifdef __wasi__
+#include "softcrypto.hpp"
+#include "wasi.hpp"
+#else
+#include <dlfcn.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -27,9 +31,21 @@
 #ifndef MSG_NOSIGNAL
 #define MSG_NOSIGNAL 0
 #endif
+#endif
 
 namespace ubit {
 
+#ifdef __wasi__
+// shortcut: wasm32-wasip1 has no threads, so a pool runs its workers one after another (one connection at a time);
+// move to wasm32-wasip1-threads if single-connection downloads prove too slow.
+struct WorkerThread {
+    template <class F> explicit WorkerThread(F&& f) { f(); }
+    void join() {}
+};
+#else
+using WorkerThread = std::thread;
+#endif
+#ifndef __wasi__
 // MARK: - Runtime dlopen OpenSSL (libssl.so.3 / 1.1 + libcrypto.so.3 / 1.1) & zlib (libz.so.1)
 // Avoids compile-time -dev header dependencies and works across Debian, Ubuntu, Fedora, Arch, RHEL, Alpine-glibc, Distroless.
 
@@ -141,6 +157,7 @@ struct DynRuntime {
         }
     }
 };
+#endif
 
 inline std::string hex_encode(const unsigned char* data, size_t len) {
     static const char* lut = "0123456789abcdef";
@@ -152,6 +169,28 @@ inline std::string hex_encode(const unsigned char* data, size_t len) {
     return out;
 }
 
+#ifdef __wasi__
+inline std::string sha256_hex(const std::string& input) {
+    unsigned char md[32];
+    soft::sha256((const uint8_t*)input.data(), input.size(), md);
+    return hex_encode(md, 32);
+}
+
+inline std::string sha1_hex(const std::string& input) {
+    unsigned char md[20];
+    soft::sha1((const uint8_t*)input.data(), input.size(), md);
+    return hex_encode(md, 20);
+}
+
+inline std::vector<uint8_t> aes128_cbc_decrypt(const std::vector<uint8_t>& cipher, const std::vector<uint8_t>& key, const uint8_t iv[16]) {
+    std::vector<uint8_t> out;
+    if (key.size() != 16 || !soft::aes128_cbc_decrypt(cipher, key.data(), iv, out)) return cipher;
+    return out;
+}
+
+// shortcut: no inflate in the WebAssembly build; requests never ask for gzip, so only a server that ignores Accept-Encoding breaks.
+inline std::vector<uint8_t> gunzip_bytes(const uint8_t* data, size_t len) { return std::vector<uint8_t>(data, data + len); }
+#else
 inline std::string sha256_hex(const std::string& input) {
     auto& rt = DynRuntime::get();
     unsigned char md[32]{};
@@ -214,6 +253,7 @@ inline std::vector<uint8_t> gunzip_bytes(const uint8_t* data, size_t len) {
     rt.inflateEnd_fn(&zs);
     return out;
 }
+#endif
 
 // MARK: - URL Parser & URL Encoding
 
@@ -437,6 +477,37 @@ public:
     std::shared_ptr<RateLimiter> limiter = std::make_shared<RateLimiter>(0);
 
 private:
+#ifdef __wasi__
+    struct SocketConn {
+        int32_t handle = -1;
+
+        ~SocketConn() { close_conn(); }
+        void close_conn() {
+            if (handle >= 0) { ubit_net_close(handle); handle = -1; }
+        }
+        ssize_t write_all(const void* buf, size_t len) {
+            const uint8_t* p = (const uint8_t*)buf;
+            size_t sent = 0;
+            while (sent < len) {
+                int32_t n = ubit_net_write(handle, p + sent, (int32_t)std::min<size_t>(len - sent, 1 << 20));
+                if (n <= 0) return -1;
+                sent += (size_t)n;
+            }
+            return (ssize_t)sent;
+        }
+        ssize_t read_some(void* buf, size_t cap) {
+            return ubit_net_read(handle, buf, (int32_t)std::min<size_t>(cap, 1 << 20));
+        }
+    };
+
+    // shortcut: no proxy support here; the host's own network settings apply. Refuse rather than bypass a configured proxy.
+    bool open_connection(SocketConn& conn, const ParsedURL& target) const {
+        if (!proxy_url.empty()) return false;
+        if (target.scheme != "https" && target.scheme != "http") return false;
+        conn.handle = ubit_net_open(target.host.data(), (int32_t)target.host.size(), target.port, target.scheme == "https" ? 1 : 0);
+        return conn.handle >= 0;
+    }
+#else
     struct SocketConn {
         int fd = -1;
         void* ssl = nullptr;
@@ -534,6 +605,7 @@ private:
         }
         return true;
     }
+#endif
 
 public:
     /// Streams response body chunks via `on_chunk(ptr, len) -> bool` (returning false aborts early cleanly).
@@ -565,7 +637,9 @@ public:
             merged["User-Agent"] = user_agent;
             merged["Accept"] = "*/*";
             merged["Accept-Language"] = "en-US,en;q=0.9";
+#ifndef __wasi__
             if (!on_chunk) merged["Accept-Encoding"] = "gzip";
+#endif
             merged["Connection"] = "close";
 
             for (const auto& [k, v] : extra_headers) merged[k] = v;

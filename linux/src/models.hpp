@@ -367,6 +367,7 @@ inline int64_t commit_file_verified(const fs::path& src, const fs::path& dst) {
         throw std::runtime_error("Output size verification failed for " + dst.string());
     }
 
+#ifndef __wasi__
     if (is_android_fuse_storage(dst)) {
         std::error_code ec_abs;
         std::string abs_dst = fs::weakly_canonical(dst, ec_abs).string();
@@ -379,6 +380,7 @@ inline int64_t commit_file_verified(const fs::path& src, const fs::path& dst) {
             (void)std::system(am_cmd.c_str());
         }
     }
+#endif
     return expected_sz;
 }
 
@@ -804,7 +806,7 @@ public:
             return true;
         };
 
-        std::vector<std::thread> threads;
+        std::vector<WorkerThread> threads;
         for (int w = 0; w < num_workers; ++w) {
             threads.emplace_back([&]() {
                 while (!cancel_flag.load() && fatal_code.load() == 0) {

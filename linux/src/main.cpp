@@ -1,7 +1,9 @@
 #include "extractors.hpp"
-#include <csignal>
 #include <iostream>
+#ifndef __wasi__
+#include <csignal>
 #include <sys/un.h>
+#endif
 
 namespace ubit {
 
@@ -445,6 +447,7 @@ inline fs::path download_single_item(
     return final_path;
 }
 
+#ifndef __wasi__
 // MARK: - Native Linux Desktop App Loopback UI (GTK WebKit / Chromeless --app= Window)
 
 inline int run_linux_desktop_gui() {
@@ -616,6 +619,7 @@ setInterval(refresh,800);refresh();
     ::close(sfd);
     return 0;
 }
+#endif
 
 // MARK: - CLI Runner
 
@@ -915,12 +919,17 @@ inline int run_info(const std::vector<std::string>& args, bool fmts_only) {
 
 int main(int argc, char** argv) {
     using namespace ubit;
+#ifdef __wasi__
+    // No signals or desktop window in WebAssembly: the host stops the module by ending its process.
+    if (argc <= 1) { print_main_help(); return 2; }
+#else
     std::signal(SIGINT, on_sigint);
     std::signal(SIGPIPE, SIG_IGN);
 
     if (argc <= 1) {
         return run_linux_desktop_gui();
     }
+#endif
 
     std::string cmd = argv[1];
     std::vector<std::string> rest;

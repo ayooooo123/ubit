@@ -54,3 +54,7 @@ UBIT_CONFIG_DIR=/tmp/ubit-e2e ./dist/ubit get -a --section 0:00-0:08 --to wav --
 # Live E2E: GUI window render smoke check
 UBIT_CONFIG_DIR=/tmp/ubit-e2e UBIT_SMOKE_SCREENSHOT=/tmp/ubit-e2e/window.png ./dist/uBit.app/Contents/MacOS/ubit
 ```
+
+## WebAssembly Build (`linux/build_wasm.sh`)
+
+`WASI_SDK_PATH=/path/to/wasi-sdk sh linux/build_wasm.sh` compiles the Linux C++ CLI (`linux/src/main.cpp`) for `wasm32-wasip1` into `dist/ubit.wasm` (~1 MB), after checking `linux/src/softcrypto.hpp` (SHA-1, SHA-256, AES-128-CBC, which replace OpenSSL there) against `linux/tests/softcrypto_test.cpp`. The module has no sockets, threads, signals, `system()` or desktop UI: the host gives it TCP/TLS through the `ubit_net` imports (`linux/src/wasi.hpp`), its linear memory (imported, so the host sets the ceiling), and WASI preview 1 files. Worker pools run their workers one after another, so downloads use one connection; ffmpeg conversions report an error. Exceptions use the standard `exnref` encoding (`-mllvm -wasm-use-legacy-eh=false`): wasi-sdk's libc++ is built with it, and V8 refuses a module that mixes it with the legacy one. `bare-ubit` is the host (Bare ≥ 1.36, for JS Promise Integration).

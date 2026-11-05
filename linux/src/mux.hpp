@@ -1,6 +1,8 @@
 #pragma once
 #include "models.hpp"
+#ifndef __wasi__
 #include <sys/xattr.h>
+#endif
 
 namespace ubit {
 
@@ -1182,7 +1184,7 @@ public:
         std::atomic<bool> failed{false};
 
         int nworkers = std::max(1, std::min(16, connections));
-        std::vector<std::thread> pool;
+        std::vector<WorkerThread> pool;
         for (int w = 0; w < nworkers; ++w) {
             pool.emplace_back([&]() {
                 while (!cancel_or_stop_live.load() && !failed.load()) {
@@ -1405,6 +1407,10 @@ struct SponsorAndSubs {
     }
 
     static void run_ffmpeg_convert(const fs::path& in_file, const fs::path& out_file, const std::string& fmt, const fs::path* second_input = nullptr) {
+#ifdef __wasi__
+        (void)in_file; (void)out_file; (void)second_input;
+        throw std::runtime_error("Converting/muxing to ." + fmt + " needs ffmpeg, which the WebAssembly build cannot run (MP4 and M4A mux natively).");
+#else
         std::string ff = find_ffmpeg();
         if (ff.empty()) {
             throw std::runtime_error("Converting/muxing to ." + fmt + " on Linux requires ffmpeg on PATH (MP4 and M4A mux natively with zero dependencies).");
@@ -1419,6 +1425,7 @@ struct SponsorAndSubs {
         else cmd += " -c copy";
         cmd += " \"" + out_file.string() + "\"";
         if (std::system(cmd.c_str()) != 0) throw std::runtime_error("ffmpeg conversion failed for ." + fmt);
+#endif
     }
 };
 

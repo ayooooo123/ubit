@@ -53,12 +53,18 @@ struct SelectedPair {
     std::string display_quality() const { return video ? video->display_quality() : (audio ? audio->display_quality() : "Audio"); }
 };
 
-inline const MediaFormat* pick_best_audio(const std::vector<MediaFormat>& fmts, bool prefer_aac) {
+inline const MediaFormat* pick_best_audio(const std::vector<MediaFormat>& fmts, bool prefer_aac, bool prefer_webm = false) {
     std::vector<const MediaFormat*> cands;
     for (const auto& f : fmts) if (f.has_audio() && !f.has_video()) cands.push_back(&f);
     if (cands.empty()) return nullptr;
     std::sort(cands.begin(), cands.end(), [&](const MediaFormat* a, const MediaFormat* b) {
-        if (prefer_aac && a->is_aac() != b->is_aac()) return a->is_aac();
+        if (prefer_webm) {
+            bool aw = strutil::to_lower(a->ext) == "webm";
+            bool bw = strutil::to_lower(b->ext) == "webm";
+            if (aw != bw) return aw;
+        } else if (prefer_aac && a->is_aac() != b->is_aac()) {
+            return a->is_aac();
+        }
         int64_t ba = a->bitrate ? a->bitrate : a->filesize;
         int64_t bb = b->bitrate ? b->bitrate : b->filesize;
         return ba > bb;
@@ -79,7 +85,7 @@ inline SelectedPair select_formats(const std::vector<MediaFormat>& fmts, const D
         }
         for (const auto& f : fmts) {
             if (f.id == opts.format_selector) {
-                if (f.has_video() && !f.has_audio()) return {&f, pick_best_audio(fmts, opts.prefer_compatible || f.ext == "mp4")};
+                if (f.has_video() && !f.has_audio()) return {&f, pick_best_audio(fmts, opts.prefer_compatible && f.ext != "webm", f.ext == "webm")};
                 return f.has_video() ? SelectedPair{&f, nullptr} : SelectedPair{nullptr, &f};
             }
         }
@@ -101,10 +107,10 @@ inline SelectedPair select_formats(const std::vector<MediaFormat>& fmts, const D
     if (pool.empty()) pool = vcands;
 
     std::sort(pool.begin(), pool.end(), [&](const MediaFormat* l, const MediaFormat* r) {
-        if (opts.prefer_compatible && l->is_native_mp4() != r->is_native_mp4()) return l->is_native_mp4();
         if (l->height != r->height) return l->height > r->height;
         int lf = (int)std::round(l->fps > 0 ? l->fps : 30.0), rf = (int)std::round(r->fps > 0 ? r->fps : 30.0);
         if (lf != rf) return lf > rf;
+        if (opts.prefer_compatible && l->is_native_mp4() != r->is_native_mp4()) return l->is_native_mp4();
         if (opts.prefer_compatible && l->is_h264() != r->is_h264()) return l->is_h264();
         int64_t lb = l->bitrate ? l->bitrate : l->filesize;
         int64_t rb = r->bitrate ? r->bitrate : r->filesize;
@@ -113,7 +119,8 @@ inline SelectedPair select_formats(const std::vector<MediaFormat>& fmts, const D
 
     const MediaFormat* cv = pool[0];
     if (cv->has_audio()) return {cv, nullptr};
-    return {cv, pick_best_audio(fmts, opts.prefer_compatible || cv->ext == "mp4")};
+    bool cv_webm = strutil::to_lower(cv->ext) == "webm";
+    return {cv, pick_best_audio(fmts, (opts.prefer_compatible || cv->ext == "mp4") && !cv_webm, cv_webm)};
 }
 
 inline HTTPClient make_http_client(
@@ -188,13 +195,25 @@ inline fs::path download_single_item(
     bool is_audio_out = opts.audio_only || (sel.video == nullptr);
 
     std::string target_ext;
-    if (!opts.target_format.empty()) target_ext = strutil::to_lower(opts.target_format);
-    else if (is_audio_out) {
-        if (sel.audio && sel.audio->ext == "mp3" && SponsorAndSubs::find_ffmpeg().empty()) target_ext = "mp3";
-        else target_ext = settings.audio_format;
+    if (!opts.target_format.empty()) {
+        target_ext = strutil::to_lower(opts.target_format);
+    } else if (is_audio_out) {
+        std::string ae = sel.audio ? strutil::to_lower(sel.audio->ext) : "";
+        if (SponsorAndSubs::find_ffmpeg().empty() &&
+            (ae == "mp3" || ae == "opus" || ae == "ogg" || ae == "flac" || ae == "wav" || ae == "webm" || ae == "aac")) {
+            target_ext = ae;
+        } else {
+            target_ext = settings.audio_format;
+        }
     } else {
-        if (!opts.prefer_compatible && sel.video && sel.video->ext == "webm" && SponsorAndSubs::find_ffmpeg().empty()) target_ext = "webm";
-        else target_ext = settings.video_format;
+        bool v_webm = sel.video && strutil::to_lower(sel.video->ext) == "webm";
+        bool a_webm = sel.audio && strutil::to_lower(sel.audio->ext) == "webm";
+        if (v_webm || a_webm) {
+            bool pure_webm = (!sel.video || v_webm) && (!sel.audio || a_webm);
+            target_ext = pure_webm ? "webm" : "mkv";
+        } else {
+            target_ext = settings.video_format;
+        }
     }
 
     fs::path base_dir = expand_tilde(opts.output_dir.empty() ? settings.folder : opts.output_dir);
@@ -383,16 +402,38 @@ inline fs::path download_single_item(
     }
 
     if (cb.on_stage) cb.on_stage("Merging");
+    auto magic_kind = [](const fs::path& p) -> std::string {
+        FILE* f = std::fopen(p.c_str(), "rb");
+        if (!f) return "";
+        uint8_t b[380]{};
+        size_t n = std::fread(b, 1, sizeof(b), f);
+        std::fclose(f);
+        if (n >= 4 && b[0] == 0x1A && b[1] == 0x45 && b[2] == 0xDF && b[3] == 0xA3) return "ebml";
+        if (n >= 8 && (std::memcmp(&b[4], "ftyp", 4) == 0 || std::memcmp(&b[4], "styp", 4) == 0 || std::memcmp(&b[4], "moov", 4) == 0)) return "mp4";
+        if (n >= 189 && b[0] == 0x47 && b[188] == 0x47) return "ts";
+        if (n >= 1 && b[0] == 0x47) return "ts";
+        return "raw";
+    };
+
     bool has_v = fs::exists(v_tmp), has_a = fs::exists(a_tmp);
+    std::string vk = has_v ? magic_kind(v_tmp) : "";
+    std::string ak = has_a ? magic_kind(a_tmp) : "";
     std::string a_src_ext = sel.audio ? strutil::to_lower(sel.audio->ext) : "";
-    bool raw_non_mp4_audio = !has_v && has_a && (a_src_ext == "mp3" || a_src_ext == "opus" || a_src_ext == "flac" || a_src_ext == "wav");
-    bool webm_involved = (sel.video && sel.video->ext == "webm") || (sel.audio && sel.audio->ext == "webm");
+    bool raw_non_mp4_audio = !has_v && has_a && ak == "raw" &&
+        (a_src_ext == "mp3" || a_src_ext == "opus" || a_src_ext == "ogg" || a_src_ext == "flac" || a_src_ext == "wav" || a_src_ext == "aac");
+    bool ebml_involved = (vk == "ebml" || ak == "ebml" || target_ext == "webm" || target_ext == "mkv");
+
+    // If an audio-only HLS stream actually delivered fMP4 despite a non-m4a format tag, adjust final_path cleanly to .m4a.
+    if (!has_v && has_a && ak == "mp4" && opts.target_format.empty() && target_ext != "m4a" && target_ext != "mp4") {
+        target_ext = "m4a";
+        final_path.replace_extension(".m4a");
+    }
 
     fs::path staged_final = job_dir / ("output." + target_ext);
     if (raw_non_mp4_audio) {
         if (a_src_ext == target_ext) staged_final = a_tmp;
         else SponsorAndSubs::run_ffmpeg_convert(a_tmp, staged_final, target_ext);
-    } else if (!webm_involved) {
+    } else if (!ebml_involved) {
         fs::path mux_out = (target_ext == "mp4" || target_ext == "m4a")
             ? staged_final
             : (job_dir / ("muxed." + std::string(is_audio_out ? "m4a" : "mp4")));
@@ -401,14 +442,14 @@ inline fs::path download_single_item(
         std::vector<fs::path> src_files;
         if (has_v) {
             int si = (int)src_files.size(); src_files.push_back(v_tmp);
-            auto vt = v_ts ? TSDemuxer::demux(v_tmp) : MP4Muxer::read_tracks(v_tmp, si);
+            auto vt = (vk == "ts" || v_ts) ? TSDemuxer::demux(v_tmp) : MP4Muxer::read_tracks(v_tmp, si);
             MP4Muxer::trim_tracks(vt, opts.section, v_base);
             MP4Muxer::remove_intervals(vt, sponsor_cuts);
             for (auto& t : vt) if (!(has_a && t.kind == "soun")) all_tracks.push_back(std::move(t));
         }
         if (has_a) {
             int si = (int)src_files.size(); src_files.push_back(a_tmp);
-            auto at = a_ts ? TSDemuxer::demux(a_tmp) : MP4Muxer::read_tracks(a_tmp, si);
+            auto at = (ak == "ts" || a_ts) ? TSDemuxer::demux(a_tmp) : MP4Muxer::read_tracks(a_tmp, si);
             MP4Muxer::trim_tracks(at, opts.section, a_base);
             MP4Muxer::remove_intervals(at, sponsor_cuts);
             for (auto& t : at) if (t.kind == "soun") all_tracks.push_back(std::move(t));
@@ -429,10 +470,49 @@ inline fs::path download_single_item(
             SponsorAndSubs::run_ffmpeg_convert(mux_out, staged_final, target_ext);
             fs::remove(mux_out, ec);
         }
+    } else if (!has_a && has_v && vk == "ebml" && !opts.section.active() && sponsor_cuts.empty() && target_ext == "webm") {
+        staged_final = v_tmp;
+    } else if (!has_v && has_a && ak == "ebml" && !opts.section.active() && sponsor_cuts.empty() && target_ext == "webm") {
+        staged_final = a_tmp;
     } else {
-        if (has_v && has_a) SponsorAndSubs::run_ffmpeg_convert(v_tmp, staged_final, target_ext, &a_tmp);
-        else if (has_v) staged_final = v_tmp;
-        else if (has_a) staged_final = a_tmp;
+        std::vector<EBMLTrack> ebml_tracks;
+        std::vector<fs::path> src_files;
+        auto append_ebml_src = [&](const fs::path& p, const std::string& kind, double base_s, bool keep_video, bool keep_audio) {
+            int si = (int)src_files.size();
+            src_files.push_back(p);
+            std::vector<EBMLTrack> trs;
+            if (kind == "ebml") {
+                trs = EBMLMuxer::read_tracks(p, si);
+            } else {
+                auto mt = (kind == "ts") ? TSDemuxer::demux(p) : MP4Muxer::read_tracks(p, si);
+                trs = EBMLMuxer::from_mp4_tracks(mt);
+            }
+            EBMLMuxer::trim_tracks(trs, opts.section, base_s);
+            EBMLMuxer::remove_intervals(trs, sponsor_cuts);
+            for (auto& t : trs) {
+                if ((t.track_type == 1 && keep_video) || (t.track_type == 2 && keep_audio))
+                    ebml_tracks.push_back(std::move(t));
+            }
+        };
+        if (has_v) append_ebml_src(v_tmp, vk, v_base, true, !has_a);
+        if (has_a) append_ebml_src(a_tmp, ak, a_base, false, true);
+
+        bool can_webm = (target_ext != "mkv");
+        for (const auto& t : ebml_tracks) {
+            if (t.track_type == 1 && t.codec_id != "V_VP8" && t.codec_id != "V_VP9" && t.codec_id != "V_AV1") can_webm = false;
+            if (t.track_type == 2 && t.codec_id != "A_OPUS" && t.codec_id != "A_VORBIS") can_webm = false;
+        }
+        if (opts.target_format.empty()) {
+            std::string want_ext = can_webm ? "webm" : "mkv";
+            if (target_ext != want_ext) {
+                target_ext = want_ext;
+                final_path.replace_extension("." + want_ext);
+                staged_final = job_dir / ("output." + want_ext);
+            }
+        } else if (!can_webm && target_ext == "webm") {
+            can_webm = false;
+        }
+        EBMLMuxer::write_ebml(std::move(ebml_tracks), src_files, staged_final, can_webm, info.title);
     }
 
     int64_t final_sz = commit_file_verified(staged_final, final_path);

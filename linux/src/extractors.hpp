@@ -237,8 +237,18 @@ struct GenericExtractor {
         std::string ct = strutil::to_lower(resp.header("content-type"));
         if (ct.rfind("video/", 0) == 0 || ct.rfind("audio/", 0) == 0) {
             bool aud = ct.rfind("audio/", 0) == 0;
+            std::string dext = aud ? "m4a" : "mp4";
+            if (ct.find("webm") != std::string::npos) dext = "webm";
+            else if (ct.find("matroska") != std::string::npos) dext = "mkv";
+            else if (ct.find("flac") != std::string::npos) dext = "flac";
+            else if (ct.find("wav") != std::string::npos) dext = "wav";
+            else if (ct.find("opus") != std::string::npos) dext = "opus";
+            else if (ct.find("ogg") != std::string::npos) dext = "ogg";
+            else if (ct.find("mpeg") != std::string::npos && aud) dext = "mp3";
             MediaInfo info; info.id = "direct"; info.title = fin.host; info.site = force_site.empty() ? fin.host : force_site; info.webpage_url = resp.final_url;
-            MediaFormat f; f.id = "direct"; f.url = resp.final_url; f.ext = aud ? "m4a" : "mp4"; f.vcodec = aud ? "none" : "avc1"; f.acodec = "mp4a";
+            MediaFormat f; f.id = "direct"; f.url = resp.final_url.empty() ? raw_url : resp.final_url; f.ext = dext;
+            f.vcodec = aud ? "none" : (dext == "webm" ? "vp9" : "avc1");
+            f.acodec = dext == "mp3" ? "mp3" : (dext == "opus" || dext == "ogg" ? "opus" : (dext == "flac" ? "flac" : "mp4a"));
             info.formats.push_back(f);
             return info;
         }
@@ -264,13 +274,18 @@ struct GenericExtractor {
                 auto hls = HLSEngine::extract_formats(client, abs, hdrs, "hls-" + std::to_string(info.formats.size()));
                 for (auto& hf : hls) info.formats.push_back(std::move(hf));
             } else {
-                bool aud = low.find(".mp3") != std::string::npos || low.find(".m4a") != std::string::npos || low.find(".opus") != std::string::npos;
+                std::string ext = "mp4";
+                for (const char* k : {"webm", "mkv", "mp3", "m4a", "opus", "ogg", "flac", "wav", "aac"}) {
+                    std::string dotk = std::string(".") + k;
+                    if (low.find(dotk) != std::string::npos) { ext = k; break; }
+                }
+                bool aud = (ext == "mp3" || ext == "m4a" || ext == "opus" || ext == "ogg" || ext == "flac" || ext == "wav" || ext == "aac");
                 MediaFormat f;
                 f.id = "web-" + std::to_string(info.formats.size());
                 f.url = abs;
-                f.ext = low.find(".webm") != std::string::npos ? "webm" : (low.find(".mp3") != std::string::npos ? "mp3" : (aud ? "m4a" : "mp4"));
-                f.vcodec = aud ? "none" : "avc1";
-                f.acodec = "mp4a";
+                f.ext = ext;
+                f.vcodec = aud ? "none" : (ext == "webm" ? "vp9" : "avc1");
+                f.acodec = ext == "mp3" ? "mp3" : (ext == "opus" || ext == "ogg" ? "opus" : (ext == "flac" ? "flac" : "mp4a"));
                 f.headers = hdrs;
                 info.formats.push_back(std::move(f));
             }
@@ -278,13 +293,13 @@ struct GenericExtractor {
 
         for (const char* mp : {"og:video:secure_url", "og:video:url", "og:video", "twitter:player:stream", "og:audio"}) {
             std::string v = strutil::meta_content(mp, html);
-            if (!v.empty() && (v.find(".mp4") != std::string::npos || v.find(".m3u8") != std::string::npos || v.find(".webm") != std::string::npos || v.find(".mp3") != std::string::npos))
-                add_url(v);
+            if (!v.empty()) add_url(v);
         }
         for (const auto& u_s : strutil::find_all_json_fields(html, "contentUrl")) add_url(u_s);
         for (const auto& u_s : strutil::scan_media_urls(html, ".m3u8")) add_url(u_s);
         if (info.formats.empty()) {
             for (const auto& u_s : strutil::scan_media_urls(html, ".mp4")) add_url(u_s);
+            for (const auto& u_s : strutil::scan_media_urls(html, ".webm")) add_url(u_s);
         }
         if (info.formats.empty()) throw std::runtime_error("No downloadable media found on " + fin.host);
         return info;
@@ -637,13 +652,15 @@ public:
             for (const auto& f : info.formats) if (f.is_live) info.is_live = true;
             return info;
         }
-        if (pext == "mp4" || pext == "m4a" || pext == "webm" || pext == "mp3" || pext == "wav" || pext == "flac") {
-            bool aud = (pext == "m4a" || pext == "mp3" || pext == "wav" || pext == "flac");
+        if (pext == "mp4" || pext == "m4a" || pext == "webm" || pext == "mkv" || pext == "mp3" || pext == "wav" || pext == "flac" || pext == "opus" || pext == "ogg" || pext == "aac") {
+            bool aud = (pext == "m4a" || pext == "mp3" || pext == "wav" || pext == "flac" || pext == "opus" || pext == "ogg" || pext == "aac");
             auto sl = u.path.rfind('/');
             std::string stem = (sl == std::string::npos) ? u.path : u.path.substr(sl + 1);
             if (auto d2 = stem.rfind('.'); d2 != std::string::npos) stem.resize(d2);
             MediaInfo info; info.id = stem.empty() ? "direct" : stem; info.title = url_decode(info.id); info.site = u.host; info.webpage_url = in;
-            MediaFormat f; f.id = "direct-" + pext; f.url = in; f.ext = pext; f.vcodec = aud ? "none" : "avc1"; f.acodec = pext == "mp3" ? "mp3" : "mp4a";
+            MediaFormat f; f.id = "direct-" + pext; f.url = in; f.ext = pext;
+            f.vcodec = aud ? "none" : (pext == "webm" ? "vp9" : "avc1");
+            f.acodec = pext == "mp3" ? "mp3" : (pext == "opus" || pext == "ogg" ? "opus" : "mp4a");
             info.formats.push_back(f);
             return info;
         }

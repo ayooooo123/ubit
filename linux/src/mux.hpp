@@ -751,6 +751,880 @@ private:
     }
 };
 
+// MARK: - Zero-Encode EBML (WebM & Matroska) Demuxer + Stream-Copy Muxer
+
+struct EBMLPacket {
+    int src_idx = 0;
+    uint64_t offset = 0;
+    uint32_t size = 0;
+    int64_t pts_ns = 0;
+    int64_t discard_padding_ns = 0;
+    bool keyframe = true;
+    std::vector<uint8_t> inline_data;
+};
+
+struct EBMLTrack {
+    uint32_t track_num = 1;
+    uint8_t track_type = 1; // 1 = video, 2 = audio
+    std::string codec_id;
+    uint64_t codec_delay_ns = 0;
+    uint64_t seek_preroll_ns = 0;
+    std::vector<uint8_t> codec_private;
+    uint32_t width = 0, height = 0;
+    std::vector<uint8_t> colour_raw; // raw 0x55B0 master element if present
+    double sample_rate = 48000.0;
+    uint32_t channels = 2, bit_depth = 0;
+    std::vector<EBMLPacket> packets;
+
+    double duration_sec() const {
+        if (packets.empty()) return 0.0;
+        int64_t hi = 0;
+        for (const auto& p : packets) if (p.pts_ns > hi) hi = p.pts_ns;
+        return (double)hi / 1e9;
+    }
+};
+
+class EBMLMuxer {
+    static bool rd_vint_id(FILE* f, uint64_t end_pos, uint32_t& id, uint64_t& hdr_pos) {
+        int64_t cur = ::ftello(f);
+        if (cur < 0 || (uint64_t)cur >= end_pos) return false;
+        hdr_pos = (uint64_t)cur;
+        int b0 = std::fgetc(f);
+        if (b0 == EOF || b0 == 0) return false;
+        int len = 1;
+        while (len <= 4 && (b0 & (0x80 >> (len - 1))) == 0) ++len;
+        if (len > 4 || hdr_pos + (uint64_t)len > end_pos) return false;
+        uint32_t v = (uint32_t)b0;
+        for (int i = 1; i < len; ++i) {
+            int b = std::fgetc(f);
+            if (b == EOF) return false;
+            v = (v << 8) | (uint32_t)b;
+        }
+        id = v;
+        return true;
+    }
+
+    static bool rd_vint_size(FILE* f, uint64_t end_pos, uint64_t& sz, bool& unknown) {
+        int64_t cur = ::ftello(f);
+        if (cur < 0 || (uint64_t)cur >= end_pos) return false;
+        int b0 = std::fgetc(f);
+        if (b0 == EOF || b0 == 0) return false;
+        int len = 1;
+        while (len <= 8 && (b0 & (0x80 >> (len - 1))) == 0) ++len;
+        if (len > 8 || (uint64_t)cur + (uint64_t)len > end_pos) return false;
+        uint64_t mask = (0x80u >> (len - 1)) - 1u;
+        uint64_t v = (uint64_t)b0 & mask;
+        uint64_t all_ones = mask;
+        for (int i = 1; i < len; ++i) {
+            int b = std::fgetc(f);
+            if (b == EOF) return false;
+            v = (v << 8) | (uint64_t)b;
+            all_ones = (all_ones << 8) | 0xffu;
+        }
+        unknown = (v == all_ones);
+        sz = v;
+        return true;
+    }
+
+    static uint64_t rd_uint_mem(const uint8_t* p, size_t n) {
+        uint64_t v = 0;
+        for (size_t i = 0; i < n && i < 8; ++i) v = (v << 8) | p[i];
+        return v;
+    }
+
+    static int64_t rd_sint_mem(const uint8_t* p, size_t n) {
+        if (n == 0) return 0;
+        int64_t v = (p[0] & 0x80) ? -1 : 0;
+        for (size_t i = 0; i < n && i < 8; ++i) v = (v << 8) | p[i];
+        return v;
+    }
+
+    static double rd_float_mem(const uint8_t* p, size_t n) {
+        if (n == 4) {
+            uint32_t u = (uint32_t)rd_uint_mem(p, 4);
+            float fv = 0.0f; std::memcpy(&fv, &u, 4);
+            return (double)fv;
+        }
+        if (n == 8) {
+            uint64_t u = rd_uint_mem(p, 8);
+            double dv = 0.0; std::memcpy(&dv, &u, 8);
+            return dv;
+        }
+        return 0.0;
+    }
+
+    static size_t rd_buf_vint(const uint8_t* p, size_t end, uint64_t& val, bool mask_marker) {
+        if (end == 0 || p[0] == 0) return 0;
+        size_t len = 1;
+        while (len <= 8 && (p[0] & (0x80u >> (len - 1))) == 0) ++len;
+        if (len > 8 || len > end) return 0;
+        uint64_t v = mask_marker ? (p[0] & ((0x80u >> (len - 1)) - 1u)) : p[0];
+        for (size_t i = 1; i < len; ++i) v = (v << 8) | p[i];
+        val = v;
+        return len;
+    }
+
+    static void wr_id(std::vector<uint8_t>& out, uint32_t id) {
+        if (id > 0xffffffu) out.push_back((uint8_t)(id >> 24));
+        if (id > 0xffffu)   out.push_back((uint8_t)(id >> 16));
+        if (id > 0xffu)     out.push_back((uint8_t)(id >> 8));
+        out.push_back((uint8_t)id);
+    }
+
+    static void wr_size(std::vector<uint8_t>& out, uint64_t sz) {
+        if (sz < 0x7fu) {
+            out.push_back((uint8_t)(0x80u | sz));
+        } else if (sz < 0x3fffu) {
+            out.push_back((uint8_t)(0x40u | (sz >> 8)));
+            out.push_back((uint8_t)sz);
+        } else if (sz < 0x1fffffu) {
+            out.push_back((uint8_t)(0x20u | (sz >> 16)));
+            out.push_back((uint8_t)(sz >> 8));
+            out.push_back((uint8_t)sz);
+        } else if (sz < 0x0fffffffu) {
+            out.push_back((uint8_t)(0x10u | (sz >> 24)));
+            out.push_back((uint8_t)(sz >> 16));
+            out.push_back((uint8_t)(sz >> 8));
+            out.push_back((uint8_t)sz);
+        } else {
+            uint64_t v = 0x0100000000000000ULL | sz;
+            for (int s = 56; s >= 0; s -= 8) out.push_back((uint8_t)(v >> s));
+        }
+    }
+
+    static void wr_uint(std::vector<uint8_t>& out, uint32_t id, uint64_t v) {
+        wr_id(out, id);
+        int n = 1;
+        while (n < 8 && (v >> (n * 8)) != 0) ++n;
+        wr_size(out, (uint64_t)n);
+        for (int i = n - 1; i >= 0; --i) out.push_back((uint8_t)(v >> (i * 8)));
+    }
+
+    static void wr_sint(std::vector<uint8_t>& out, uint32_t id, int64_t v) {
+        wr_id(out, id);
+        wr_size(out, 8);
+        uint64_t u = (uint64_t)v;
+        for (int s = 56; s >= 0; s -= 8) out.push_back((uint8_t)(u >> s));
+    }
+
+    static void wr_f64(std::vector<uint8_t>& out, uint32_t id, double dv) {
+        wr_id(out, id);
+        wr_size(out, 8);
+        uint64_t u = 0; std::memcpy(&u, &dv, 8);
+        for (int s = 56; s >= 0; s -= 8) out.push_back((uint8_t)(u >> s));
+    }
+
+    static void wr_str(std::vector<uint8_t>& out, uint32_t id, const std::string& s) {
+        wr_id(out, id);
+        wr_size(out, s.size());
+        out.insert(out.end(), s.begin(), s.end());
+    }
+
+    static void wr_bytes(std::vector<uint8_t>& out, uint32_t id, const std::vector<uint8_t>& b) {
+        wr_id(out, id);
+        wr_size(out, b.size());
+        out.insert(out.end(), b.begin(), b.end());
+    }
+
+    static void wr_master(std::vector<uint8_t>& out, uint32_t id, const std::function<void(std::vector<uint8_t>&)>& fn) {
+        std::vector<uint8_t> body;
+        fn(body);
+        wr_id(out, id);
+        wr_size(out, body.size());
+        out.insert(out.end(), body.begin(), body.end());
+    }
+
+    static void parse_block_frames(
+        FILE* f,
+        int src_idx,
+        uint64_t pay_pos,
+        uint64_t pay_len,
+        int64_t cluster_ts_ticks,
+        uint64_t ts_scale,
+        bool is_simple,
+        bool group_has_ref,
+        int64_t discard_ns,
+        std::map<uint32_t, EBMLTrack>& by_num
+    ) {
+        if (pay_len < 4) return;
+        uint8_t hdr[16]{};
+        size_t rd_n = (size_t)std::min<uint64_t>(pay_len, sizeof(hdr));
+        ::fseeko(f, (off_t)pay_pos, SEEK_SET);
+        if (std::fread(hdr, 1, rd_n, f) != rd_n) return;
+        uint64_t tnum = 0;
+        size_t vlen = rd_buf_vint(hdr, rd_n, tnum, true);
+        if (vlen == 0 || vlen + 3 > pay_len) return;
+        auto it = by_num.find((uint32_t)tnum);
+        if (it == by_num.end()) return;
+        EBMLTrack& tr = it->second;
+
+        int16_t rel_ts = (int16_t)(((uint16_t)hdr[vlen] << 8) | hdr[vlen + 1]);
+        uint8_t flags = hdr[vlen + 2];
+        bool kf = is_simple ? ((flags & 0x80u) != 0) : (!group_has_ref || tr.track_type == 2);
+        int lacing = (flags >> 1) & 0x03;
+        int64_t pts_ns = (cluster_ts_ticks + (int64_t)rel_ts) * (int64_t)ts_scale;
+        uint64_t data_off = pay_pos + vlen + 3;
+        uint64_t data_len = pay_len - (vlen + 3);
+
+        if (lacing == 0) {
+            tr.packets.push_back({src_idx, data_off, (uint32_t)data_len, pts_ns, discard_ns, kf, {}});
+            return;
+        }
+        // Unlace Xiph (1), Fixed (2), or EBML (3) laced frames.
+        std::vector<uint8_t> buf((size_t)data_len);
+        ::fseeko(f, (off_t)data_off, SEEK_SET);
+        if (data_len > 0 && std::fread(buf.data(), 1, (size_t)data_len, f) != (size_t)data_len) return;
+        if (buf.empty()) return;
+        size_t nframes = (size_t)buf[0] + 1;
+        size_t pos = 1;
+        std::vector<size_t> fsizes;
+        if (lacing == 2) {
+            size_t each = (buf.size() - 1) / nframes;
+            fsizes.assign(nframes, each);
+        } else if (lacing == 1) {
+            size_t sum = 0;
+            for (size_t i = 0; i + 1 < nframes; ++i) {
+                size_t sz = 0;
+                while (pos < buf.size()) {
+                    uint8_t b = buf[pos++];
+                    sz += b;
+                    if (b < 255) break;
+                }
+                fsizes.push_back(sz);
+                sum += sz;
+            }
+            fsizes.push_back(pos + sum <= buf.size() ? (buf.size() - pos - sum) : 0);
+        } else {
+            size_t sum = 0;
+            int64_t prev = 0;
+            for (size_t i = 0; i + 1 < nframes; ++i) {
+                uint64_t uv = 0;
+                size_t l = rd_buf_vint(buf.data() + pos, buf.size() - pos, uv, true);
+                if (l == 0) return;
+                pos += l;
+                int64_t sz = (i == 0) ? (int64_t)uv : (prev + ((int64_t)uv - ((1LL << (l * 7 - 1)) - 1LL)));
+                if (sz < 0) return;
+                prev = sz;
+                fsizes.push_back((size_t)sz);
+                sum += (size_t)sz;
+            }
+            fsizes.push_back(pos + sum <= buf.size() ? (buf.size() - pos - sum) : 0);
+        }
+        for (size_t i = 0; i < fsizes.size() && pos + fsizes[i] <= buf.size(); ++i) {
+            tr.packets.push_back({
+                src_idx,
+                data_off + pos,
+                (uint32_t)fsizes[i],
+                pts_ns,
+                (i + 1 == fsizes.size()) ? discard_ns : 0,
+                kf,
+                {}
+            });
+            pos += fsizes[i];
+        }
+    }
+
+public:
+    static bool is_ebml_file(const fs::path& p) {
+        FILE* f = std::fopen(p.c_str(), "rb");
+        if (!f) return false;
+        uint8_t b[4]{};
+        size_t n = std::fread(b, 1, 4, f);
+        std::fclose(f);
+        return n == 4 && b[0] == 0x1A && b[1] == 0x45 && b[2] == 0xDF && b[3] == 0xA3;
+    }
+
+    static std::vector<EBMLTrack> read_tracks(const fs::path& file_path, int src_idx = 0) {
+        FILE* f = std::fopen(file_path.c_str(), "rb");
+        if (!f) throw std::runtime_error("Cannot open " + file_path.string());
+        ::fseeko(f, 0, SEEK_END);
+        uint64_t fsize = (uint64_t)::ftello(f);
+        ::fseeko(f, 0, SEEK_SET);
+
+        uint64_t ts_scale = 1000000ULL;
+        std::map<uint32_t, EBMLTrack> by_num;
+        std::vector<uint32_t> order;
+
+        uint32_t id = 0; uint64_t hpos = 0, esz = 0; bool unk = false;
+        uint64_t seg_start = 0, seg_end = fsize;
+        while (rd_vint_id(f, fsize, id, hpos) && rd_vint_size(f, fsize, esz, unk)) {
+            uint64_t pay = (uint64_t)::ftello(f);
+            uint64_t end = unk ? fsize : std::min(fsize, pay + esz);
+            if (id == 0x18538067u) { seg_start = pay; seg_end = end; break; }
+            ::fseeko(f, (off_t)end, SEEK_SET);
+        }
+        if (seg_start == 0) { std::fclose(f); throw std::runtime_error("Invalid WebM/MKV segment in " + file_path.filename().string()); }
+
+        ::fseeko(f, (off_t)seg_start, SEEK_SET);
+        while (rd_vint_id(f, seg_end, id, hpos) && rd_vint_size(f, seg_end, esz, unk)) {
+            uint64_t pay = (uint64_t)::ftello(f);
+            uint64_t end = unk ? seg_end : std::min(seg_end, pay + esz);
+            if (id == 0x1549A966u && end - pay <= (1u << 20)) {
+                // Info
+                while ((uint64_t)::ftello(f) < end) {
+                    uint32_t cid = 0; uint64_t chp = 0, csz = 0; bool cu = false;
+                    if (!rd_vint_id(f, end, cid, chp) || !rd_vint_size(f, end, csz, cu)) break;
+                    uint64_t cp = (uint64_t)::ftello(f);
+                    uint64_t ce = cu ? end : std::min(end, cp + csz);
+                    if (cid == 0x2AD7B1u && ce - cp <= 8) {
+                        uint8_t b[8]{}; size_t n = (size_t)(ce - cp);
+                        if (std::fread(b, 1, n, f) == n) ts_scale = std::max<uint64_t>(1, rd_uint_mem(b, n));
+                    }
+                    ::fseeko(f, (off_t)ce, SEEK_SET);
+                }
+            } else if (id == 0x1654AE6Bu && end - pay <= (4u << 20)) {
+                // Tracks
+                while ((uint64_t)::ftello(f) < end) {
+                    uint32_t tid = 0; uint64_t thp = 0, tsz = 0; bool tu = false;
+                    if (!rd_vint_id(f, end, tid, thp) || !rd_vint_size(f, end, tsz, tu)) break;
+                    uint64_t tp = (uint64_t)::ftello(f);
+                    uint64_t te = tu ? end : std::min(end, tp + tsz);
+                    if (tid == 0xAEu) {
+                        EBMLTrack tr;
+                        while ((uint64_t)::ftello(f) < te) {
+                            uint32_t fid = 0; uint64_t fhp = 0, fsz = 0; bool fu = false;
+                            if (!rd_vint_id(f, te, fid, fhp) || !rd_vint_size(f, te, fsz, fu)) break;
+                            uint64_t fp = (uint64_t)::ftello(f);
+                            uint64_t fe = fu ? te : std::min(te, fp + fsz);
+                            size_t fn = (size_t)(fe - fp);
+                            if (fid == 0xD7u && fn <= 8) {
+                                uint8_t b[8]{}; if (std::fread(b, 1, fn, f) == fn) tr.track_num = (uint32_t)rd_uint_mem(b, fn);
+                            } else if (fid == 0x83u && fn <= 8) {
+                                uint8_t b[8]{}; if (std::fread(b, 1, fn, f) == fn) tr.track_type = (uint8_t)rd_uint_mem(b, fn);
+                            } else if (fid == 0x86u && fn <= 256) {
+                                tr.codec_id.resize(fn);
+                                if (fn > 0 && std::fread(tr.codec_id.data(), 1, fn, f) == fn) {
+                                    while (!tr.codec_id.empty() && tr.codec_id.back() == '\0') tr.codec_id.pop_back();
+                                }
+                            } else if (fid == 0x56AAu && fn <= 8) {
+                                uint8_t b[8]{}; if (std::fread(b, 1, fn, f) == fn) tr.codec_delay_ns = rd_uint_mem(b, fn);
+                            } else if (fid == 0x56BBu && fn <= 8) {
+                                uint8_t b[8]{}; if (std::fread(b, 1, fn, f) == fn) tr.seek_preroll_ns = rd_uint_mem(b, fn);
+                            } else if (fid == 0x63A2u && fn <= (1u << 20)) {
+                                tr.codec_private.resize(fn);
+                                if (fn > 0) (void)std::fread(tr.codec_private.data(), 1, fn, f);
+                            } else if (fid == 0xE0u) {
+                                while ((uint64_t)::ftello(f) < fe) {
+                                    uint32_t vid = 0; uint64_t vhp = 0, vsz = 0; bool vu = false;
+                                    if (!rd_vint_id(f, fe, vid, vhp) || !rd_vint_size(f, fe, vsz, vu)) break;
+                                    uint64_t vp = (uint64_t)::ftello(f);
+                                    uint64_t ve = vu ? fe : std::min(fe, vp + vsz);
+                                    size_t vn = (size_t)(ve - vp);
+                                    if (vid == 0xB0u && vn <= 8) { uint8_t b[8]{}; if (std::fread(b, 1, vn, f) == vn) tr.width = (uint32_t)rd_uint_mem(b, vn); }
+                                    else if (vid == 0xBAu && vn <= 8) { uint8_t b[8]{}; if (std::fread(b, 1, vn, f) == vn) tr.height = (uint32_t)rd_uint_mem(b, vn); }
+                                    else if (vid == 0x55B0u && !vu && ve - vhp <= 4096) {
+                                        tr.colour_raw.resize((size_t)(ve - vhp));
+                                        ::fseeko(f, (off_t)vhp, SEEK_SET);
+                                        (void)std::fread(tr.colour_raw.data(), 1, tr.colour_raw.size(), f);
+                                    }
+                                    ::fseeko(f, (off_t)ve, SEEK_SET);
+                                }
+                            } else if (fid == 0xE1u) {
+                                while ((uint64_t)::ftello(f) < fe) {
+                                    uint32_t aid = 0; uint64_t ahp = 0, asz = 0; bool au = false;
+                                    if (!rd_vint_id(f, fe, aid, ahp) || !rd_vint_size(f, fe, asz, au)) break;
+                                    uint64_t ap = (uint64_t)::ftello(f);
+                                    uint64_t ae = au ? fe : std::min(fe, ap + asz);
+                                    size_t an = (size_t)(ae - ap);
+                                    if (aid == 0xB5u && (an == 4 || an == 8)) { uint8_t b[8]{}; if (std::fread(b, 1, an, f) == an) tr.sample_rate = rd_float_mem(b, an); }
+                                    else if (aid == 0x9Fu && an <= 8) { uint8_t b[8]{}; if (std::fread(b, 1, an, f) == an) tr.channels = (uint32_t)rd_uint_mem(b, an); }
+                                    else if (aid == 0x6264u && an <= 8) { uint8_t b[8]{}; if (std::fread(b, 1, an, f) == an) tr.bit_depth = (uint32_t)rd_uint_mem(b, an); }
+                                    ::fseeko(f, (off_t)ae, SEEK_SET);
+                                }
+                            }
+                            ::fseeko(f, (off_t)fe, SEEK_SET);
+                        }
+                        if ((tr.track_type == 1 || tr.track_type == 2) && !tr.codec_id.empty()) {
+                            by_num[tr.track_num] = std::move(tr);
+                            order.push_back(by_num.rbegin()->first);
+                        }
+                    }
+                    ::fseeko(f, (off_t)te, SEEK_SET);
+                }
+                order.clear();
+                for (const auto& [tn, _] : by_num) order.push_back(tn);
+            } else if (id == 0x1F43B675u) {
+                // Cluster
+                int64_t cluster_ts = 0;
+                while ((uint64_t)::ftello(f) < end) {
+                    uint32_t cid = 0; uint64_t chp = 0, csz = 0; bool cu = false;
+                    if (!rd_vint_id(f, end, cid, chp) || !rd_vint_size(f, end, csz, cu)) break;
+                    // In an unknown-size Cluster, a top-level Segment element starts the next section.
+                    if (unk && (cid == 0x1F43B675u || cid == 0x1C53BB6Bu || cid == 0x1254C367u)) {
+                        end = chp;
+                        break;
+                    }
+                    uint64_t cp = (uint64_t)::ftello(f);
+                    uint64_t ce = cu ? end : std::min(end, cp + csz);
+                    if (cid == 0xE7u && ce - cp <= 8) {
+                        uint8_t b[8]{}; size_t n = (size_t)(ce - cp);
+                        if (std::fread(b, 1, n, f) == n) cluster_ts = (int64_t)rd_uint_mem(b, n);
+                    } else if (cid == 0xA3u) {
+                        parse_block_frames(f, src_idx, cp, ce - cp, cluster_ts, ts_scale, true, false, 0, by_num);
+                    } else if (cid == 0xA0u) {
+                        uint64_t blk_p = 0, blk_l = 0;
+                        bool has_ref = false;
+                        int64_t discard_ns = 0;
+                        while ((uint64_t)::ftello(f) < ce) {
+                            uint32_t bid = 0; uint64_t bhp = 0, bsz = 0; bool bu = false;
+                            if (!rd_vint_id(f, ce, bid, bhp) || !rd_vint_size(f, ce, bsz, bu)) break;
+                            uint64_t bp = (uint64_t)::ftello(f);
+                            uint64_t be = bu ? ce : std::min(ce, bp + bsz);
+                            if (bid == 0xA1u) { blk_p = bp; blk_l = be - bp; }
+                            else if (bid == 0xFBu) has_ref = true;
+                            else if (bid == 0x75A2u && be - bp <= 8) {
+                                uint8_t b[8]{}; size_t n = (size_t)(be - bp);
+                                if (std::fread(b, 1, n, f) == n) discard_ns = rd_sint_mem(b, n);
+                            }
+                            ::fseeko(f, (off_t)be, SEEK_SET);
+                        }
+                        if (blk_l > 0) parse_block_frames(f, src_idx, blk_p, blk_l, cluster_ts, ts_scale, false, has_ref, discard_ns, by_num);
+                    }
+                    ::fseeko(f, (off_t)ce, SEEK_SET);
+                }
+            }
+            ::fseeko(f, (off_t)end, SEEK_SET);
+        }
+        std::fclose(f);
+
+        std::vector<EBMLTrack> out;
+        for (uint32_t tn : order) if (!by_num[tn].packets.empty()) out.push_back(std::move(by_num[tn]));
+        return out;
+    }
+
+    static std::vector<EBMLTrack> from_mp4_tracks(const std::vector<MP4Track>& mp4_tracks) {
+        std::vector<EBMLTrack> out;
+        for (const auto& mt : mp4_tracks) {
+            if (mt.kind != "vide" && mt.kind != "soun") continue;
+            if (mt.stsd_payload.size() < 16) continue;
+            const uint8_t* sd = mt.stsd_payload.data();
+            auto entries = list_boxes(sd, 8, mt.stsd_payload.size());
+            if (entries.empty()) continue;
+            const BoxRef& se = entries[0];
+
+            EBMLTrack et;
+            et.track_type = (mt.kind == "vide") ? 1 : 2;
+            if (mt.kind == "vide") {
+                if (se.type == "avc1" || se.type == "avc3") et.codec_id = "V_MPEG4/ISO/AVC";
+                else if (se.type == "hvc1" || se.type == "hev1") et.codec_id = "V_MPEGH/ISO/HEVC";
+                else if (se.type == "av01") et.codec_id = "V_AV1";
+                else if (se.type == "vp09") et.codec_id = "V_VP9";
+                else if (se.type == "vp08") et.codec_id = "V_VP8";
+                else continue;
+                et.width = mt.width;
+                et.height = mt.height;
+                if (se.pay_off + 78 <= se.end_off) {
+                    if (et.width == 0) et.width = ((uint32_t)sd[se.pay_off + 24] << 8) | sd[se.pay_off + 25];
+                    if (et.height == 0) et.height = ((uint32_t)sd[se.pay_off + 26] << 8) | sd[se.pay_off + 27];
+                    for (const auto& cb : list_boxes(sd, se.pay_off + 78, se.end_off)) {
+                        if (cb.type == "avcC" || cb.type == "hvcC" || cb.type == "av1C" || cb.type == "vpcC") {
+                            et.codec_private.assign(sd + cb.pay_off, sd + cb.end_off);
+                            break;
+                        }
+                    }
+                }
+            } else {
+                et.sample_rate = mt.timescale > 0 ? (double)mt.timescale : 48000.0;
+                if (se.pay_off + 28 <= se.end_off) {
+                    et.channels = std::max<uint32_t>(1, ((uint32_t)sd[se.pay_off + 16] << 8) | sd[se.pay_off + 17]);
+                    uint32_t sr16 = rd_u32(sd + se.pay_off + 24) >> 16;
+                    if (sr16 > 0) et.sample_rate = (double)sr16;
+                }
+                if (se.type == "mp4a" && se.pay_off + 28 <= se.end_off) {
+                    et.codec_id = "A_AAC";
+                    for (const auto& cb : list_boxes(sd, se.pay_off + 28, se.end_off)) {
+                        if (cb.type == "esds" && cb.pay_off + 4 < cb.end_off) {
+                            size_t p = cb.pay_off + 4;
+                            while (p + 2 <= cb.end_off) {
+                                uint8_t tag = sd[p++];
+                                uint32_t dlen = 0;
+                                for (int k = 0; k < 4 && p < cb.end_off; ++k) {
+                                    uint8_t b = sd[p++];
+                                    dlen = (dlen << 7) | (b & 0x7fu);
+                                    if ((b & 0x80u) == 0) break;
+                                }
+                                if (tag == 0x03 && p + 3 <= cb.end_off) {
+                                    uint8_t fl = sd[p + 2];
+                                    p += 3 + ((fl & 0x80) ? 2 : 0) + ((fl & 0x40) ? (1 + sd[p + 3]) : 0) + ((fl & 0x20) ? 2 : 0);
+                                } else if (tag == 0x04 && p + 13 <= cb.end_off) {
+                                    p += 13;
+                                } else if (tag == 0x05 && p + dlen <= cb.end_off) {
+                                    et.codec_private.assign(sd + p, sd + p + dlen);
+                                    break;
+                                } else {
+                                    p += dlen;
+                                }
+                            }
+                        }
+                    }
+                } else if (se.type == "Opus" && se.pay_off + 28 <= se.end_off) {
+                    et.codec_id = "A_OPUS";
+                    et.sample_rate = 48000.0;
+                    et.seek_preroll_ns = 80000000ULL;
+                    for (const auto& cb : list_boxes(sd, se.pay_off + 28, se.end_off)) {
+                        if (cb.type == "dOps" && cb.pay_off + 11 <= cb.end_off) {
+                            const uint8_t* dp = sd + cb.pay_off;
+                            uint8_t ch = dp[1];
+                            uint16_t pre = ((uint16_t)dp[2] << 8) | dp[3];
+                            uint32_t srate = rd_u32(dp + 4);
+                            uint16_t gain = ((uint16_t)dp[8] << 8) | dp[9];
+                            uint8_t mapf = dp[10];
+                            et.channels = std::max<uint32_t>(1, ch);
+                            et.codec_delay_ns = (uint64_t)pre * 1000000000ULL / 48000ULL;
+                            std::vector<uint8_t> oh = {'O','p','u','s','H','e','a','d', 1, ch,
+                                (uint8_t)(pre & 0xff), (uint8_t)(pre >> 8),
+                                (uint8_t)(srate & 0xff), (uint8_t)((srate >> 8) & 0xff), (uint8_t)((srate >> 16) & 0xff), (uint8_t)(srate >> 24),
+                                (uint8_t)(gain & 0xff), (uint8_t)(gain >> 8), mapf};
+                            if (cb.pay_off + 11 < cb.end_off) oh.insert(oh.end(), sd + cb.pay_off + 11, sd + cb.end_off);
+                            et.codec_private = std::move(oh);
+                        }
+                    }
+                } else continue;
+            }
+
+            uint32_t ts = std::max<uint32_t>(1, mt.timescale);
+            int64_t ticks = 0;
+            et.packets.reserve(mt.samples.size());
+            for (const auto& s : mt.samples) {
+                int64_t pts_ticks = ticks + (int64_t)s.cts_offset;
+                int64_t pts_ns = (pts_ticks * 1000000000LL) / (int64_t)ts;
+                et.packets.push_back({s.src_idx, s.offset, s.size, std::max<int64_t>(0, pts_ns), 0, s.is_sync, s.inline_data});
+                ticks += s.duration;
+            }
+            if (!et.packets.empty()) out.push_back(std::move(et));
+        }
+        return out;
+    }
+
+    static void trim_tracks(std::vector<EBMLTrack>& tracks, const SectionRange& sec, double base_sec = 0.0) {
+        if (!sec.active()) return;
+        int64_t s_ns = (int64_t)(std::max(0.0, (sec.start >= 0 ? sec.start : 0.0) - base_sec) * 1e9);
+        int64_t e_ns = (sec.end >= 0) ? (int64_t)(std::max(0.0, sec.end - base_sec) * 1e9) : -1;
+        int64_t eff_ns = s_ns;
+        for (const auto& t : tracks) {
+            if (t.track_type == 1) {
+                int64_t last_kf = 0;
+                for (const auto& p : t.packets) {
+                    if (p.pts_ns > s_ns) break;
+                    if (p.keyframe) last_kf = p.pts_ns;
+                }
+                eff_ns = last_kf;
+                break;
+            }
+        }
+        for (auto& t : tracks) {
+            std::vector<EBMLPacket> kept;
+            for (auto& p : t.packets) {
+                if (p.pts_ns < eff_ns) continue;
+                if (e_ns >= 0 && p.pts_ns > e_ns) break;
+                p.pts_ns -= eff_ns;
+                kept.push_back(std::move(p));
+            }
+            t.packets.swap(kept);
+        }
+    }
+
+    static void remove_intervals(std::vector<EBMLTrack>& tracks, const std::vector<std::pair<double, double>>& cuts) {
+        if (cuts.empty()) return;
+        for (auto& t : tracks) {
+            std::vector<EBMLPacket> kept;
+            for (auto& p : t.packets) {
+                double s = (double)p.pts_ns / 1e9;
+                bool drop = false;
+                double shift = 0.0;
+                for (const auto& [c0, c1] : cuts) {
+                    if (s >= c0 && s < c1) { drop = true; break; }
+                    if (s >= c1) shift += (c1 - c0);
+                }
+                if (!drop) {
+                    p.pts_ns = std::max<int64_t>(0, p.pts_ns - (int64_t)(shift * 1e9));
+                    kept.push_back(std::move(p));
+                }
+            }
+            t.packets.swap(kept);
+        }
+    }
+
+    static void write_ebml(
+        std::vector<EBMLTrack> tracks,
+        const std::vector<fs::path>& source_files,
+        const fs::path& dest,
+        bool is_webm,
+        const std::string& title = ""
+    ) {
+        if (tracks.empty()) throw std::runtime_error("No WebM/MKV tracks to mux");
+        uint32_t video_tnum = 0;
+        int64_t max_pts_ns = 0;
+        for (size_t i = 0; i < tracks.size(); ++i) {
+            tracks[i].track_num = (uint32_t)(i + 1);
+            if (tracks[i].track_type == 1 && video_tnum == 0) video_tnum = tracks[i].track_num;
+            for (const auto& p : tracks[i].packets) if (p.pts_ns > max_pts_ns) max_pts_ns = p.pts_ns;
+        }
+        double dur_ms = std::max(1.0, (double)max_pts_ns / 1e6 + 20.0);
+
+        std::vector<FILE*> ins(source_files.size(), nullptr);
+        struct InGuard {
+            std::vector<FILE*>& v;
+            ~InGuard() { for (FILE* f : v) if (f) std::fclose(f); }
+        } in_guard{ins};
+        for (size_t i = 0; i < source_files.size(); ++i) {
+            ins[i] = std::fopen(source_files[i].c_str(), "rb");
+            if (!ins[i]) throw std::runtime_error("Cannot open source " + source_files[i].string());
+        }
+
+        fs::path part = dest.string() + ".part";
+        FILE* out = std::fopen(part.c_str(), "wb");
+        if (!out) throw std::runtime_error("Cannot write " + part.string());
+
+        // 1. EBML header + Segment 8-byte size placeholder + 128-byte SeekHead/Void slot.
+        std::vector<uint8_t> ebml_hdr;
+        wr_master(ebml_hdr, 0x1A45DFA3u, [&](std::vector<uint8_t>& h) {
+            wr_uint(h, 0x4286u, 1);
+            wr_uint(h, 0x42F7u, 1);
+            wr_uint(h, 0x42F2u, 4);
+            wr_uint(h, 0x42F3u, 8);
+            wr_str(h, 0x4282u, is_webm ? "webm" : "matroska");
+            wr_uint(h, 0x4287u, 4);
+            wr_uint(h, 0x4285u, 2);
+        });
+        std::fwrite(ebml_hdr.data(), 1, ebml_hdr.size(), out);
+
+        uint64_t seg_size_file_off = (uint64_t)::ftello(out) + 4;
+        uint8_t seg_open[12] = {0x18, 0x53, 0x80, 0x67, 0x01, 0, 0, 0, 0, 0, 0, 0};
+        std::fwrite(seg_open, 1, 12, out);
+        uint64_t seg_data_off = (uint64_t)::ftello(out);
+
+        constexpr size_t SEEK_SLOT_LEN = 128;
+        std::vector<uint8_t> blank_slot(SEEK_SLOT_LEN, 0);
+        blank_slot[0] = 0xEC; // EBML Void placeholder until patched
+        blank_slot[1] = (uint8_t)(0x80u | (SEEK_SLOT_LEN - 2));
+        std::fwrite(blank_slot.data(), 1, SEEK_SLOT_LEN, out);
+
+        // 2. Info + Tracks
+        uint64_t info_rel = (uint64_t)::ftello(out) - seg_data_off;
+        std::vector<uint8_t> info_buf;
+        wr_master(info_buf, 0x1549A966u, [&](std::vector<uint8_t>& ib) {
+            wr_uint(ib, 0x2AD7B1u, 1000000ULL);
+            wr_str(ib, 0x4D80u, "uBit");
+            wr_str(ib, 0x5741u, "uBit");
+            wr_f64(ib, 0x4489u, dur_ms);
+            if (!is_webm && !title.empty()) wr_str(ib, 0x7BA9u, title);
+        });
+        std::fwrite(info_buf.data(), 1, info_buf.size(), out);
+
+        uint64_t tracks_rel = (uint64_t)::ftello(out) - seg_data_off;
+        std::vector<uint8_t> tracks_buf;
+        wr_master(tracks_buf, 0x1654AE6Bu, [&](std::vector<uint8_t>& tb) {
+            for (const auto& t : tracks) {
+                wr_master(tb, 0xAEu, [&](std::vector<uint8_t>& te) {
+                    wr_uint(te, 0xD7u, t.track_num);
+                    wr_uint(te, 0x73C5u, t.track_num);
+                    wr_uint(te, 0x83u, t.track_type);
+                    wr_uint(te, 0x9Cu, 0);
+                    wr_str(te, 0x86u, t.codec_id);
+                    if (t.codec_delay_ns > 0) wr_uint(te, 0x56AAu, t.codec_delay_ns);
+                    if (t.seek_preroll_ns > 0) wr_uint(te, 0x56BBu, t.seek_preroll_ns);
+                    if (!t.codec_private.empty()) wr_bytes(te, 0x63A2u, t.codec_private);
+                    if (t.track_type == 1) {
+                        wr_master(te, 0xE0u, [&](std::vector<uint8_t>& vb) {
+                            wr_uint(vb, 0xB0u, std::max<uint32_t>(1, t.width));
+                            wr_uint(vb, 0xBAu, std::max<uint32_t>(1, t.height));
+                            if (!t.colour_raw.empty()) vb.insert(vb.end(), t.colour_raw.begin(), t.colour_raw.end());
+                        });
+                    } else {
+                        wr_master(te, 0xE1u, [&](std::vector<uint8_t>& ab) {
+                            wr_f64(ab, 0xB5u, t.sample_rate > 0 ? t.sample_rate : 48000.0);
+                            wr_uint(ab, 0x9Fu, std::max<uint32_t>(1, t.channels));
+                            if (t.bit_depth > 0) wr_uint(ab, 0x6264u, t.bit_depth);
+                        });
+                    }
+                });
+            }
+        });
+        std::fwrite(tracks_buf.data(), 1, tracks_buf.size(), out);
+
+        // 3. Interleave packets across tracks by millisecond timestamp (video keyframes first on ties).
+        struct Ref { uint32_t t_idx; uint32_t p_idx; int64_t ms; bool v_kf; };
+        size_t total_pkts = 0;
+        for (const auto& t : tracks) total_pkts += t.packets.size();
+        std::vector<Ref> sched;
+        sched.reserve(total_pkts);
+        for (size_t ti = 0; ti < tracks.size(); ++ti) {
+            bool is_v = (tracks[ti].track_type == 1);
+            for (size_t pi = 0; pi < tracks[ti].packets.size(); ++pi) {
+                int64_t ms = (tracks[ti].packets[pi].pts_ns + 500000LL) / 1000000LL;
+                sched.push_back({(uint32_t)ti, (uint32_t)pi, std::max<int64_t>(0, ms), is_v && tracks[ti].packets[pi].keyframe});
+            }
+        }
+        std::stable_sort(sched.begin(), sched.end(), [](const Ref& a, const Ref& b) {
+            if (a.ms != b.ms) return a.ms < b.ms;
+            if (a.v_kf != b.v_kf) return a.v_kf;
+            return a.t_idx < b.t_idx;
+        });
+
+        struct CueRec { uint64_t time_ms; uint32_t track_num; uint64_t cluster_rel; };
+        std::vector<CueRec> cues;
+        std::vector<uint8_t> copy_buf(65536);
+
+        size_t idx = 0;
+        while (idx < sched.size()) {
+            int64_t cluster_ms = sched[idx].ms;
+            size_t end_idx = idx + 1;
+            while (end_idx < sched.size()) {
+                int64_t rel = sched[end_idx].ms - cluster_ms;
+                if (rel > 30000) break;
+                if (video_tnum != 0) {
+                    if (sched[end_idx].v_kf && rel >= 500) break;
+                } else if (rel >= 4000) {
+                    break;
+                }
+                ++end_idx;
+            }
+
+            // Exact pre-computed Cluster byte size -> single-pass streaming write with 0 RAM buffering of frames!
+            std::vector<uint8_t> ts_el;
+            wr_uint(ts_el, 0xE7u, (uint64_t)cluster_ms);
+            uint64_t cluster_payload_sz = ts_el.size();
+
+            for (size_t k = idx; k < end_idx; ++k) {
+                const auto& tr = tracks[sched[k].t_idx];
+                const auto& pk = tr.packets[sched[k].p_idx];
+                uint32_t pay_sz = pk.inline_data.empty() ? pk.size : (uint32_t)pk.inline_data.size();
+                uint64_t blk_sz = 4ULL + pay_sz;
+                if (pk.discard_padding_ns == 0) {
+                    std::vector<uint8_t> tmp_h;
+                    wr_id(tmp_h, 0xA3u);
+                    wr_size(tmp_h, blk_sz);
+                    cluster_payload_sz += tmp_h.size() + blk_sz;
+                } else {
+                    std::vector<uint8_t> sub_h, dp_el, ref_el, grp_h;
+                    wr_id(sub_h, 0xA1u); wr_size(sub_h, blk_sz);
+                    wr_sint(dp_el, 0x75A2u, pk.discard_padding_ns);
+                    if (!pk.keyframe) wr_uint(ref_el, 0xFBu, 0);
+                    uint64_t grp_sz = sub_h.size() + blk_sz + dp_el.size() + ref_el.size();
+                    wr_id(grp_h, 0xA0u); wr_size(grp_h, grp_sz);
+                    cluster_payload_sz += grp_h.size() + grp_sz;
+                }
+            }
+
+            uint64_t cluster_rel = (uint64_t)::ftello(out) - seg_data_off;
+            uint32_t cue_track = (video_tnum != 0) ? video_tnum : tracks[0].track_num;
+            cues.push_back({(uint64_t)cluster_ms, cue_track, cluster_rel});
+
+            std::vector<uint8_t> cl_hdr;
+            wr_id(cl_hdr, 0x1F43B675u);
+            wr_size(cl_hdr, cluster_payload_sz);
+            cl_hdr.insert(cl_hdr.end(), ts_el.begin(), ts_el.end());
+            std::fwrite(cl_hdr.data(), 1, cl_hdr.size(), out);
+
+            auto stream_pkt = [&](const EBMLPacket& pk) {
+                if (!pk.inline_data.empty()) {
+                    std::fwrite(pk.inline_data.data(), 1, pk.inline_data.size(), out);
+                    return;
+                }
+                FILE* sf = ins[(size_t)pk.src_idx];
+                ::fseeko(sf, (off_t)pk.offset, SEEK_SET);
+                uint32_t rem = pk.size;
+                while (rem > 0) {
+                    size_t chunk = std::min<size_t>(rem, copy_buf.size());
+                    size_t got = std::fread(copy_buf.data(), 1, chunk, sf);
+                    if (got == 0) throw std::runtime_error("Unexpected EOF reading WebM/MKV packet");
+                    std::fwrite(copy_buf.data(), 1, got, out);
+                    rem -= (uint32_t)got;
+                }
+            };
+
+            for (size_t k = idx; k < end_idx; ++k) {
+                const auto& tr = tracks[sched[k].t_idx];
+                const auto& pk = tr.packets[sched[k].p_idx];
+                uint32_t pay_sz = pk.inline_data.empty() ? pk.size : (uint32_t)pk.inline_data.size();
+                int16_t rel_ms = (int16_t)std::max<int64_t>(-32768, std::min<int64_t>(32767, sched[k].ms - cluster_ms));
+                uint8_t b4[4] = {
+                    (uint8_t)(0x80u | (tr.track_num & 0x7fu)),
+                    (uint8_t)((uint16_t)rel_ms >> 8),
+                    (uint8_t)((uint16_t)rel_ms & 0xffu),
+                    (uint8_t)((pk.discard_padding_ns == 0 && pk.keyframe) ? 0x80u : 0x00u)
+                };
+                uint64_t blk_sz = 4ULL + pay_sz;
+                if (pk.discard_padding_ns == 0) {
+                    std::vector<uint8_t> bh;
+                    wr_id(bh, 0xA3u); wr_size(bh, blk_sz);
+                    bh.insert(bh.end(), b4, b4 + 4);
+                    std::fwrite(bh.data(), 1, bh.size(), out);
+                    stream_pkt(pk);
+                } else {
+                    std::vector<uint8_t> sub_h, dp_el, ref_el, grp_h;
+                    wr_id(sub_h, 0xA1u); wr_size(sub_h, blk_sz);
+                    wr_sint(dp_el, 0x75A2u, pk.discard_padding_ns);
+                    if (!pk.keyframe) wr_uint(ref_el, 0xFBu, 0);
+                    uint64_t grp_sz = sub_h.size() + blk_sz + dp_el.size() + ref_el.size();
+                    wr_id(grp_h, 0xA0u); wr_size(grp_h, grp_sz);
+                    grp_h.insert(grp_h.end(), sub_h.begin(), sub_h.end());
+                    grp_h.insert(grp_h.end(), b4, b4 + 4);
+                    std::fwrite(grp_h.data(), 1, grp_h.size(), out);
+                    stream_pkt(pk);
+                    std::fwrite(dp_el.data(), 1, dp_el.size(), out);
+                    if (!ref_el.empty()) std::fwrite(ref_el.data(), 1, ref_el.size(), out);
+                }
+            }
+            idx = end_idx;
+        }
+
+        // 4. Cues index
+        uint64_t cues_rel = (uint64_t)::ftello(out) - seg_data_off;
+        std::vector<uint8_t> cues_buf;
+        wr_master(cues_buf, 0x1C53BB6Bu, [&](std::vector<uint8_t>& cb) {
+            for (const auto& c : cues) {
+                wr_master(cb, 0xBBu, [&](std::vector<uint8_t>& cp) {
+                    wr_uint(cp, 0xB3u, c.time_ms);
+                    wr_master(cp, 0xB7u, [&](std::vector<uint8_t>& tp) {
+                        wr_uint(tp, 0xF7u, c.track_num);
+                        wr_uint(tp, 0xF1u, c.cluster_rel);
+                    });
+                });
+            }
+        });
+        std::fwrite(cues_buf.data(), 1, cues_buf.size(), out);
+
+        uint64_t file_end = (uint64_t)::ftello(out);
+        uint64_t seg_len = file_end - seg_data_off;
+
+        // 5. Patch Segment 8-byte size and SeekHead + trailing Void inside the 128-byte slot.
+        uint64_t seg_vint = 0x0100000000000000ULL | seg_len;
+        uint8_t seg_sz8[8];
+        for (int i = 0; i < 8; ++i) seg_sz8[i] = (uint8_t)(seg_vint >> ((7 - i) * 8));
+        ::fseeko(out, (off_t)seg_size_file_off, SEEK_SET);
+        std::fwrite(seg_sz8, 1, 8, out);
+
+        std::vector<uint8_t> seek_head;
+        auto add_seek = [&](std::vector<uint8_t>& sh, uint32_t target_id, uint64_t rel_pos) {
+            wr_master(sh, 0x4DBBu, [&](std::vector<uint8_t>& sk) {
+                std::vector<uint8_t> idb; wr_id(idb, target_id);
+                wr_bytes(sk, 0x53ABu, idb);
+                wr_uint(sk, 0x53ACu, rel_pos);
+            });
+        };
+        wr_master(seek_head, 0x114D9B74u, [&](std::vector<uint8_t>& sh) {
+            add_seek(sh, 0x1549A966u, info_rel);
+            add_seek(sh, 0x1654AE6Bu, tracks_rel);
+            add_seek(sh, 0x1C53BB6Bu, cues_rel);
+        });
+        if (seek_head.size() + 2 <= SEEK_SLOT_LEN) {
+            size_t rem = SEEK_SLOT_LEN - seek_head.size() - 2;
+            seek_head.push_back(0xEC);
+            seek_head.push_back((uint8_t)(0x80u | rem));
+            seek_head.resize(SEEK_SLOT_LEN, 0);
+            ::fseeko(out, (off_t)seg_data_off, SEEK_SET);
+            std::fwrite(seek_head.data(), 1, SEEK_SLOT_LEN, out);
+        }
+
+        std::fflush(out);
+        ::fsync(fileno(out));
+        std::fclose(out);
+        commit_file_verified(part, dest);
+    }
+};
+
 // MARK: - Pure C++ 188-Byte MPEG-TS (H.264 Annex-B + ADTS AAC) -> MP4Track Demuxer
 
 class TSDemuxer {
@@ -979,8 +1853,15 @@ public:
 
         if (txt.find("#EXT-X-STREAM-INF") == std::string::npos) {
             bool live = (txt.find("#EXT-X-ENDLIST") == std::string::npos) && (txt.find("#EXTINF:") != std::string::npos);
-            MediaFormat f; f.id = pfx; f.url = base.origin() + base.path_and_query; f.ext = "mp4"; f.proto = "hls";
-            f.vcodec = "avc1"; f.acodec = "mp4a"; f.headers = hdrs; f.is_live = live;
+            std::string low_txt = txt;
+            for (char& c : low_txt) c = (char)std::tolower((unsigned char)c);
+            std::string ext = "mp4", vc = "avc1", ac = "mp4a";
+            if (low_txt.find(".opus") != std::string::npos) { ext = "opus"; vc = "none"; ac = "opus"; }
+            else if (low_txt.find(".ogg") != std::string::npos) { ext = "ogg"; vc = "none"; ac = "opus"; }
+            else if (low_txt.find(".mp3") != std::string::npos) { ext = "mp3"; vc = "none"; ac = "mp3"; }
+            else if (low_txt.find(".webm") != std::string::npos) { ext = "webm"; vc = "vp9"; ac = "opus"; }
+            MediaFormat f; f.id = pfx; f.url = base.origin() + base.path_and_query; f.ext = ext; f.proto = "hls";
+            f.vcodec = vc; f.acodec = ac; f.headers = hdrs; f.is_live = live;
             return {f};
         }
 
@@ -1251,12 +2132,75 @@ public:
             std::fwrite(init_bytes.data(), 1, init_bytes.size(), out);
             head16.assign(init_bytes.begin(), init_bytes.begin() + std::min<size_t>(16, init_bytes.size()));
         }
+        auto ogg_crc32 = [](const uint8_t* data, size_t len) -> uint32_t {
+            uint32_t crc = 0;
+            for (size_t k = 0; k < len; ++k) {
+                crc ^= (uint32_t)data[k] << 24;
+                for (int b = 0; b < 8; ++b) crc = (crc & 0x80000000u) ? ((crc << 1) ^ 0x04C11DB7u) : (crc << 1);
+            }
+            return crc;
+        };
+        bool unchain_ogg = false;
+        uint32_t ogg_serial = 0x55424954u;
+        uint32_t ogg_seq = 0;
+        int64_t ogg_max_gran = 0;
         for (size_t i = 0; i < segs.size(); ++i) {
             char name[32]; std::snprintf(name, sizeof(name), "%06zu.seg", i);
             std::ifstream sf(seg_dir / name, std::ios::binary);
             std::vector<uint8_t> sb((std::istreambuf_iterator<char>(sf)), std::istreambuf_iterator<char>());
-            if (head16.empty() && !sb.empty()) head16.assign(sb.begin(), sb.begin() + std::min<size_t>(16, sb.size()));
-            if (!sb.empty()) std::fwrite(sb.data(), 1, sb.size(), out);
+            if (head16.empty() && !sb.empty()) {
+                head16.assign(sb.begin(), sb.begin() + std::min<size_t>(16, sb.size()));
+                unchain_ogg = init_bytes.empty() && segs.size() > 1 && sb.size() >= 27 && std::memcmp(sb.data(), "OggS", 4) == 0;
+            }
+            if (!unchain_ogg) {
+                if (!sb.empty()) std::fwrite(sb.data(), 1, sb.size(), out);
+                continue;
+            }
+            // Seamless Ogg HLS unchaining: strip duplicate BOS/tags headers on segments i > 0 and maintain continuous granules + CRC.
+            size_t p = 0;
+            int hdr_pages_skipped = 0;
+            int64_t seg_gran_base = -1;
+            while (p + 27 <= sb.size() && std::memcmp(&sb[p], "OggS", 4) == 0) {
+                uint8_t nsegs = sb[p + 26];
+                if (p + 27 + nsegs > sb.size()) break;
+                size_t body_len = 0;
+                for (uint8_t s = 0; s < nsegs; ++s) body_len += sb[p + 27 + s];
+                size_t page_len = 27 + nsegs + body_len;
+                if (p + page_len > sb.size()) break;
+
+                uint8_t htype = sb[p + 5];
+                uint64_t graw = 0;
+                for (int k = 7; k >= 0; --k) graw = (graw << 8) | sb[p + 6 + k];
+                int64_t gran = (int64_t)graw;
+
+                if (i == 0 && ogg_seq == 0) {
+                    ogg_serial = (uint32_t)sb[p + 14] | ((uint32_t)sb[p + 15] << 8) | ((uint32_t)sb[p + 16] << 16) | ((uint32_t)sb[p + 17] << 24);
+                }
+                if (i > 0 && ((htype & 0x02u) != 0 || (gran == 0 && hdr_pages_skipped < 2))) {
+                    ++hdr_pages_skipped;
+                    p += page_len;
+                    continue;
+                }
+                if (gran > 0) {
+                    if (seg_gran_base < 0) seg_gran_base = (i > 0 && gran <= ogg_max_gran) ? ogg_max_gran : 0;
+                    gran += seg_gran_base;
+                    if (gran > ogg_max_gran) ogg_max_gran = gran;
+                }
+                bool is_final_page = (i + 1 == segs.size()) && (p + page_len >= sb.size());
+                uint8_t new_htype = (uint8_t)((htype & ~0x04u) | (is_final_page ? 0x04u : 0x00u));
+                if (i > 0) new_htype &= ~0x02u;
+                sb[p + 5] = new_htype;
+                uint64_t ug = (uint64_t)gran;
+                for (int k = 0; k < 8; ++k) sb[p + 6 + k] = (uint8_t)((ug >> (k * 8)) & 0xffu);
+                for (int k = 0; k < 4; ++k) sb[p + 14 + k] = (uint8_t)((ogg_serial >> (k * 8)) & 0xffu);
+                for (int k = 0; k < 4; ++k) sb[p + 18 + k] = (uint8_t)((ogg_seq >> (k * 8)) & 0xffu);
+                ++ogg_seq;
+                sb[p + 22] = sb[p + 23] = sb[p + 24] = sb[p + 25] = 0;
+                uint32_t crc = ogg_crc32(&sb[p], page_len);
+                for (int k = 0; k < 4; ++k) sb[p + 22 + k] = (uint8_t)((crc >> (k * 8)) & 0xffu);
+                std::fwrite(&sb[p], 1, page_len, out);
+                p += page_len;
+            }
         }
         std::fflush(out);
         ::fsync(fileno(out));

@@ -271,12 +271,13 @@ struct AppPaths {
     static fs::path work_dir()      { return config_dir() / "work"; }
     static fs::path ipc_socket()    { return config_dir() / "ubit.sock"; }
 
-    static void ensure() {
+    static void ensure_dir(const fs::path& cfg) {
         std::error_code ec;
-        fs::create_directories(config_dir(), ec);
-        fs::create_directories(work_dir(), ec);
+        fs::path wk = cfg / "work";
+        fs::create_directories(cfg, ec);
+        fs::create_directories(wk, ec);
         auto now = fs::file_time_type::clock::now();
-        for (const auto& entry : fs::directory_iterator(work_dir(), ec)) {
+        for (const auto& entry : fs::directory_iterator(wk, ec)) {
             std::error_code ec2;
             auto mtime = fs::last_write_time(entry.path(), ec2);
             if (!ec2 && (now - mtime) > std::chrono::hours(24)) {
@@ -286,6 +287,8 @@ struct AppPaths {
             }
         }
     }
+
+    static void ensure() { ensure_dir(config_dir()); }
 };
 
 inline std::string expand_tilde(const std::string& p) {
@@ -367,7 +370,7 @@ inline int64_t commit_file_verified(const fs::path& src, const fs::path& dst) {
         throw std::runtime_error("Output size verification failed for " + dst.string());
     }
 
-#ifndef __wasi__
+#if !defined(__wasi__) && !defined(UBIT_SDK)
     if (is_android_fuse_storage(dst)) {
         std::error_code ec_abs;
         std::string abs_dst = fs::weakly_canonical(dst, ec_abs).string();
@@ -525,9 +528,11 @@ struct Settings {
     bool use_upload_date = false;
     std::string sponsors = "keep";
 
-    static Settings load() {
+    static Settings load() { return load_from(AppPaths::config_dir()); }
+
+    static Settings load_from(const fs::path& cfg) {
         Settings s;
-        std::string txt = read_file_text(AppPaths::settings_file());
+        std::string txt = read_file_text(cfg / "settings.json");
         if (txt.empty()) return s;
         Json j = Json::parse(txt);
         if (!j.is_obj()) return s;

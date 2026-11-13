@@ -1,6 +1,6 @@
 #pragma once
 #include "models.hpp"
-#ifndef __wasi__
+#if !defined(__wasi__) && !defined(_WIN32)
 #include <sys/xattr.h>
 #endif
 
@@ -1390,6 +1390,9 @@ struct SponsorAndSubs {
     }
 
     static std::string find_ffmpeg() {
+#if defined(__wasi__) || defined(UBIT_SDK)
+        return "";
+#else
         if (const char* env = std::getenv("UBIT_FFMPEG"); env && *env && ::access(env, X_OK) == 0) return env;
         const char* path_env = std::getenv("PATH");
         if (!path_env) return "";
@@ -1404,12 +1407,13 @@ struct SponsorAndSubs {
             p = col + 1;
         }
         return "";
+#endif
     }
 
     static void run_ffmpeg_convert(const fs::path& in_file, const fs::path& out_file, const std::string& fmt, const fs::path* second_input = nullptr) {
-#ifdef __wasi__
+#if defined(__wasi__) || defined(UBIT_SDK)
         (void)in_file; (void)out_file; (void)second_input;
-        throw std::runtime_error("Converting/muxing to ." + fmt + " needs ffmpeg, which the WebAssembly build cannot run (MP4 and M4A mux natively).");
+        throw std::runtime_error("Converting/muxing to ." + fmt + " needs ffmpeg, which this sandboxed uBit build does not run (MP4 and M4A mux natively).");
 #else
         std::string ff = find_ffmpeg();
         if (ff.empty()) {

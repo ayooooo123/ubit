@@ -55,6 +55,11 @@ ubit get --json <url>                                          # stream NDJSON e
 
 See **[`docs/agents.md`](docs/agents.md)** for full NDJSON schemas, exit codes (`0`, `1`, `2`, `130`), `UBIT_CONFIG_DIR` sandbox isolation, and authentication workflows.
 
+
+### Embeddable SDKs (Rust, C & Bare/JS)
+
+- **Rust SDK (`ubit` crate, root `Cargo.toml`)**: `ubit = { git = "https://github.com/ayooooo123/ubit" }` links the C++20 extractor and MP4/HLS/DASH/TS mux engine (`linux/src/engine.hpp`) behind `sdk/include/ubit.h`, driving all outbound sockets through `rustls` (`webpki-roots`) and `ubit::is_public_address` SSRF filtering with instant per-call socket cancellation (`ubit::CancelToken`) and zero OpenSSL/FFmpeg/subprocess dependencies.
+- **Bare / JavaScript WASM SDK ([`bare-ubit`](https://github.com/ayooooo123/bare-ubit))**: runs `dist/ubit.wasm` inside a jailed WASI preview-1 `/config` + `/out` sandbox with the same IANA public-IP SSRF guard.
 ---
 
 ## Interactive CLI Usage

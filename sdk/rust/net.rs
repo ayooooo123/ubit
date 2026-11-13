@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{c_char, c_void};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::slice;
@@ -299,7 +299,7 @@ impl NetSession {
 
 extern "C" fn cb_open(
     ctx: *mut c_void,
-    host: *const i8,
+    host: *const c_char,
     host_len: i32,
     port: i32,
     tls: i32,

@@ -119,6 +119,7 @@ When `--json` is passed to `ubit get`, `stdout` emits strictly valid newline-del
 - **Authenticated / Age-Gated Sites**:
   1. Default (`--cookies builtin`): reads `~/Library/Application Support/uBit/cookies.txt`, automatically populated whenever the user signs into a site inside `ubit browse <url>` (`⌘B`).
   2. Firefox SQLite (`--cookies-from-browser firefox`): copies and queries the active Firefox profile's `cookies.sqlite` read-only.
+  2b. Safari (`--cookies-from-browser safari`): reads `~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies` (falling back to `~/Library/Cookies`). The file is unencrypted, so no keychain access is needed. Chrome/Brave/Edge are rejected with an explicit error: their cookie values need the browser's keychain password and an AES unwrap.
   3. Explicit Netscape Cookie File (`--cookies /path/to/cookies.txt`).
   4. Cookie-free (`--no-cookies`): forces unauthenticated extraction.
 - **Unrecognized JS-Heavy Player Pages**:

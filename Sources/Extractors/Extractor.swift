@@ -11,6 +11,9 @@ public enum ExtractorError: LocalizedError {
     case notFound(String)
     case drmProtected
     case loginRequired(String)
+    /// YouTube refused anonymous playback (its "confirm you're not a bot" wall). Not a sign-in
+    /// prompt and not fixable inside the app: the refusal is decided server-side per video.
+    case botGate(String)
 
     public var errorDescription: String? {
         switch self {
@@ -18,6 +21,7 @@ public enum ExtractorError: LocalizedError {
         case .notFound(let m): return m
         case .drmProtected: return "This media is protected by DRM and can't be downloaded."
         case .loginRequired(let site): return "\(site) asked to sign in. Open uBit's Browser (⌘B) and sign in to \(site), or pass --cookies."
+        case .botGate(let site): return "\(site) refused anonymous playback for this video (\"confirm you're not a bot\"). The decision is made server-side per video; retry later, send the request out a different route (--proxy socks5://host:port), or pass --cookies."
         }
     }
 }

@@ -288,7 +288,7 @@ public struct Settings: Codable, Sendable {
     public var connections: Int = 8                 // 1-32 (unlocked!)
     public var rateLimit: String = ""               // e.g. "2M", "500K"
     public var proxy: String = ""                   // e.g. "socks5://127.0.0.1:1080"
-    public var cookies: String = "builtin"          // "builtin", "none", "safari", "chrome", "brave", "firefox", or path
+    public var cookies: String = "builtin"          // "builtin", "none", "safari", "firefox", or path
     public var template: String = "{title}"         // {title} {site} {author} {quality} {date} {id}
     public var siteFolders: Bool = false
     public var playlistFolders: Bool = false
@@ -390,7 +390,7 @@ public struct Settings: Codable, Sendable {
             ("compatible", String(compatible), "Prefer H.264/AAC in MP4 for universal playback"),
             ("concurrent", String(concurrent), "Downloads running at once (1-16)"),
             ("connections", String(connections), "Parallel range connections per download (1-32)"),
-            ("cookies", cookies, "Cookie source: builtin, none, chrome, brave, firefox, safari, or file path"),
+            ("cookies", cookies, "Cookie source: builtin, none, safari, firefox, or file path"),
             ("embedMetadata", String(embedMetadata), "Embed title, artist, date, link, chapters & cover art"),
             ("embedSubtitles", String(embedSubtitles), "Mux subtitles inside MP4 rather than beside them"),
             ("folder", folder, "Folder downloads are saved to"),

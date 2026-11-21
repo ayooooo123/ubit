@@ -131,6 +131,62 @@ public struct YouTubeExtractor: SiteExtractor {
         requiresJS: true
     )
 
+    // Keeps one aged visitor on disk, caches MediaInfo for 5.5h, and paces /player calls so uBit never burns an egress IP.
+    private actor YTGuard {
+        static let shared = YTGuard()
+        private var visitorData: String?
+        private var cache: [String: (info: MediaInfo, exp: Date)] = [:]
+        private var lastPlayerCall: TimeInterval = 0
+        private var fileURL: URL { AppPaths.appSupportDir.appendingPathComponent("yt_visitor.txt") }
+
+        func visitor() -> String? {
+            if let v = visitorData, !v.isEmpty { return v }
+            if let s = try? String(contentsOf: fileURL, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+                visitorData = s
+                return s
+            }
+            return nil
+        }
+
+        func saveVisitor(_ v: String) {
+            guard !v.isEmpty, visitorData == nil else { return }
+            visitorData = v
+            try? FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            try? v.write(to: fileURL, atomically: true, encoding: .utf8)
+        }
+
+        func cached(_ id: String) -> MediaInfo? {
+            guard let hit = cache[id], hit.exp > Date() else { return nil }
+            return hit.info
+        }
+
+        func store(_ id: String, _ info: MediaInfo) {
+            cache[id] = (info, Date().addingTimeInterval(5.5 * 3600))
+        }
+
+        func invalidate(_ id: String) { cache.removeValue(forKey: id) }
+
+        func pace() async {
+            let now = ProcessInfo.processInfo.systemUptime
+            let gap = 3.0 - (now - lastPlayerCall)
+            if lastPlayerCall > 0 && gap > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(gap * 1_000_000_000))
+            }
+            lastPlayerCall = ProcessInfo.processInfo.systemUptime
+        }
+    }
+
+    public static func invalidateCache(for url: String) async {
+        if let u = URL(string: url), let vid = extractVideoID(from: u) {
+            await YTGuard.shared.invalidate(vid)
+        }
+    }
+
+    private static func isBotGateReason(_ reason: String?) -> Bool {
+        let r = (reason ?? "").lowercased()
+        return r.contains("not a bot") || r.contains("unusual traffic")
+    }
+
     private struct WatchContext {
         var visitorData: String?
         var jsURL: String?
@@ -140,11 +196,15 @@ public struct YouTubeExtractor: SiteExtractor {
 
     private func fetchWatchContext(videoID: String, client: HTTPClient) async -> WatchContext {
         var ctx = WatchContext()
+        ctx.visitorData = await YTGuard.shared.visitor()
         if let (html, _) = try? await client.fetchText(
             url: "https://www.youtube.com/watch?v=\(videoID)&bpctr=9999999999&has_verified=1",
             headers: ["Accept-Language": "en-US,en;q=0.9"]
         ) {
-            ctx.visitorData = ExtractorUtils.firstMatch("\"VISITOR_DATA\"\\s*:\\s*\"([^\"]+)\"", in: html)
+            if ctx.visitorData == nil, let v = ExtractorUtils.firstMatch("\"VISITOR_DATA\"\\s*:\\s*\"([^\"]+)\"", in: html) {
+                ctx.visitorData = v
+                await YTGuard.shared.saveVisitor(v)
+            }
             if let jsRel = ExtractorUtils.firstMatch("\"jsUrl\"\\s*:\\s*\"([^\"]+base\\.js)\"", in: html) {
                 ctx.jsURL = jsRel.hasPrefix("http") ? jsRel : "https://www.youtube.com\(jsRel)"
             }
@@ -154,8 +214,10 @@ public struct YouTubeExtractor: SiteExtractor {
             }
         }
         if ctx.visitorData == nil,
-           let (sw, _) = try? await client.fetchText(url: "https://www.youtube.com/sw.js_data", includeCookies: false) {
-            ctx.visitorData = ExtractorUtils.firstMatch("\"(Cgt[A-Za-z0-9_-]{10,})\"", in: sw)
+           let (sw, _) = try? await client.fetchText(url: "https://www.youtube.com/sw.js_data", includeCookies: false),
+           let v = ExtractorUtils.firstMatch("\"(Cgt[A-Za-z0-9_-]{10,})\"", in: sw) {
+            ctx.visitorData = v
+            await YTGuard.shared.saveVisitor(v)
         }
         return ctx
     }
@@ -178,8 +240,14 @@ public struct YouTubeExtractor: SiteExtractor {
     }
 
     private func extractVideo(videoID: String, client: HTTPClient) async throws -> MediaInfo {
+        if let cached = await YTGuard.shared.cached(videoID) { return cached }
         let watchCtx = await fetchWatchContext(videoID: videoID, client: client)
 
+        // Fail fast before firing any /player calls if the watch page itself already carries the IP bot-gate.
+        let watchReason = (watchCtx.playerResponse?["playabilityStatus"] as? [String: Any])?["reason"] as? String
+        if watchCtx.playerResponse?["streamingData"] == nil && Self.isBotGateReason(watchReason) {
+            throw ExtractorError.botGate("YouTube")
+        }
         // Honor YouTube pre-roll ad slot wait if requested (avoids transient 403 before stream activation)
         if let adSlots = watchCtx.playerResponse?["adSlots"] as? [Any], !adSlots.isEmpty,
            let adJSON = try? JSONSerialization.data(withJSONObject: adSlots),
@@ -206,6 +274,7 @@ public struct YouTubeExtractor: SiteExtractor {
         var lastReason: String?
 
         for profile in candidateProfiles {
+            await YTGuard.shared.pace()
             guard let resp = try? await callPlayer(
                 videoID: videoID,
                 profile: profile,
@@ -216,9 +285,11 @@ public struct YouTubeExtractor: SiteExtractor {
 
             let pStatus = (resp["playabilityStatus"] as? [String: Any])?["status"] as? String ?? ""
             if pStatus != "OK" && resp["streamingData"] == nil {
-                if let r = (resp["playabilityStatus"] as? [String: Any])?["reason"] as? String {
-                    lastReason = r
+                let r = (resp["playabilityStatus"] as? [String: Any])?["reason"] as? String
+                if Self.isBotGateReason(r) {
+                    throw ExtractorError.botGate("YouTube")
                 }
+                if let r { lastReason = r }
                 continue
             }
             guard let sd = resp["streamingData"] as? [String: Any] else { continue }
@@ -343,7 +414,11 @@ public struct YouTubeExtractor: SiteExtractor {
         }
 
         if formats.isEmpty {
-            if let r = lastReason, r.lowercased().contains("sign in") {
+            let reason = (lastReason ?? "").lowercased()
+            if reason.contains("not a bot") || reason.contains("unusual traffic") {
+                throw ExtractorError.botGate("YouTube")
+            }
+            if reason.contains("sign in") {
                 throw ExtractorError.loginRequired("YouTube")
             }
             throw ExtractorError.notFound("YouTube: \(lastReason ?? "No playable non-DRM streams returned")")
@@ -368,7 +443,7 @@ public struct YouTubeExtractor: SiteExtractor {
 
         let chapters = SponsorAndSubtitles.chaptersFromDescription(description, totalDuration: duration)
 
-        return MediaInfo(
+        let info = MediaInfo(
             id: videoID,
             title: title,
             site: "YouTube",
@@ -383,6 +458,8 @@ public struct YouTubeExtractor: SiteExtractor {
             subtitles: subtitles,
             chapters: chapters
         )
+        await YTGuard.shared.store(videoID, info)
+        return info
     }
 
     private func callPlayer(

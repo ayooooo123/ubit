@@ -842,7 +842,7 @@ public enum CLIRunner {
 
         Network & Output
               --cookies FILE            Netscape cookie file (default: built-in browser)
-              --cookies-from-browser B  firefox (or path)
+              --cookies-from-browser B  safari, firefox (or a cookies.txt path)
               --no-cookies              Send no cookies
               --proxy URL               socks5://127.0.0.1:1080 or http://127.0.0.1:8080
               --referer URL             Custom Referer header

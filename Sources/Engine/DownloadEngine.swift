@@ -179,8 +179,8 @@ private actor SpeedMeter {
 public final class DownloadEngine: @unchecked Sendable {
     public init() {}
 
-    public func makeClient(settings: Settings, options: DownloadRequestOptions) -> HTTPClient {
-        let cookies = CookieVault.load(source: options.cookieSource)
+    public func makeClient(settings: Settings, options: DownloadRequestOptions) throws -> HTTPClient {
+        let cookies = try CookieVault.load(source: options.cookieSource)
         var extra = options.extraHeaders
         if let ref = options.referer, !ref.isEmpty { extra["Referer"] = ref }
         let rate = FormatHelpers.parseRateLimit(options.rateLimit ?? settings.rateLimit)
@@ -194,7 +194,7 @@ public final class DownloadEngine: @unchecked Sendable {
     }
 
     public func extract(url: String, settings: Settings, options: DownloadRequestOptions) async throws -> MediaInfo {
-        let client = makeClient(settings: settings, options: options)
+        let client = try makeClient(settings: settings, options: options)
         return try await ExtractorRegistry.extract(url: url, client: client)
     }
 
@@ -211,7 +211,7 @@ public final class DownloadEngine: @unchecked Sendable {
         try AppPaths.ensureAppSupport()
         onEvent?(.start(url: url))
 
-        let client = makeClient(settings: settings, options: options)
+        let client = try makeClient(settings: settings, options: options)
         var info: MediaInfo
         if let pre = preExtracted, !pre.formats.isEmpty {
             info = pre
@@ -309,6 +309,7 @@ public final class DownloadEngine: @unchecked Sendable {
                         try? FileManager.default.removeItem(at: dest.appendingPathExtension("part"))
                         try? FileManager.default.removeItem(at: dest.appendingPathExtension("part.json"))
                     }
+                    await YouTubeExtractor.invalidateCache(for: url)
                     let freshInfo = try await ExtractorRegistry.extract(url: url, client: client)
                     let remaining = freshInfo.formats.filter { !blockedFormatIDs.contains($0.id) }
                     let candidatePool = remaining.isEmpty ? freshInfo.formats : remaining
@@ -383,24 +384,32 @@ public final class DownloadEngine: @unchecked Sendable {
                     }
                 }
 
-                try await client.downloadFile(
-                    url: fmt.url,
-                    destination: dest,
-                    headers: mergedHeaders,
-                    knownSize: fmt.filesize,
-                    connections: options.connections
-                ) { done, streamTotal in
-                    Task {
-                        let grandDone = priorBytes + done
-                        let grandTotal = combinedEst > 0 ? combinedEst : (priorBytes + streamTotal)
-                        let frac = grandTotal > 0 ? min(1.0, Double(grandDone) / Double(grandTotal)) : 0
-                        let upd = await meter.update(downloaded: grandDone, total: grandTotal)
-                        if upd.shouldEmit {
-                            onEvent?(.progress(fraction: frac, downloaded: grandDone, total: grandTotal, speed: upd.speed, eta: upd.eta, recordedSeconds: nil))
+                do {
+                    try await client.downloadFile(
+                        url: fmt.url,
+                        destination: dest,
+                        headers: mergedHeaders,
+                        knownSize: fmt.filesize,
+                        connections: options.connections
+                    ) { done, streamTotal in
+                        Task {
+                            let grandDone = priorBytes + done
+                            let grandTotal = combinedEst > 0 ? combinedEst : (priorBytes + streamTotal)
+                            let frac = grandTotal > 0 ? min(1.0, Double(grandDone) / Double(grandTotal)) : 0
+                            let upd = await meter.update(downloaded: grandDone, total: grandTotal)
+                            if upd.shouldEmit {
+                                onEvent?(.progress(fraction: frac, downloaded: grandDone, total: grandTotal, speed: upd.speed, eta: upd.eta, recordedSeconds: nil))
+                            }
                         }
                     }
+                    return (0, false)
+                } catch where fmt.url.contains("lsig=") {
+                    // SABR-only (`lsig`) URLs that reject ranged GETs fall back to the UMP stream.
+                    let ua = mergedHeaders["User-Agent"] ?? HTTPClient.defaultBrowserUA
+                    let mp4 = try await UMP.pull(mediaURL: fmt.url, userAgent: ua, client: client)
+                    try mp4.write(to: dest)
+                    return (0, false)
                 }
-                return (0, false)
             }
         }
 

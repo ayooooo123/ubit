@@ -67,6 +67,6 @@ ubit info --json "ytsearch:blender open movie"
 
 ### 6. Handle Auth-Gated Links & Resume
 
-- **Cookies**: `ubit` uses `~/Library/Application Support/uBit/cookies.txt` by default (shared with `ubit browse`), or pass `--cookies-from-browser firefox`, `--cookies /path/to/cookies.txt`, or `--no-cookies`.
+- **Cookies**: `ubit` uses `~/Library/Application Support/uBit/cookies.txt` by default (shared with `ubit browse`), or pass `--cookies-from-browser safari`, `--cookies-from-browser firefox`, `--cookies /path/to/cookies.txt`, or `--no-cookies`. Chrome/Brave/Edge are refused with an explicit error (keychain + AES unwrap not implemented).
 - **Sandbox Isolation**: Set `UBIT_CONFIG_DIR=/tmp/agent-ubit-$$` when running parallel workers.
 - **Exit Codes**: `0` = done, `1` = download/extractor error, `2` = bad CLI flags, `130` = interrupted (`.part` + `.part.json` saved; re-running the identical command resumes at byte-level).

@@ -21,6 +21,8 @@ jobs:
           ./dist/ubit version
           ./dist/ubit --llms
           ./dist/ubit sites --json
+      - name: Swift regression checks (offline fixtures)
+        run: ./tests/swift/run.sh
       - name: Upload macOS release archive
         uses: actions/upload-artifact@v4
         with:

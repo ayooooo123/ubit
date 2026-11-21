@@ -2,10 +2,12 @@ import Foundation
 
 /// Reader for YouTube's UMP stream (`application/vnd.yt-ump`).
 ///
-/// UMP is *not* protobuf: every length is a custom variable-length integer (1 byte under
-/// 128, 2 under 192, 3 under 224, 4 under 240, else `0xF0` + little-endian UInt32). Each
-/// media part also carries a one-byte prefix before its payload, and the payloads only form
-/// a valid MP4 once that prefix is dropped and the parts are concatenated.
+/// UMP framing is *not* protobuf: each part's type and length are a custom variable-length
+/// integer (1 byte under 128, 2 under 192, 3 under 224, 4 under 240, else `0xF0` +
+/// little-endian UInt32). Part payloads can be protobuf messages (the redirect part is one)
+/// and are decoded with protobuf rules. Each media part carries a one-byte prefix before its
+/// payload, and the payloads only form a valid MP4 once that prefix is dropped and the parts
+/// are concatenated.
 public enum UMP {
     public static let requestBody = Data([0x78, 0x00])   // {15: 0} — "start streaming"
 
@@ -53,20 +55,48 @@ public enum UMP {
         return out
     }
 
-    /// The redirect URL carried by a type-43 part (protobuf field 1).
+    /// The redirect URL carried by a type-43 part (protobuf field 1, length-delimited).
     public static func redirectURL(in data: Data) -> String? {
         for part in parts(in: data) where part.type == 43 {
             let bytes = [UInt8](part.payload)
             var index = 0
             while index < bytes.count {
-                guard var tag = varint(bytes, &index), let length = varint(bytes, &index) else { break }
-                tag >>= 3
-                guard index + length <= bytes.count else { break }
-                if tag == 1 {
-                    return String(decoding: bytes[index..<(index + length)], as: UTF8.self)
+                guard let key = protobufVarint(bytes, &index) else { break }
+                let field = key >> 3
+                switch key & 0x7 {
+                case 0:
+                    guard protobufVarint(bytes, &index) != nil else { return nil }
+                case 1:
+                    index += 8
+                case 2:
+                    guard let length = protobufVarint(bytes, &index),
+                          length <= UInt64(bytes.count - index) else { return nil }
+                    let end = index + Int(length)
+                    if field == 1 {
+                        return String(decoding: bytes[index..<end], as: UTF8.self)
+                    }
+                    index = end
+                case 5:
+                    index += 4
+                default:
+                    return nil   // groups (3, 4) and invalid wire types
                 }
-                index += length
             }
+        }
+        return nil
+    }
+
+    /// Reads one protobuf base-128 varint at `index`, advancing it. Nil when truncated or
+    /// longer than 10 bytes.
+    static func protobufVarint(_ bytes: [UInt8], _ index: inout Int) -> UInt64? {
+        var value: UInt64 = 0
+        var shift: UInt64 = 0
+        while index < bytes.count, shift < 70 {
+            let byte = bytes[index]
+            index += 1
+            value |= UInt64(byte & 0x7f) << shift
+            if byte & 0x80 == 0 { return value }
+            shift += 7
         }
         return nil
     }
@@ -92,8 +122,10 @@ public enum UMP {
         return mp4
     }
 
-    /// Concatenates the media parts (type 21, minus their one-byte prefix) and trims the result
-    /// to its MP4 box chain, so trailing UMP framing never reaches the file.
+    /// Concatenates the media parts (type 21, minus their one-byte prefix) and returns the MP4
+    /// box chain that starts at `ftyp`. Nil unless the chain is complete: every box must fit,
+    /// the chain must end exactly at the end of the media bytes, and it must hold an `mdat`.
+    /// A truncated response therefore fails instead of being saved as a finished file.
     public static func assembleMP4(from data: Data) -> Data? {
         var media = Data()
         for part in parts(in: data) where part.type == 21 {
@@ -104,18 +136,27 @@ public enum UMP {
 
         guard let ftyp = indexOf("ftyp", in: bytes), ftyp >= 4 else { return nil }
         var position = ftyp - 4
-        while position + 8 <= bytes.count {
+        var sawMediaData = false
+        while position < bytes.count {
+            let remaining = bytes.count - position
+            guard remaining >= 8 else { return nil }
             let size32 = beU32(bytes, position)
-            var size = Int(size32)
-            if size32 == 1, position + 16 <= bytes.count {
-                size = Int(beU64(bytes, position + 8))
+            let size: Int
+            if size32 == 1 {
+                guard remaining >= 16 else { return nil }
+                let size64 = beU64(bytes, position + 8)
+                guard size64 >= 16, size64 <= UInt64(remaining) else { return nil }
+                size = Int(size64)
             } else if size32 == 0 {
-                size = bytes.count - position
+                size = remaining   // box runs to the end of the data
+            } else {
+                guard size32 >= 8, UInt64(size32) <= UInt64(remaining) else { return nil }
+                size = Int(size32)
             }
-            guard size >= 8, position + size <= bytes.count else { break }
+            if bytes[(position + 4)..<(position + 8)].elementsEqual("mdat".utf8) { sawMediaData = true }
             position += size
         }
-        guard position > ftyp else { return nil }
+        guard sawMediaData else { return nil }
         return media.subdata(in: (ftyp - 4)..<position)
     }
 

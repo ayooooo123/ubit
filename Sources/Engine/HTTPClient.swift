@@ -192,6 +192,8 @@ public final class HTTPClient: @unchecked Sendable {
     public let limiter: RateLimiter
     public let defaultHeaders: [String: String]
     public let userAgent: String
+    /// The proxy URL this client routes through, or nil for a direct route.
+    public let proxy: String?
 
     public init(
         cookies: CookieVault = CookieVault(),
@@ -204,6 +206,7 @@ public final class HTTPClient: @unchecked Sendable {
         self.limiter = RateLimiter(bytesPerSec: rateLimitBytesPerSec)
         self.userAgent = (userAgent?.isEmpty == false) ? userAgent! : Self.defaultBrowserUA
         self.defaultHeaders = extraHeaders
+        self.proxy = (proxy?.isEmpty == false) ? proxy : nil
 
         let cfg = URLSessionConfiguration.ephemeral
         cfg.httpCookieAcceptPolicy = .never
@@ -317,9 +320,10 @@ public final class HTTPClient: @unchecked Sendable {
         method: String = "GET",
         headers: [String: String]? = nil,
         body: Data? = nil,
-        includeCookies: Bool = true
+        includeCookies: Bool = true,
+        retries: Int = 3
     ) async throws -> Any {
-        let (data, _) = try await fetchData(url: url, method: method, headers: headers, body: body, includeCookies: includeCookies)
+        let (data, _) = try await fetchData(url: url, method: method, headers: headers, body: body, includeCookies: includeCookies, retries: retries)
         return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
     }
 

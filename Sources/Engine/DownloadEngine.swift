@@ -377,14 +377,12 @@ public final class DownloadEngine: @unchecked Sendable {
                 return (0, false)
 
             case .http:
-                // Fast sidx byte-range section download when --section is requested!
-                if let sec = options.section, fmt.ext == "mp4" || fmt.ext == "m4a" {
-                    if let baseStart = try await tryDownloadSectionViaSidx(client: client, fmt: fmt, headers: mergedHeaders, section: sec, destination: dest) {
+                do {
+                    // Fast sidx byte-range section download when --section is requested!
+                    if let sec = options.section, fmt.ext == "mp4" || fmt.ext == "m4a",
+                       let baseStart = try await tryDownloadSectionViaSidx(client: client, fmt: fmt, headers: mergedHeaders, section: sec, destination: dest) {
                         return (baseStart, false)
                     }
-                }
-
-                do {
                     try await client.downloadFile(
                         url: fmt.url,
                         destination: dest,
@@ -403,10 +401,23 @@ public final class DownloadEngine: @unchecked Sendable {
                         }
                     }
                     return (0, false)
-                } catch where fmt.url.contains("lsig=") {
-                    // SABR-only (`lsig`) URLs that reject ranged GETs fall back to the UMP stream.
+                } catch {
+                    // Only an HTTP 403/410 refusal (from the sidx probe or the full download) is
+                    // handled here; cancellation and every other error propagate unchanged.
+                    guard let refusal = Self.refusalStatus(of: error) else { throw error }
+                    // SABR-only (`lsig`) URLs refuse ranged GETs but may still stream over UMP. If UMP
+                    // fails too, or the URL is not SABR-only, report a stale link so fetchStream
+                    // invalidates the metadata cache and extracts a fresh URL.
+                    guard fmt.url.contains("lsig=") else { throw HTTPError.staleLink(refusal) }
                     let ua = mergedHeaders["User-Agent"] ?? HTTPClient.defaultBrowserUA
-                    let mp4 = try await UMP.pull(mediaURL: fmt.url, userAgent: ua, client: client)
+                    let mp4: Data
+                    do {
+                        mp4 = try await UMP.pull(mediaURL: fmt.url, userAgent: ua, client: client)
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        throw HTTPError.staleLink(refusal)
+                    }
                     try mp4.write(to: dest)
                     return (0, false)
                 }
@@ -608,6 +619,19 @@ public final class DownloadEngine: @unchecked Sendable {
         let elapsed = ProcessInfo.processInfo.systemUptime - startedTime
         onEvent?(.done(path: finalURL.path, size: finalSize, seconds: elapsed))
         return finalURL
+    }
+
+    /// The HTTP status when `error` is a server refusal of the media URL (403 or 410), else nil.
+    /// `fetchData` reports these as `.status`; the probe and ranged workers report `.staleLink`.
+    private static func refusalStatus(of error: Error) -> Int? {
+        switch error {
+        case HTTPError.staleLink(let code):
+            return code
+        case HTTPError.status(let code, _) where code == 403 || code == 410:
+            return code
+        default:
+            return nil
+        }
     }
 
     private func tryDownloadSectionViaSidx(

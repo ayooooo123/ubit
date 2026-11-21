@@ -122,5 +122,7 @@ When `--json` is passed to `ubit get`, `stdout` emits strictly valid newline-del
   2b. Safari (`--cookies-from-browser safari`): reads `~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies` (falling back to `~/Library/Cookies`). The file is unencrypted, so no keychain access is needed. Chrome/Brave/Edge are rejected with an explicit error: their cookie values need the browser's keychain password and an AES unwrap.
   3. Explicit Netscape Cookie File (`--cookies /path/to/cookies.txt`).
   4. Cookie-free (`--no-cookies`): forces unauthenticated extraction.
+- **YouTube Request Pacing & Bot Wall**:
+  One `ubit` process leaves at least 3 seconds between its YouTube `/player` requests, retries included, and caches a video's metadata for 5.5 hours per cookie set and proxy. Separate processes do not share this pacing or the cache. When YouTube answers "confirm you're not a bot", extraction stops at once with exit code `1` and an error that names the bot wall. Do not retry that URL in a loop: wait, route through another `--proxy`, or pass cookies.
 - **Unrecognized JS-Heavy Player Pages**:
   If static/API extraction fails on a custom video host, hand the URL to the built-in WebKit media-sniffer browser (`ubit browse <url>`), which hooks `fetch`, `XMLHttpRequest`, and `<video>` across all frames to capture dynamic HLS/DASH/MP4 URLs.

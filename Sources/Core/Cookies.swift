@@ -118,14 +118,11 @@ public final class CookieVault: @unchecked Sendable {
     /// Safari stores cookies in an unencrypted `Cookies.binarycookies` blob, so importing its
     /// session needs no keychain access and no Chromium-style AES unwrapping. macOS TCC still
     /// guards the container, so an unreadable file is reported instead of returning an empty vault.
-    /// `UBIT_SAFARI_COOKIES` overrides the path (used by the test fixture).
     public static func loadSafariCookies() throws -> CookieVault {
-        var candidates: [String] = []
-        if let override = ProcessInfo.processInfo.environment["UBIT_SAFARI_COOKIES"], !override.isEmpty {
-            candidates.append(override)
-        }
-        candidates.append(NSHomeDirectory() + "/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies")
-        candidates.append(NSHomeDirectory() + "/Library/Cookies/Cookies.binarycookies")
+        let candidates = [
+            NSHomeDirectory() + "/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies",
+            NSHomeDirectory() + "/Library/Cookies/Cookies.binarycookies",
+        ]
 
         var foundButUnreadable: String?
         for path in candidates where FileManager.default.fileExists(atPath: path) {
@@ -306,7 +303,6 @@ enum SafariBinaryCookies {
             guard start >= record, start < record + size, start < bytes.count else { return nil }
             var end = start
             while end < record + size, end < bytes.count, bytes[end] != 0 { end += 1 }
-            guard end > start else { return nil }
             return String(decoding: bytes[start..<end], as: UTF8.self)
         }
 
@@ -316,7 +312,9 @@ enum SafariBinaryCookies {
               let value = string(leU32(bytes, record + 28)),
               !name.isEmpty, !domain.isEmpty else { return nil }
 
+        // Malformed files can hold NaN, infinity or huge values; Int64(_:) traps on those.
         let macExpiry = leDouble(bytes, record + 40)
+        guard macExpiry.isFinite, macExpiry < 1e15 else { return nil }
         let unix = macExpiry > 0 ? Int64(macExpiry + appleEpochOffset) : 0
         if unix > 0 && Double(unix) < Date().timeIntervalSince1970 { return nil }
 

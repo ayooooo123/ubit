@@ -523,7 +523,7 @@ public enum CLIRunner {
         while i < args.count {
             let a = args[i]
             if a == "--json" { /* handled */ }
-            else if a == "--cookies" && i + 1 < args.count { i += 1; cookieSrc = args[i] }
+            else if (a == "--cookies" || a == "--cookies-from-browser") && i + 1 < args.count { i += 1; cookieSrc = args[i] }
             else if a == "--no-cookies" { cookieSrc = "none" }
             else if !a.hasPrefix("-") && targetURL == nil { targetURL = a }
             i += 1

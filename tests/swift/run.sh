@@ -1,0 +1,56 @@
+#!/bin/sh
+# Compiles tests/swift/RegressionChecks.swift with the app sources (without Sources/main.swift)
+# and runs each case in its own process with its own UBIT_CONFIG_DIR. No case uses the network.
+# Usage: tests/swift/run.sh [case ...]   (default: every case)
+set -eu
+
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+OUT="${TMPDIR:-/tmp}/ubit-swift-checks"
+rm -rf "$OUT"
+mkdir -p "$OUT"
+
+echo "▸ Compiling Swift regression checks…"
+swiftc \
+  -Onone \
+  -target arm64-apple-macos14.0 \
+  -whole-module-optimization \
+  -module-cache-path "$OUT/module-cache" \
+  -framework AppKit \
+  -framework SwiftUI \
+  -framework WebKit \
+  -framework JavaScriptCore \
+  -framework AVFoundation \
+  -framework AudioToolbox \
+  -framework QuickLookUI \
+  -framework IOKit \
+  -framework ImageIO \
+  -framework UniformTypeIdentifiers \
+  -lsqlite3 \
+  "$ROOT"/Sources/Core/*.swift \
+  "$ROOT"/Sources/Mux/*.swift \
+  "$ROOT"/Sources/Engine/*.swift \
+  "$ROOT"/Sources/Extractors/*.swift \
+  "$ROOT"/Sources/CLI/*.swift \
+  "$ROOT"/Sources/UI/*.swift \
+  "$ROOT"/tests/swift/RegressionChecks.swift \
+  -o "$OUT/checks"
+
+# visitor-first and visitor-reuse share one config directory: the second process must reuse
+# the visitor ID that the first one stored.
+CASES="${*:-watch-gate player-gate visitor-first visitor-reuse pace-concurrent pace-retry cache cache-context cache-cancelled normal stale section non-http-error ump-redirect ump-oversized-box ump-truncated safari-values safari-infinite-expiry chromium}"
+
+failed=""
+for case in $CASES; do
+  config="$OUT/config-$case"
+  case "$case" in visitor-*) config="$OUT/config-visitor" ;; esac
+  if ! UBIT_CONFIG_DIR="$config" "$OUT/checks" "$case"; then
+    echo "FAIL $case (exit or signal)"
+    failed="$failed $case"
+  fi
+done
+
+if [ -n "$failed" ]; then
+  echo "✗ Failed:$failed"
+  exit 1
+fi
+echo "✓ All Swift regression checks passed"

@@ -8,7 +8,7 @@
 | --- | --- |
 | `Sources/main.swift` | Dual-mode entry point: dispatches to `CLIRunner` when arguments are passed (ignoring macOS `-psn_*`/`-NS*` launch flags), otherwise starts `NSApplication` with `UBitAppDelegate` |
 | `Sources/Core/Models.swift` | Core types (`MediaInfo`, `MediaFormat`, `SubtitleTrack`, `Chapter`, `PlaylistEntry`, `Settings`, `LibraryItem`, `Subscription`, `SectionRange`, `AppPaths`, filename template sanitizer) |
-| `Sources/Core/Cookies.swift` | `CookieVault`: Netscape `cookies.txt` parser/writer, read-only Firefox `cookies.sqlite` importer (`libsqlite3`), and `WKHTTPCookieStore` exporter |
+| `Sources/Core/Cookies.swift` | `CookieVault`: Netscape `cookies.txt` parser/writer, read-only Firefox `cookies.sqlite` importer (`libsqlite3`), Safari `Cookies.binarycookies` reader (`SafariBinaryCookies`), and `WKHTTPCookieStore` exporter; Chromium-family names throw `CookieError.browserNotSupported` |
 | `Sources/Core/QueueAndSubs.swift` | Thread-safe `LibraryStore`, `SubscriptionStore`, `@MainActor QueueManager`, `IOKit` idle-sleep assertion (`IOPMAssertionCreateWithName`), Dock progress badge, and `AF_UNIX` socket IPC (`LocalIPC`) |
 | `Sources/Engine/HTTPClient.swift` | Ephemeral `URLSession` client (SOCKS5/HTTP proxy, token-bucket `RateLimiter`, retry/backoff) and `WorkStealingQueue` multi-connection HTTP `Range` downloader (`pwrite` into `.part` + `.part.json`) |
 | `Sources/Engine/HLS.swift` | Master & media M3U8 parser (`#EXT-X-STREAM-INF`, `#EXT-X-MEDIA` separate audio renditions, `#EXT-X-MAP`, `#EXT-X-BYTERANGE`, `CommonCrypto` `AES-128-CBC` decryption, parallel segment worker pool, live HLS recorder) |
@@ -17,15 +17,17 @@
 | `Sources/Mux/TSDemuxer.swift` | Pure-Swift 188-byte MPEG-TS (`PAT`/`PMT`/`PES`) demuxer converting Annex-B H.264 (`SPS`/`PPS` → `avcC`) and ADTS AAC (`esds`) into `MP4Track`s |
 | `Sources/Engine/SponsorBlock.swift` | Privacy-preserving 4-hex SHA-256 prefix SponsorBlock client, description chapter parser, WebVTT/SRT/XML subtitle parser, and timeline squeezer |
 | `Sources/Engine/Converter.swift` | Native `AVFoundation`/`AudioToolbox` converter (`mov`, `m4a`, `wav`, `aiff`, `flac`), `ImageIO` baseline JPEG cover normalizer, `com.apple.metadata:kMDItemWhereFroms` binary plist `setxattr`, Music/TV AppleScript importer, and optional system `ffmpeg` passthrough (`mp3`, `opus`, `mkv`, `webm`) |
-| `Sources/Engine/DownloadEngine.swift` | Full download pipeline (`FormatSelector`, `sidx` fast section fetch, stale-URL 403/410 re-extraction, muxing, sidecars, `DownloadEventPayload` emission) |
+| `Sources/Engine/DownloadEngine.swift` | Full download pipeline (`FormatSelector`, `sidx` fast section fetch, HTTP 403/410 handling: UMP fallback for `lsig` URLs, then stale-URL re-extraction, muxing, sidecars, `DownloadEventPayload` emission) |
+| `Sources/Engine/UMPBypass.swift` | YouTube UMP (`application/vnd.yt-ump`) reader: UMP part framing, protobuf redirect part, and MP4 assembly that rejects truncated box chains |
 | `Sources/Extractors/Extractor.swift` | `SiteExtractor` protocol, `ExtractorRegistry` (35 extractors + direct URLs + `ytsearch:`), balanced-JSON/HTML utilities, and `GenericExtractor` (OpenGraph, JSON-LD, `<video>`, inline `.m3u8`/`.mpd`) |
-| `Sources/Extractors/YouTubeExtractor.swift` | Multi-client InnerTube (`IOS` direct-URL fast path + `WEB` captions/playlists/channels/search + `TVHTML5_SIMPLY_EMBEDDED_PLAYER` fallback), `SAPISIDHASH` cookie auth, and `JavaScriptCore` `base.js` cipher solver |
+| `Sources/Extractors/YouTubeExtractor.swift` | Multi-client InnerTube (`IOS` direct-URL fast path + `WEB` captions/playlists/channels/search + `TVHTML5_SIMPLY_EMBEDDED_PLAYER` fallback), `SAPISIDHASH` cookie auth, `JavaScriptCore` `base.js` cipher solver, and `YTGuard` (persisted visitor ID, 5.5 h metadata cache keyed by video + cookies + proxy, 3 s `/player` pacing that includes retries, bot-wall fail-fast) |
 | `Sources/Extractors/SitesA.swift` | Vimeo (+ showcases), SoundCloud (dynamic `client_id` + sets/artists), Bilibili (BV/av/multi-part), Twitch (GQL live/VOD/clip), Kick, Reddit (`v.redd.it` + embed fallback), X/Twitter (syndication token + `api.vxtwitter.com` fallback) |
 | `Sources/Extractors/SitesB.swift` | Bluesky (ATProto), TikTok, Instagram, Facebook, Threads, Bandcamp, Mixcloud, Dailymotion, Rumble, Odysee, PeerTube, Internet Archive, Streamable, Loom, TED, Imgur, Tumblr, Pinterest, VK, Douyin, Kuaishou, Weibo, Xiaohongshu, GitHub, Mastodon, Coub, 9GAG |
 | `Sources/CLI/CLI.swift` | Complete CLI (`get`, `info`, `formats`, `list`, `subs`, `settings`, `sites`, `open`, `browse`, `version`, `--llms`) with NDJSON streaming, ANSI progress bar, and two-stage `SIGINT` handler |
 | `Sources/UI/MainWindow.swift` | Native dark-onyx `AppKit` + `SwiftUI` main window, live link preview card, grayscale-to-vivid progress artwork (`ColorFillArtworkView`), `QLPreviewPanel` Quick Look, Settings window, Menu Bar item |
 | `Sources/UI/BrowserWindow.swift` | `WKWebView` built-in browser (`⌘B`) with document-start `fetch`/`XHR`/media element sniffer across all frames, `WKContentRuleList` adblocker, and automatic cookie export |
 | `build.sh` | Compiles `arm64-apple-macos14.0` with `-Osize -whole-module-optimization -gnone -Xlinker -dead_strip`, strips non-global symbols, generates programmatic `AppIcon.icns`, ad-hoc signs `dist/uBit.app`, and packs `dist/ubit-0.3.0-darwin-arm64.tar.gz` |
+| `tests/swift/run.sh` | Builds `tests/swift/RegressionChecks.swift` with the app sources and runs each Swift regression case in its own process against a local `URLProtocol` fixture (no network) |
 
 ## Architectural Rules & Invariants
 
@@ -44,6 +46,9 @@
 # Verify agent manifest & extractor registry
 ./dist/ubit --llms
 ./dist/ubit sites --json
+
+# Offline Swift regression checks (YouTube pacing/cache, UMP, stale-link refresh, Safari cookies)
+./tests/swift/run.sh
 
 # Live E2E: sidx byte-range clip download + native ISO-BMFF MP4 mux + metadata
 UBIT_CONFIG_DIR=/tmp/ubit-e2e ./dist/ubit get -q 720 --section 0:05-0:15 --no-library --json -o /tmp/ubit-e2e 'https://www.youtube.com/watch?v=aqz-KE-bpKQ'

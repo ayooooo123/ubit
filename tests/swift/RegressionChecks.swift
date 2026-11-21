@@ -38,6 +38,19 @@ final class FixtureProtocol: URLProtocol {
     static func setTitle(_ value: String) { lock.withLock { title = value } }
     static func playerRequests() -> [SeenRequest] { requests().filter { $0.url.path.hasSuffix("/player") } }
 
+    /// Every session configuration that an HTTPClient built, read after the client set it up.
+    nonisolated(unsafe) private static var configs: [URLSessionConfiguration] = []
+    static func recordConfig(_ config: URLSessionConfiguration) { lock.withLock { configs.append(config) } }
+    /// The proxies that CFNetwork resolves from each configuration, as "type host:port".
+    static func resolvedProxies() -> [String] {
+        let target = URL(string: "https://www.youtube.com/")! as CFURL
+        return lock.withLock { configs }.flatMap { config -> [String] in
+            guard let settings = config.connectionProxyDictionary else { return [] }
+            let list = CFNetworkCopyProxiesForURL(target, settings as CFDictionary).takeRetainedValue() as? [[String: Any]] ?? []
+            return list.map { "\($0[kCFProxyTypeKey as String] ?? "") \($0[kCFProxyHostNameKey as String] ?? ""):\($0[kCFProxyPortNumberKey as String] ?? "")" }
+        }
+    }
+
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func stopLoading() {}
@@ -61,9 +74,12 @@ final class FixtureProtocol: URLProtocol {
         switch (url.host ?? "", url.path) {
         case ("fixture.invalid", "/sanity"):
             data = Data("intercepted".utf8)
+        case ("embed.invalid", "/page"):
+            data = Data("<html><title>Embed</title><iframe src=\"https://www.youtube.com/embed/Fixture0001\"></iframe></html>".utf8)
+            headers["Content-Type"] = "text/html"
         case (_, "/watch"):
             let visitor = mode == "visitor-reuse" ? Self.secondVisitor : Self.firstVisitor
-            let player: [String: Any] = mode == "watch-gate"
+            let player: [String: Any] = ["watch-gate", "wall-unusable-cookie"].contains(mode)
                 ? ["playabilityStatus": ["status": "LOGIN_REQUIRED", "reason": "Sign in to confirm you're not a bot"]]
                 : ["playabilityStatus": ["status": "OK"]]
             let json = String(data: try! JSONSerialization.data(withJSONObject: player), encoding: .utf8)!
@@ -76,28 +92,40 @@ final class FixtureProtocol: URLProtocol {
                 data = Self.json(["playabilityStatus": ["status": "LOGIN_REQUIRED", "reason": "Sign in to confirm you're not a bot"]])
             } else {
                 let mime = mode == "section" ? "audio/mp4; codecs=\"mp4a.40.2\"" : "audio/webm; codecs=\"opus\""
+                var format: [String: Any] = [
+                    "itag": 251,
+                    "url": "https://media.invalid/media?n=\(playerNumber)&lsig=fixture",
+                    "mimeType": mime,
+                    "audioSampleRate": "48000",
+                ]
+                switch mode {
+                case "ump-cut": format["contentLength"] = String(Bytes.cutStream.count + 36)   // longer than what UMP returns
+                case "ump-complete": format["contentLength"] = String(Bytes.cutStream.count)
+                case "ump-unknown-length": break
+                default: format["contentLength"] = String(Self.mediaBytes.count)
+                }
                 data = Self.json([
                     "playabilityStatus": ["status": "OK"],
                     "videoDetails": ["title": "\(title)-\(playerNumber)", "lengthSeconds": "8"],
-                    "streamingData": ["adaptiveFormats": [[
-                        "itag": 251,
-                        "url": "https://media.invalid/media?n=\(playerNumber)&lsig=fixture",
-                        "mimeType": mime,
-                        // ump-cut advertises the full stream, which is longer than what UMP returns.
-                        "contentLength": String(mode == "ump-cut" ? Bytes.cutStream.count + 36 : Self.mediaBytes.count),
-                        "audioSampleRate": "48000",
-                    ]]],
+                    "streamingData": ["adaptiveFormats": [format]],
                 ])
             }
         case ("media.invalid", "/media"):
             // The first URL breaks only in the download phase; extraction's tail probe still works.
-            let broken = phase && mediaNumber == 1
-            if broken && ["stale", "section"].contains(mode) {
+            // ump-cold refuses every ranged GET from the start.
+            let broken = (phase && mediaNumber == 1) || mode == "ump-cold"
+            if broken && ["stale", "section", "stale-embed"].contains(mode) {
                 status = 403
-            } else if broken && mode == "ump-cut" {
+            } else if broken && ["ump-cut", "ump-complete", "ump-unknown-length", "ump-cold"].contains(mode) {
                 // Ranged GETs are refused; the UMP start request answers with a redirect part.
+                // In ump-complete the 1-byte probe works, so the HTTP downloader opens its
+                // resume files before the refusal and UMP must remove them.
                 if method == "POST" {
                     data = Bytes.redirectPart("https://media.invalid/ump-stream")
+                } else if mode == "ump-complete" && range == "bytes=0-0" {
+                    status = 206
+                    data = Data(Bytes.cutStream.prefix(1))
+                    headers["Content-Range"] = "bytes 0-0/\(Bytes.cutStream.count)"
                 } else {
                     status = 403
                 }
@@ -145,6 +173,7 @@ extension URLSessionConfiguration {
     @objc class func fixtureEphemeral() -> URLSessionConfiguration {
         let config = fixtureEphemeral()
         config.protocolClasses = [FixtureProtocol.self]
+        FixtureProtocol.recordConfig(config)
         return config
     }
 }
@@ -225,26 +254,27 @@ struct RegressionChecks {
         catch { print("unexpected error: \(error)"); return false }
     }
 
-    /// Seconds from the first /player request to each later one.
-    static func playerOffsets() -> [TimeInterval] {
-        let times = FixtureProtocol.playerRequests().map(\.time).sorted()
-        guard let first = times.first else { return [] }
-        return times.dropFirst().map { $0 - first }
+    static func now() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
+
+    /// Seconds from `start` (taken before the first extraction began) to each /player request.
+    static func playerOffsets(from start: TimeInterval) -> [TimeInterval] {
+        FixtureProtocol.playerRequests().map { $0.time - start }.sorted()
     }
 
-    /// The pacer reserves slots 3 s apart, but a waiter can wake late, which shortens the next
-    /// arrival gap. So the check is on the k-th request leaving no earlier than 3k s after the
-    /// first one, less this allowance for the first request's own send latency.
-    static let sendJitter: TimeInterval = 0.5
+    /// The first slot is no earlier than `start`, and slot k is 3k s after it. A request never
+    /// leaves before its slot; it can only leave late. So request k (from 0) must arrive no
+    /// earlier than 3k s after `start`. The bound does not depend on how late any request
+    /// was, so a slow machine cannot make it fail. `clockSlack` covers only timer rounding.
+    static let clockSlack: TimeInterval = 0.05
 
-    static func spacedBySlots(_ offsets: [TimeInterval]) -> Bool {
-        offsets.enumerated().allSatisfy { $0.element >= 3.0 * Double($0.offset + 1) - sendJitter }
+    static func keepsSlots(_ offsets: [TimeInterval]) -> Bool {
+        offsets.enumerated().allSatisfy { $0.element >= 3.0 * Double($0.offset) - clockSlack }
     }
 
     /// Extracts, then downloads through `DownloadEngine` with the first media URL broken.
-    static func download(audioExt: String) async -> (file: URL?, error: Error?) {
+    static func download(audioExt: String, url: String = videoURL) async -> (file: URL?, error: Error?) {
         do {
-            let info = try await extract()
+            let info = url == videoURL ? try await extract() : try await ExtractorRegistry.extract(url: url, client: HTTPClient())
             var settings = Settings()
             settings.embedMetadata = false
             settings.saveThumbnail = false
@@ -256,7 +286,7 @@ struct RegressionChecks {
             options.outputDir = AppPaths.appSupportDir.appendingPathComponent("out").path
             if FixtureProtocol.mode == "section" { options.section = SectionRange(start: 0, end: 4) }
             FixtureProtocol.beginDownload()
-            let file = try await DownloadEngine().downloadSingle(url: videoURL, preExtracted: info, settings: settings, options: options)
+            let file = try await DownloadEngine().downloadSingle(url: url, preExtracted: info, settings: settings, options: options)
             return (file, nil)
         } catch {
             return (nil, error)
@@ -286,18 +316,47 @@ struct RegressionChecks {
 
         // Report 1 #1 / report 2 #5: one /player request per 3 s, retries included.
         case "pace-concurrent":
+            let start = now()
             check(await isBotGate("Fixture0001"), "seed request returns botGate")
             let results = await withTaskGroup(of: Bool.self, returning: [Bool].self) { group in
                 for id in ["Fixture0002", "Fixture0003", "Fixture0004"] { group.addTask { await isBotGate(id) } }
                 return await group.reduce(into: []) { $0.append($1) }
             }
-            let offsets = playerOffsets()
-            check(results.allSatisfy { $0 } && offsets.count == 3 && spacedBySlots(offsets),
-                  "concurrent /player requests use slots 3 s apart; offsets from the first=\(offsets)")
+            let offsets = playerOffsets(from: start)
+            check(results.allSatisfy { $0 } && offsets.count == 4 && keepsSlots(offsets),
+                  "concurrent /player requests keep slots 3 s apart; offsets from the start=\(offsets)")
         case "pace-retry":
+            let start = now()
             let gated = await isBotGate("Fixture0001")
-            let offsets = playerOffsets()
-            check(gated && offsets.count == 1 && spacedBySlots(offsets), "the retry after HTTP 429 waits for the next 3 s slot; offsets=\(offsets)")
+            let offsets = playerOffsets(from: start)
+            check(gated && offsets.count == 2 && keepsSlots(offsets), "the retry after HTTP 429 waits for the next 3 s slot; offsets from the start=\(offsets)")
+        case "cancel-slots":
+            // A waiter that is cancelled gives its slot back when nobody queued behind it.
+            let pacer = YouTubeExtractor.YTGuard()
+            try await pacer.pace()
+            var waiters: [Task<Void, Error>] = []
+            for _ in 0..<3 {
+                waiters.append(Task { try await pacer.pace() })
+                try await Task.sleep(nanoseconds: 100_000_000)   // reserve the slots in this order
+            }
+            for waiter in waiters.reversed() {
+                waiter.cancel()
+                _ = await waiter.result
+            }
+            let before = now()
+            try await pacer.pace()
+            let waited = now() - before
+            check(waited < 6, "three cancelled waiters give back their slots; the next caller waited \(waited) s (about 2.7 s expected, about 11.7 s if no slot came back)")
+        case "wall-unusable-cookie":
+            // An expired or empty SAPISID is never sent, so it must not keep extraction going.
+            let expired = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", expires: 1, name: "SAPISID", value: "fixture-only")]))
+            let empty = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", name: "SAPISID", value: "")]))
+            var stopped = 0
+            for client in [expired, empty] {
+                do { _ = try await extract(client: client) } catch ExtractorError.botGate { stopped += 1 }
+            }
+            let players = FixtureProtocol.playerRequests().count
+            check(stopped == 2 && players == 0, "an expired or empty sign-in cookie stops at the watch-page wall; stopped=\(stopped), player requests=\(players)")
         case "signed-in-wall":
             // Review of PR #1: a bot wall for the anonymous profiles must not stop the profile
             // that sends the user's sign-in cookies.
@@ -327,6 +386,24 @@ struct RegressionChecks {
             let added = FixtureProtocol.playerRequests().count - before
             check(added == 2 && anonymous.title != first.title && proxied.title != first.title,
                   "other cookies or another proxy do not reuse cached metadata; new player requests=\(added)")
+        case "cache-scope":
+            // Cookies scoped to /watch and the client's extra headers also change YouTube's answer.
+            func client(_ lang: String, headers: [String: String] = [:]) -> HTTPClient {
+                HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", path: "/watch", name: "PREF", value: "hl=\(lang)")]),
+                           extraHeaders: headers)
+            }
+            _ = try await extract(client: client("fr"))
+            _ = try await extract(client: client("en"))
+            _ = try await extract(client: client("fr", headers: ["X-Fixture": "1"]))
+            let players = FixtureProtocol.playerRequests().count
+            check(players == 3, "a /watch-scoped cookie or another extra header gets its own cache entry; player requests=\(players)")
+        case "cache-prune":
+            let info = try await extract()
+            let cache = YouTubeExtractor.YTGuard()
+            await cache.store(.init(videoID: "old", context: ""), info, now: Date().addingTimeInterval(-6 * 3600))
+            await cache.store(.init(videoID: "new", context: ""), info)
+            let entries = await cache.entryCount
+            check(entries == 1, "storing an entry drops the expired ones; entries=\(entries)")
         case "cache-cancelled":
             _ = try await extract()
             let task = Task { () throws -> MediaInfo in
@@ -352,6 +429,13 @@ struct RegressionChecks {
             let players = FixtureProtocol.playerRequests().count
             check(error == nil && bytes == FixtureProtocol.mediaBytes && players == 2 && umpPosts().count == 1,
                   "403 on HTTP and UMP re-extracts and downloads the fresh URL; players=\(players), umpPosts=\(umpPosts().count), error=\(String(describing: error))")
+        case "stale-embed":
+            // The user entered a page that embeds the video, so its URL holds no video ID.
+            let (file, error) = await download(audioExt: "webm", url: "https://embed.invalid/page")
+            let bytes = file.flatMap { try? Data(contentsOf: $0) }
+            let players = FixtureProtocol.playerRequests().count
+            check(error == nil && bytes == FixtureProtocol.mediaBytes && players == 2,
+                  "a stale URL from an embedded video is refreshed; players=\(players), error=\(String(describing: error))")
         case "section":
             _ = await download(audioExt: "m4a")
             let sidxRefused = FixtureProtocol.requests().contains { $0.url.host == "media.invalid" && $0.method == "GET" && $0.status == 403 }
@@ -367,6 +451,26 @@ struct RegressionChecks {
             let players = FixtureProtocol.playerRequests().count
             check(error == nil && bytes == FixtureProtocol.mediaBytes && players == 2,
                   "a short UMP stream is refused and the fresh URL is downloaded; players=\(players), savedBytes=\(bytes?.count ?? -1), error=\(String(describing: error))")
+        case "ump-unknown-length":
+            // Without an advertised length, nothing shows that a UMP stream is complete.
+            let (file, error) = await download(audioExt: "webm")
+            let bytes = file.flatMap { try? Data(contentsOf: $0) }
+            let players = FixtureProtocol.playerRequests().count
+            check(error == nil && bytes == FixtureProtocol.mediaBytes && players == 2 && umpPosts().isEmpty,
+                  "UMP is not tried without a content length and the fresh URL is downloaded; players=\(players), umpPosts=\(umpPosts().count), savedBytes=\(bytes?.count ?? -1)")
+        case "ump-complete":
+            let (file, error) = await download(audioExt: "webm")
+            let bytes = file.flatMap { try? Data(contentsOf: $0) }
+            let outDir = AppPaths.appSupportDir.appendingPathComponent("out")
+            let leftovers = ((try? FileManager.default.contentsOfDirectory(atPath: outDir.path)) ?? []).filter { $0.hasSuffix(".part") || $0.hasSuffix(".part.json") }
+            check(error == nil && bytes == Data(Bytes.cutStream) && leftovers.isEmpty,
+                  "a complete UMP stream is saved and no resume file is left; leftovers=\(leftovers), error=\(String(describing: error))")
+        case "ump-cold":
+            // Documented boundary: UMP is a fallback for a URL that passed the range probe during
+            // extraction. When every range request is refused from the start, extraction fails.
+            let info = try? await extract()
+            check((info?.formats.isEmpty ?? true) && umpPosts().isEmpty,
+                  "refused range probes end extraction without UMP; formats=\(info?.formats.count ?? 0), umpPosts=\(umpPosts().count)")
 
         // Report 1 #4 / report 2 #2, #1, #3: UMP parsing.
         case "ump-redirect":
@@ -402,6 +506,21 @@ struct RegressionChecks {
             let storedBrave = settings.setByKey("cookies", value: "brave")
             check(unknown == 2 && chromium == 1 && added == 0 && !storedBrave,
                   "unknown info flag exits 2, a Chromium cookie source fails before any request, settings refuse it; unknown=\(unknown), chromium=\(chromium), requests=\(added), stored=\(storedBrave)")
+        case "proxy-values":
+            // A proxy value that cannot be installed must not send the requests directly.
+            let before = FixtureProtocol.requests().count
+            let target = "https://fixture.invalid/must-not-contact"
+            let formats = await CLIRunner.run(arguments: ["ubit", "formats", "--no-cookies", "--proxy", "--bogus", target])
+            let info = await CLIRunner.run(arguments: ["ubit", "info", "--proxy", "127.0.0.1:9", target])
+            let get = await CLIRunner.run(arguments: ["ubit", "get", "--proxy", "not a proxy", target])
+            let added = FixtureProtocol.requests().count - before
+            var settings = Settings()
+            let storedBad = settings.setByKey("proxy", value: "bogus")
+            let storedGood = settings.setByKey("proxy", value: "socks5://127.0.0.1:9")
+            _ = await CLIRunner.run(arguments: ["ubit", "info", "--no-cookies", "--proxy", "socks5://127.0.0.1:9", "https://fixture.invalid/video"])
+            let routed = FixtureProtocol.resolvedProxies().contains("\(kCFProxyTypeSOCKS as String) 127.0.0.1:9")
+            check(formats == 2 && info == 2 && get == 2 && added == 0 && !storedBad && storedGood && routed,
+                  "invalid proxies exit 2 before any request, settings refuse them, a valid one is installed; formats=\(formats), info=\(info), get=\(get), requests=\(added), storedBad=\(storedBad), routed=\(routed)")
 
         // Report 1 #7 / report 2 #6, #1: Safari cookie parsing.
         case "safari-values":
@@ -413,6 +532,12 @@ struct RegressionChecks {
         case "safari-infinite-expiry":
             let parsed = SafariBinaryCookies.parse(Bytes.safariCookies(value: "token", expiry: .infinity))
             check(parsed.isEmpty, "a non-finite expiry is rejected without a trap")
+        case "safari-expiry-sentinels":
+            let session = SafariBinaryCookies.parse(Bytes.safariCookies(value: "token", expiry: 0))
+            let before2001 = SafariBinaryCookies.parse(Bytes.safariCookies(value: "token", expiry: -1))
+            let hugeNegative = SafariBinaryCookies.parse(Bytes.safariCookies(value: "token", expiry: -1e300))
+            check(session.count == 1 && session.first?.expires == 0 && before2001.isEmpty && hugeNegative.isEmpty,
+                  "0 is a session cookie, a negative expiry is expired; session=\(session.count), before2001=\(before2001.count), hugeNegative=\(hugeNegative.count)")
         case "chromium":
             do {
                 _ = try CookieVault.load(source: "brave")

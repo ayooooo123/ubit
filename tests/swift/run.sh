@@ -37,7 +37,7 @@ swiftc \
 
 # visitor-first and visitor-reuse share one config directory: the second process must reuse
 # the visitor ID that the first one stored. Naming visitor-reuse alone runs visitor-first first.
-CASES="${*:-watch-gate player-gate visitor-first visitor-reuse pace-concurrent pace-retry signed-in-wall cache cache-context cache-cancelled normal stale section non-http-error ump-cut ump-redirect ump-oversized-box ump-truncated ump-mixed-streams cli-flags safari-values safari-infinite-expiry chromium}"
+CASES="${*:-watch-gate player-gate visitor-first visitor-reuse pace-concurrent pace-retry cancel-slots wall-unusable-cookie signed-in-wall cache cache-context cache-scope cache-prune cache-cancelled normal stale stale-embed section non-http-error ump-cut ump-unknown-length ump-complete ump-cold ump-redirect ump-oversized-box ump-truncated ump-mixed-streams cli-flags proxy-values safari-values safari-infinite-expiry safari-expiry-sentinels chromium}"
 
 failed=""
 for case in $CASES; do

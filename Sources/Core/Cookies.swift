@@ -314,8 +314,10 @@ enum SafariBinaryCookies {
               !name.isEmpty, !domain.isEmpty else { return nil }
 
         // Malformed files can hold NaN, infinity or huge values; Int64(_:) traps on those.
+        // Exactly 0 marks a session cookie. A negative value is a date before 2001 (or garbage),
+        // so the cookie has expired and must not come back as a session cookie.
         let macExpiry = leDouble(bytes, record + 40)
-        guard macExpiry.isFinite, macExpiry < 1e15 else { return nil }
+        guard macExpiry.isFinite, macExpiry >= 0, macExpiry < 1e15 else { return nil }
         let unix = macExpiry > 0 ? Int64(macExpiry + appleEpochOffset) : 0
         if unix > 0 && Double(unix) < Date().timeIntervalSince1970 { return nil }
 

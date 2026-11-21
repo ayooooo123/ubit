@@ -6,8 +6,11 @@
 set -eu
 cd "$(dirname "$0")/.."
 # rustc and the C compiler use the last matching prefix, so the checkout (inside $HOME) goes last.
+# gcc before 12 does not pass -ffile-prefix-map to the assembler, so ring's .S objects keep
+# their paths unless -fdebug-prefix-map is also given.
 RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$HOME=~ --remap-path-prefix=$PWD=."
-CFLAGS="${CFLAGS:-} -ffile-prefix-map=$HOME=~ -ffile-prefix-map=$PWD=."
-CXXFLAGS="${CXXFLAGS:-} -ffile-prefix-map=$HOME=~ -ffile-prefix-map=$PWD=."
+MAP="-ffile-prefix-map=$HOME=~ -fdebug-prefix-map=$HOME=~ -ffile-prefix-map=$PWD=. -fdebug-prefix-map=$PWD=."
+CFLAGS="${CFLAGS:-} $MAP"
+CXXFLAGS="${CXXFLAGS:-} $MAP"
 export RUSTFLAGS CFLAGS CXXFLAGS
 exec cargo "$@"

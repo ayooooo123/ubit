@@ -134,7 +134,8 @@ public struct YouTubeExtractor: SiteExtractor {
     /// Process-wide YouTube state: one persisted visitor ID, a 5.5 h MediaInfo cache, and the
     /// /player request pacing. It lowers the request rate from one process; it does not
     /// guarantee anything about how YouTube rates the egress IP.
-    private actor YTGuard {
+    /// Internal, not private, so that `tests/swift/RegressionChecks.swift` can drive one instance.
+    actor YTGuard {
         static let shared = YTGuard()
         /// Minimum time between two /player requests from this process, retries included.
         static let playerGap: TimeInterval = 3
@@ -173,11 +174,12 @@ public struct YouTubeExtractor: SiteExtractor {
             return hit.info
         }
 
-        func store(_ key: CacheKey, _ info: MediaInfo) {
-            let now = Date()
+        func store(_ key: CacheKey, _ info: MediaInfo, now: Date = Date()) {
             cache = cache.filter { $0.value.exp > now }   // a long GUI session must not keep expired entries
             cache[key] = (info, now.addingTimeInterval(5.5 * 3600))
         }
+
+        var entryCount: Int { cache.count }
 
         /// Drops the video's entries for every request context.
         func invalidate(_ videoID: String) {
@@ -203,14 +205,31 @@ public struct YouTubeExtractor: SiteExtractor {
         }
     }
 
-    /// The request context for the metadata cache: the cookies sent to youtube.com and the
-    /// proxy route, hashed so that cookie values are not kept as dictionary keys.
+    static let playerURL = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+
+    /// The request context for the metadata cache: everything that the watch page and /player
+    /// requests carry and that can change YouTube's answer. That is the cookies in scope for
+    /// each of the two paths, the User-Agent, the extra headers and the proxy route. The context
+    /// is hashed so that cookie values are not kept as dictionary keys.
     private static func cacheContext(for client: HTTPClient) -> String {
-        let cookies = client.cookies.cookieHeader(for: URL(string: "https://www.youtube.com/")!) ?? ""
-        let digest = SHA256.hash(data: Data("\(cookies)\n\(client.proxy ?? "")".utf8))
-        return digest.map { String(format: "%02x", $0) }.joined()
+        let watch = client.cookies.cookieHeader(for: URL(string: "https://www.youtube.com/watch")!) ?? ""
+        let player = client.cookies.cookieHeader(for: URL(string: playerURL)!) ?? ""
+        let headers = client.defaultHeaders.sorted { $0.key < $1.key }.map { "\($0.key): \($0.value)" }
+        let context = ([watch, player, client.userAgent, client.proxy ?? ""] + headers).joined(separator: "\n")
+        return SHA256.hash(data: Data(context.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
+    /// The SAPISID value for SAPISIDHASH sign-in: a nonempty `SAPISID` (or `__Secure-3PAPISID`)
+    /// cookie that a /player request would actually send, so neither expired nor out of scope.
+    /// The bot-wall decision and the Authorization header both use this one test.
+    static func signInCookie(in cookies: CookieVault) -> String? {
+        let url = URL(string: playerURL)!
+        let usable = cookies.all().filter { $0.matches(url: url) && !$0.value.isEmpty }
+        return (usable.first { $0.name == "SAPISID" } ?? usable.first { $0.name == "__Secure-3PAPISID" })?.value
+    }
+
+    /// Drops the cached metadata of the video at `url`. Pass the extracted `webpageURL`, not the
+    /// page that the user entered: an embedding page does not hold the video ID in its own URL.
     public static func invalidateCache(for url: String) async {
         if let u = URL(string: url), let vid = extractVideoID(from: u) {
             await YTGuard.shared.invalidate(vid)
@@ -283,8 +302,7 @@ public struct YouTubeExtractor: SiteExtractor {
         // After a bot-wall answer, only a profile that sends the user's YouTube sign-in cookies can
         // still succeed. Without such cookies the wall ends extraction before any more /player
         // requests; with them, only the cookie profiles are tried.
-        let hasSignIn = client.cookies.cookieValue(named: "SAPISID", forDomain: "youtube.com") != nil
-            || client.cookies.cookieValue(named: "__Secure-3PAPISID", forDomain: "youtube.com") != nil
+        let hasSignIn = Self.signInCookie(in: client.cookies) != nil
         var botWalled = false
         let watchReason = (watchCtx.playerResponse?["playabilityStatus"] as? [String: Any])?["reason"] as? String
         if watchCtx.playerResponse?["streamingData"] == nil && Self.isBotGateReason(watchReason) {
@@ -560,9 +578,7 @@ public struct YouTubeExtractor: SiteExtractor {
             headers["X-Goog-Visitor-Id"] = visitorData
         }
 
-        if profile.supportsCookies,
-           let sapisid = client.cookies.cookieValue(named: "SAPISID", forDomain: "youtube.com")
-                ?? client.cookies.cookieValue(named: "__Secure-3PAPISID", forDomain: "youtube.com") {
+        if profile.supportsCookies, let sapisid = Self.signInCookie(in: client.cookies) {
             let ts = Int(Date().timeIntervalSince1970)
             let input = "\(ts) \(sapisid) https://www.youtube.com"
             let sha1 = Insecure.SHA1.hash(data: Data(input.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -577,7 +593,7 @@ public struct YouTubeExtractor: SiteExtractor {
             try await YTGuard.shared.pace()
             do {
                 let json = try await client.fetchJSON(
-                    url: "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+                    url: Self.playerURL,
                     method: "POST",
                     headers: headers,
                     body: bodyData,

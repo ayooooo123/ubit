@@ -102,10 +102,14 @@ public enum UMP {
     }
 
     /// Downloads one SABR (`lsig`) stream end to end: start the umbrella request, follow the
-    /// redirect part, and return the assembled MP4. When `expectedSize` (the format's advertised
-    /// content length) is known, a result of any other length is an error: a stream cut between
-    /// two complete fragments still forms a valid box chain, so only the size can expose it.
+    /// redirect part, and return the assembled MP4. The format's advertised content length is
+    /// required, and a result of any other length is an error: a stream cut between two
+    /// complete fragments still forms a valid box chain, so only the size can expose it.
+    /// Without a length no result can be shown to be complete, so no request is sent.
     public static func pull(mediaURL: String, userAgent: String, expectedSize: Int64?, client: HTTPClient) async throws -> Data {
+        guard let expectedSize, expectedSize > 0 else {
+            throw HTTPError.badURL("UMP: no content length, so a complete stream cannot be confirmed")
+        }
         let separator = mediaURL.contains("?") ? "&" : "?"
         let headers = ["Content-Type": "application/octet-stream", "User-Agent": userAgent]
         let (probe, _) = try await client.fetchData(
@@ -121,7 +125,7 @@ public enum UMP {
         guard let mp4 = assembleMP4(from: blob) else {
             throw HTTPError.badURL("UMP: no complete media")
         }
-        if let expectedSize, expectedSize > 0, Int64(mp4.count) != expectedSize {
+        if Int64(mp4.count) != expectedSize {
             throw HTTPError.badURL("UMP: got \(mp4.count) of \(expectedSize) bytes")
         }
         return mp4

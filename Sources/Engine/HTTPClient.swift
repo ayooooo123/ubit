@@ -187,6 +187,15 @@ private actor WorkStealingQueue {
 public final class HTTPClient: @unchecked Sendable {
     public static let defaultBrowserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15"
 
+    /// True for a proxy URL that `init` can install: an http(s) or socks scheme and a host.
+    /// Any other string would leave the session without a proxy, so callers reject it instead
+    /// of sending the requests directly.
+    public static func isValidProxy(_ proxy: String) -> Bool {
+        guard let url = URL(string: proxy), let host = url.host, !host.isEmpty,
+              let scheme = url.scheme?.lowercased() else { return false }
+        return ["http", "https", "socks", "socks4", "socks4a", "socks5", "socks5h"].contains(scheme)
+    }
+
     public let session: URLSession
     public let cookies: CookieVault
     public let limiter: RateLimiter

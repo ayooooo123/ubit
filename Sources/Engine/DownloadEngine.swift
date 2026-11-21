@@ -180,13 +180,18 @@ public final class DownloadEngine: @unchecked Sendable {
     public init() {}
 
     public func makeClient(settings: Settings, options: DownloadRequestOptions) throws -> HTTPClient {
+        let proxy = options.proxy ?? (settings.proxy.isEmpty ? nil : settings.proxy)
+        // A proxy string that the client cannot install would send every request directly.
+        if let proxy, !proxy.isEmpty, !HTTPClient.isValidProxy(proxy) {
+            throw HTTPError.badURL("invalid proxy \(proxy): use http://host:port or socks5://host:port")
+        }
         let cookies = try CookieVault.load(source: options.cookieSource)
         var extra = options.extraHeaders
         if let ref = options.referer, !ref.isEmpty { extra["Referer"] = ref }
         let rate = FormatHelpers.parseRateLimit(options.rateLimit ?? settings.rateLimit)
         return HTTPClient(
             cookies: cookies,
-            proxy: options.proxy ?? (settings.proxy.isEmpty ? nil : settings.proxy),
+            proxy: proxy,
             rateLimitBytesPerSec: rate,
             userAgent: options.userAgent,
             extraHeaders: extra
@@ -309,7 +314,7 @@ public final class DownloadEngine: @unchecked Sendable {
                         try? FileManager.default.removeItem(at: dest.appendingPathExtension("part"))
                         try? FileManager.default.removeItem(at: dest.appendingPathExtension("part.json"))
                     }
-                    await YouTubeExtractor.invalidateCache(for: url)
+                    await YouTubeExtractor.invalidateCache(for: info.webpageURL)
                     let freshInfo = try await ExtractorRegistry.extract(url: url, client: client)
                     let remaining = freshInfo.formats.filter { !blockedFormatIDs.contains($0.id) }
                     let candidatePool = remaining.isEmpty ? freshInfo.formats : remaining

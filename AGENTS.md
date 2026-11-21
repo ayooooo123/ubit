@@ -18,9 +18,9 @@
 | `Sources/Engine/SponsorBlock.swift` | Privacy-preserving 4-hex SHA-256 prefix SponsorBlock client, description chapter parser, WebVTT/SRT/XML subtitle parser, and timeline squeezer |
 | `Sources/Engine/Converter.swift` | Native `AVFoundation`/`AudioToolbox` converter (`mov`, `m4a`, `wav`, `aiff`, `flac`), `ImageIO` baseline JPEG cover normalizer, `com.apple.metadata:kMDItemWhereFroms` binary plist `setxattr`, Music/TV AppleScript importer, and optional system `ffmpeg` passthrough (`mp3`, `opus`, `mkv`, `webm`) |
 | `Sources/Engine/DownloadEngine.swift` | Full download pipeline (`FormatSelector`, `sidx` fast section fetch, HTTP 403/410 handling: UMP fallback for `lsig` URLs, then stale-URL re-extraction, muxing, sidecars, `DownloadEventPayload` emission) |
-| `Sources/Engine/UMPBypass.swift` | YouTube UMP (`application/vnd.yt-ump`) reader: UMP part framing, protobuf redirect part, MP4 assembly that rejects box chains which overrun the data or mix header IDs, and a size check against the advertised content length (the only check that catches a stream cut between two complete boxes) |
+| `Sources/Engine/UMPBypass.swift` | YouTube UMP (`application/vnd.yt-ump`) reader: UMP part framing, protobuf redirect part, MP4 assembly that rejects box chains which overrun the data or mix header IDs, and a required size check against the advertised content length (the only check that catches a stream cut between two complete boxes; without a length, UMP is not tried) |
 | `Sources/Extractors/Extractor.swift` | `SiteExtractor` protocol, `ExtractorRegistry` (35 extractors + direct URLs + `ytsearch:`), balanced-JSON/HTML utilities, and `GenericExtractor` (OpenGraph, JSON-LD, `<video>`, inline `.m3u8`/`.mpd`) |
-| `Sources/Extractors/YouTubeExtractor.swift` | Multi-client InnerTube (`IOS` direct-URL fast path + `WEB` captions/playlists/channels/search + `TVHTML5_SIMPLY_EMBEDDED_PLAYER` fallback), `SAPISIDHASH` cookie auth, `JavaScriptCore` `base.js` cipher solver, and `YTGuard` (persisted visitor ID, 5.5 h metadata cache keyed by video + cookies + proxy, `/player` slots reserved 3 s apart that include retries, bot-wall stop that still tries the cookie profiles when sign-in cookies are loaded) |
+| `Sources/Extractors/YouTubeExtractor.swift` | Multi-client InnerTube (`IOS` direct-URL fast path + `WEB` captions/playlists/channels/search + `TVHTML5_SIMPLY_EMBEDDED_PLAYER` fallback), `SAPISIDHASH` cookie auth, `JavaScriptCore` `base.js` cipher solver, and `YTGuard` (persisted visitor ID, 5.5 h metadata cache keyed by video and request context (cookies for `/watch` and `/player`, User-Agent, extra headers, proxy), `/player` slots reserved 3 s apart that include retries, bot-wall stop that still tries the cookie profiles when a usable sign-in cookie is loaded) |
 | `Sources/Extractors/SitesA.swift` | Vimeo (+ showcases), SoundCloud (dynamic `client_id` + sets/artists), Bilibili (BV/av/multi-part), Twitch (GQL live/VOD/clip), Kick, Reddit (`v.redd.it` + embed fallback), X/Twitter (syndication token + `api.vxtwitter.com` fallback) |
 | `Sources/Extractors/SitesB.swift` | Bluesky (ATProto), TikTok, Instagram, Facebook, Threads, Bandcamp, Mixcloud, Dailymotion, Rumble, Odysee, PeerTube, Internet Archive, Streamable, Loom, TED, Imgur, Tumblr, Pinterest, VK, Douyin, Kuaishou, Weibo, Xiaohongshu, GitHub, Mastodon, Coub, 9GAG |
 | `Sources/CLI/CLI.swift` | Complete CLI (`get`, `info`, `formats`, `list`, `subs`, `settings`, `sites`, `open`, `browse`, `version`, `--llms`) with NDJSON streaming, ANSI progress bar, and two-stage `SIGINT` handler |
@@ -29,7 +29,7 @@
 | `build.sh` | Compiles `arm64-apple-macos14.0` with `-Osize -whole-module-optimization -gnone -Xlinker -dead_strip`, strips non-global symbols, generates programmatic `AppIcon.icns`, ad-hoc signs `dist/uBit.app`, and packs `dist/ubit-0.3.3-darwin-arm64.tar.gz` |
 | `tests/swift/run.sh` | Builds `tests/swift/RegressionChecks.swift` with the app sources and runs each Swift regression case in its own process against a local `URLProtocol` fixture (no network) |
 | `tests/home-paths.sh` | Fails when a binary or rlib holds the home-directory path of the machine that built it; CI runs it on the macOS, Linux and Android binaries and on the SDK rlibs |
-| `sdk/cargo.sh` | Runs `cargo` with `--remap-path-prefix` (rustc) and `-ffile-prefix-map` (C/C++) for `$HOME` and the checkout, so that uBit and its dependencies build without home-directory paths |
+| `sdk/cargo.sh` | Runs `cargo` with `--remap-path-prefix` (rustc) and `-ffile-prefix-map` plus `-fdebug-prefix-map` (C/C++ and the assembler; gcc before 12 needs the second for ring's `.S` files) for `$HOME` and the checkout, so that uBit and its dependencies build without home-directory paths |
 
 ## Architectural Rules & Invariants
 
@@ -49,7 +49,7 @@
 ./dist/ubit --llms
 ./dist/ubit sites --json
 
-# Offline Swift regression checks (YouTube pacing/cache, UMP, stale-link refresh, Safari cookies)
+# Offline Swift regression checks (YouTube pacing/cache/sign-in, UMP, stale-link refresh, proxy values, Safari cookies)
 ./tests/swift/run.sh
 
 # No home-directory path in the shipped binary

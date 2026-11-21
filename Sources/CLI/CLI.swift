@@ -897,7 +897,7 @@ public enum CLIRunner {
           - `{"event":"stopped","url":"..."}`
         - `--quiet` — Suppress progress bars; print ONLY saved absolute file paths to stdout (ideal for command substitution `FILE=$(ubit get --quiet ...)`).
         - `--no-library` — Ephemeral run; do not append agent scratch downloads to the user's GUI library.
-        - `--section START-END` — Keyframe-accurate clip trim (e.g. `0:30-1:15` or `90-135`). Uses `sidx` HTTP byte-range planning so a 15s clip from a 2h video downloads only ~2–4 MB. Exception: when YouTube refuses byte ranges and uBit falls back to UMP, the whole stream is downloaded and then trimmed.
+        - `--section START-END` — Keyframe-accurate clip trim (e.g. `0:30-1:15` or `90-135`). Uses `sidx` HTTP byte-range planning so a 15s clip from a 2h video downloads only ~2–4 MB. Exception: when YouTube refuses byte ranges during the download and uBit falls back to UMP, the whole stream is downloaded and then trimmed. UMP is tried only for a URL that passed the range probe during extraction; if YouTube refuses byte ranges from the first request, extraction fails.
         - `-a --to wav` — Extract 16-bit 44.1 kHz stereo PCM `.wav` natively via macOS AudioToolbox (zero FFmpeg) for ASR/transcription pipelines.
         - `-q <best|2160|1440|1080|720|480|360>` / `-f <vid+aid>` — Bound resolution or select exact stream IDs.
         - `--subs --sub-langs en --sub-files` — Download WebVTT `.vtt` subtitle sidecar files alongside media.

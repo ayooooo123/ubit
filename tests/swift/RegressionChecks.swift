@@ -20,6 +20,15 @@ struct SeenRequest {
     let visitor: String?
     let range: String?
     let status: Int
+    let authorization: Bool
+}
+
+/// Times that several tasks record.
+final class TimeLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var values: [TimeInterval] = []
+    func add(_ time: TimeInterval) { lock.withLock { values.append(time) } }
+    func all() -> [TimeInterval] { lock.withLock { values } }
 }
 
 final class FixtureProtocol: URLProtocol {
@@ -85,7 +94,10 @@ final class FixtureProtocol: URLProtocol {
             let json = String(data: try! JSONSerialization.data(withJSONObject: player), encoding: .utf8)!
             data = Data("<script>var ytcfg = {\"VISITOR_DATA\":\"\(visitor)\"};</script><script>var ytInitialPlayerResponse = \(json);</script>".utf8)
         case (_, let path) where path.hasSuffix("/player"):
-            if mode == "pace-retry" && playerNumber == 1 {
+            if mode == "auth-header" && playerNumber % 2 == 1 {
+                // Not the bot wall, so extraction goes on to the next client profile.
+                data = Self.json(["playabilityStatus": ["status": "UNPLAYABLE", "reason": "fixture refusal"]])
+            } else if mode == "pace-retry" && playerNumber == 1 {
                 status = 429
             } else if ["player-gate", "pace-concurrent", "pace-retry"].contains(mode)
                         || (mode == "signed-in-wall" && request.value(forHTTPHeaderField: "Authorization") == nil) {
@@ -149,7 +161,8 @@ final class FixtureProtocol: URLProtocol {
             Self.seen.append(SeenRequest(
                 method: method, url: url, time: ProcessInfo.processInfo.systemUptime,
                 visitor: request.value(forHTTPHeaderField: "X-Goog-Visitor-Id"),
-                range: range, status: failure == nil ? status : -1
+                range: range, status: failure == nil ? status : -1,
+                authorization: request.value(forHTTPHeaderField: "Authorization") != nil
             ))
         }
         if let failure {
@@ -347,6 +360,30 @@ struct RegressionChecks {
             try await pacer.pace()
             let waited = now() - before
             check(waited < 6, "three cancelled waiters give back their slots; the next caller waited \(waited) s (about 2.7 s expected, about 11.7 s if no slot came back)")
+        case "cancel-middle":
+            // A cancelled waiter with a later caller queued behind it must not free its slot,
+            // or two later waits would end in one slot.
+            let pacer = YouTubeExtractor.YTGuard()
+            let log = TimeLog()
+            let start = now()
+            try await pacer.pace()
+            log.add(now())
+            var waiters: [Task<Void, Error>] = []
+            for _ in 0..<3 {
+                waiters.append(Task { try await pacer.pace(); log.add(now()) })
+                try await Task.sleep(nanoseconds: 100_000_000)   // reserve the slots in this order
+            }
+            waiters[1].cancel()
+            _ = await waiters[1].result
+            for _ in 0..<2 {
+                try await pacer.pace()
+                log.add(now())
+            }
+            _ = await waiters[0].result
+            _ = await waiters[2].result
+            let offsets = log.all().map { $0 - start }.sorted()
+            check(offsets.count == 5 && keepsSlots(offsets),
+                  "after a middle waiter is cancelled, every wait still ends in its own 3 s slot; offsets from the start=\(offsets)")
         case "wall-unusable-cookie":
             // An expired or empty SAPISID is never sent, so it must not keep extraction going.
             let expired = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", expires: 1, name: "SAPISID", value: "fixture-only")]))
@@ -365,6 +402,16 @@ struct RegressionChecks {
             let players = FixtureProtocol.playerRequests().count
             check(!info.formats.isEmpty && players == 2,
                   "after the wall only the cookie profile is tried, and it succeeds; player requests=\(players)")
+        case "auth-header":
+            // The fixture refuses every odd /player request without the bot wall, so each
+            // extraction asks two client profiles. Only a usable SAPISID may be sent as SAPISIDHASH.
+            let expired = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", expires: 1, name: "SAPISID", value: "fixture-only")]))
+            let valid = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", name: "SAPISID", value: "fixture-only")]))
+            _ = try await extract(client: expired)
+            _ = try await extract(client: valid)
+            let sent = FixtureProtocol.playerRequests().map(\.authorization)
+            check(sent == [false, false, false, true],
+                  "an expired SAPISID sends no Authorization header and a valid one does; Authorization per /player request=\(sent)")
 
         // Report 1 #5 / report 2 #4: cache is per request context and honours cancellation.
         case "cache":
@@ -387,16 +434,22 @@ struct RegressionChecks {
             check(added == 2 && anonymous.title != first.title && proxied.title != first.title,
                   "other cookies or another proxy do not reuse cached metadata; new player requests=\(added)")
         case "cache-scope":
-            // Cookies scoped to /watch and the client's extra headers also change YouTube's answer.
-            func client(_ lang: String, headers: [String: String] = [:]) -> HTTPClient {
-                HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", path: "/watch", name: "PREF", value: "hl=\(lang)")]),
-                           extraHeaders: headers)
+            // Every request context part changes YouTube's answer: cookies in scope for /watch or
+            // only for /player, the extra headers and the User-Agent. The same context is reused.
+            func client(_ lang: String, path: String = "/watch", headers: [String: String] = [:], agent: String? = nil) -> HTTPClient {
+                HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", path: path, name: "PREF", value: "hl=\(lang)")]),
+                           userAgent: agent, extraHeaders: headers)
             }
             _ = try await extract(client: client("fr"))
             _ = try await extract(client: client("en"))
             _ = try await extract(client: client("fr", headers: ["X-Fixture": "1"]))
+            _ = try await extract(client: client("fr", path: "/youtubei"))
+            _ = try await extract(client: client("en", path: "/youtubei"))
+            _ = try await extract(client: client("fr", agent: "FixtureAgent/1"))
+            _ = try await extract(client: client("fr", agent: "FixtureAgent/2"))
+            _ = try await extract(client: client("fr", agent: "FixtureAgent/1"))
             let players = FixtureProtocol.playerRequests().count
-            check(players == 3, "a /watch-scoped cookie or another extra header gets its own cache entry; player requests=\(players)")
+            check(players == 7, "each /watch cookie, /player cookie, extra header and User-Agent gets its own cache entry, and a repeated context reuses it; player requests=\(players) of 8 extractions")
         case "cache-prune":
             let info = try await extract()
             let cache = YouTubeExtractor.YTGuard()
@@ -504,8 +557,9 @@ struct RegressionChecks {
             let added = FixtureProtocol.requests().count - before
             var settings = Settings()
             let storedBrave = settings.setByKey("cookies", value: "brave")
-            check(unknown == 2 && chromium == 1 && added == 0 && !storedBrave,
-                  "unknown info flag exits 2, a Chromium cookie source fails before any request, settings refuse it; unknown=\(unknown), chromium=\(chromium), requests=\(added), stored=\(storedBrave)")
+            let storedPadded = settings.setByKey("cookies", value: " brave ")
+            check(unknown == 2 && chromium == 1 && added == 0 && !storedBrave && !storedPadded,
+                  "unknown info flag exits 2, a Chromium cookie source fails before any request, settings refuse it even with spaces; unknown=\(unknown), chromium=\(chromium), requests=\(added), stored=\(storedBrave), storedPadded=\(storedPadded)")
         case "proxy-values":
             // A proxy value that cannot be installed must not send the requests directly.
             let before = FixtureProtocol.requests().count
@@ -513,14 +567,25 @@ struct RegressionChecks {
             let formats = await CLIRunner.run(arguments: ["ubit", "formats", "--no-cookies", "--proxy", "--bogus", target])
             let info = await CLIRunner.run(arguments: ["ubit", "info", "--proxy", "127.0.0.1:9", target])
             let get = await CLIRunner.run(arguments: ["ubit", "get", "--proxy", "not a proxy", target])
+            let socks4 = await CLIRunner.run(arguments: ["ubit", "info", "--proxy", "socks4://127.0.0.1:9", target])
             let added = FixtureProtocol.requests().count - before
             var settings = Settings()
             let storedBad = settings.setByKey("proxy", value: "bogus")
             let storedGood = settings.setByKey("proxy", value: "socks5://127.0.0.1:9")
             _ = await CLIRunner.run(arguments: ["ubit", "info", "--no-cookies", "--proxy", "socks5://127.0.0.1:9", "https://fixture.invalid/video"])
             let routed = FixtureProtocol.resolvedProxies().contains("\(kCFProxyTypeSOCKS as String) 127.0.0.1:9")
-            check(formats == 2 && info == 2 && get == 2 && added == 0 && !storedBad && storedGood && routed,
-                  "invalid proxies exit 2 before any request, settings refuse them, a valid one is installed; formats=\(formats), info=\(info), get=\(get), requests=\(added), storedBad=\(storedBad), routed=\(routed)")
+            check(formats == 2 && info == 2 && get == 2 && socks4 == 2 && added == 0 && !storedBad && storedGood && routed,
+                  "invalid proxies exit 2 before any request, settings refuse them, a valid one is installed; formats=\(formats), info=\(info), get=\(get), socks4=\(socks4), requests=\(added), storedBad=\(storedBad), routed=\(routed)")
+        case "proxy-stored":
+            // A proxy that was stored before validation existed (or typed into settings.json)
+            // must fail the command, not send the request without a proxy.
+            var settings = Settings.load()
+            settings.proxy = "127.0.0.1:9"
+            try settings.save()
+            let before = FixtureProtocol.requests().count
+            let info = await CLIRunner.run(arguments: ["ubit", "info", "--no-cookies", "https://fixture.invalid/must-not-contact"])
+            let added = FixtureProtocol.requests().count - before
+            check(info != 0 && added == 0, "a stored invalid proxy fails the command before any request; exit=\(info), requests=\(added)")
 
         // Report 1 #7 / report 2 #6, #1: Safari cookie parsing.
         case "safari-values":

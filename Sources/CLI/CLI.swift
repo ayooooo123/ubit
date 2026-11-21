@@ -518,24 +518,32 @@ public enum CLIRunner {
     private static func runInfo(_ args: [String], formatsOnly: Bool) async -> Int32 {
         let jsonMode = args.contains("--json")
         var cookieSrc = Settings.load().cookies
+        var proxy: String?
         var targetURL: String?
         var i = 0
         while i < args.count {
             let a = args[i]
             if a == "--json" { /* handled */ }
             else if (a == "--cookies" || a == "--cookies-from-browser") && i + 1 < args.count { i += 1; cookieSrc = args[i] }
+            else if a == "--proxy" && i + 1 < args.count { i += 1; proxy = args[i] }
             else if a == "--no-cookies" { cookieSrc = "none" }
-            else if !a.hasPrefix("-") && targetURL == nil { targetURL = a }
+            else if a.hasPrefix("-") {
+                // An unknown flag's value would otherwise become the target URL.
+                fputs("error: unknown flag \(a) for \(formatsOnly ? "formats" : "info")\n", stderr)
+                return 2
+            }
+            else if targetURL == nil { targetURL = a }
             i += 1
         }
         guard let url = targetURL else {
-            fputs("Usage: ubit \(formatsOnly ? "formats" : "info") <url> [--json]\n", stderr)
+            fputs("Usage: ubit \(formatsOnly ? "formats" : "info") <url> [--json] [--cookies FILE | --cookies-from-browser B | --no-cookies] [--proxy URL]\n", stderr)
             return 2
         }
 
         let settings = Settings.load()
         var opts = DownloadRequestOptions.from(settings: settings)
         opts.cookieSource = cookieSrc
+        if let proxy { opts.proxy = proxy }
         let engine = DownloadEngine()
 
         do {
@@ -862,7 +870,7 @@ public enum CLIRunner {
 
         ## Commands
         - `ubit get <url>... [flags]` — Download video/audio. Prefer `--json` (NDJSON events on stdout) or `--quiet` (prints only final saved file path(s), one per line).
-        - `ubit info <url> --json` — Probe metadata (`id`, `title`, `site`, `author`, `duration`, `isLive`, `isDRM`, `formats`, `subtitles`, `chapters`, `entries`) without downloading.
+        - `ubit info <url> --json` — Probe metadata (`id`, `title`, `site`, `author`, `duration`, `isLive`, `isDRM`, `formats`, `subtitles`, `chapters`, `entries`) without downloading. `info` and `formats` accept only `--json`, `--cookies FILE`, `--cookies-from-browser B`, `--no-cookies` and `--proxy URL`; any other flag exits with code `2`.
         - `ubit formats <url> --json` — Return JSON array of `MediaFormat` objects (`id`, `ext`, `proto`, `vcodec`, `acodec`, `width`, `height`, `fps`, `bitrate`, `filesize`).
         - `ubit list --json` — Return JSON array of library/queue items (`id`, `url`, `title`, `state`, `path`, `downloadedBytes`, `totalBytes`).
         - `ubit subs [list|add <url>|remove <n>|check] [--json] [--quiet]` — Manage channel/playlist subscriptions.

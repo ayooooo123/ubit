@@ -350,7 +350,7 @@ public struct Settings: Codable, Sendable {
         case "connections": guard let n = Int(value), (1...32).contains(n) else { return false }; connections = n
         case "rateLimit": rateLimit = value
         case "proxy": proxy = value
-        case "cookies": cookies = value
+        case "cookies": guard !CookieVault.chromiumFamily.contains(value.lowercased()) else { return false }; cookies = value
         case "template": template = value
         case "siteFolders": guard let v = b(value) else { return false }; siteFolders = v
         case "playlistFolders": guard let v = b(value) else { return false }; playlistFolders = v

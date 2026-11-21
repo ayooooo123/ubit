@@ -71,7 +71,8 @@ final class FixtureProtocol: URLProtocol {
         case (_, let path) where path.hasSuffix("/player"):
             if mode == "pace-retry" && playerNumber == 1 {
                 status = 429
-            } else if ["player-gate", "pace-concurrent", "pace-retry"].contains(mode) {
+            } else if ["player-gate", "pace-concurrent", "pace-retry"].contains(mode)
+                        || (mode == "signed-in-wall" && request.value(forHTTPHeaderField: "Authorization") == nil) {
                 data = Self.json(["playabilityStatus": ["status": "LOGIN_REQUIRED", "reason": "Sign in to confirm you're not a bot"]])
             } else {
                 let mime = mode == "section" ? "audio/mp4; codecs=\"mp4a.40.2\"" : "audio/webm; codecs=\"opus\""
@@ -82,7 +83,8 @@ final class FixtureProtocol: URLProtocol {
                         "itag": 251,
                         "url": "https://media.invalid/media?n=\(playerNumber)&lsig=fixture",
                         "mimeType": mime,
-                        "contentLength": String(Self.mediaBytes.count),
+                        // ump-cut advertises the full stream, which is longer than what UMP returns.
+                        "contentLength": String(mode == "ump-cut" ? Bytes.cutStream.count + 36 : Self.mediaBytes.count),
                         "audioSampleRate": "48000",
                     ]]],
                 ])
@@ -92,6 +94,13 @@ final class FixtureProtocol: URLProtocol {
             let broken = phase && mediaNumber == 1
             if broken && ["stale", "section"].contains(mode) {
                 status = 403
+            } else if broken && mode == "ump-cut" {
+                // Ranged GETs are refused; the UMP start request answers with a redirect part.
+                if method == "POST" {
+                    data = Bytes.redirectPart("https://media.invalid/ump-stream")
+                } else {
+                    status = 403
+                }
             } else if broken && mode == "non-http-error" {
                 failure = URLError(.cancelled)
             } else if range == "bytes=0-0" {
@@ -101,6 +110,9 @@ final class FixtureProtocol: URLProtocol {
             } else {
                 data = Self.mediaBytes
             }
+        case ("media.invalid", "/ump-stream"):
+            // A stream cut between two complete fragments: every box fits, but bytes are missing.
+            data = Bytes.umpPart(21, [0] + Bytes.cutStream)
         default:
             status = 404   // never forward an unexpected request
         }
@@ -186,6 +198,10 @@ enum Bytes {
     }
 
     static let ftyp = be32(16) + Array("ftypisom".utf8) + be32(0)
+
+    /// `ftyp` + one `moof`/`mdat` fragment: a valid box chain that stops before the next fragment.
+    static let cutStream = ftyp + be32(16) + Array("moof".utf8) + [UInt8](repeating: 0, count: 8)
+        + be32(20) + Array("mdat".utf8) + [UInt8](repeating: 7, count: 12)
 }
 
 // MARK: - Cases
@@ -209,9 +225,20 @@ struct RegressionChecks {
         catch { print("unexpected error: \(error)"); return false }
     }
 
-    static func playerGaps() -> [TimeInterval] {
+    /// Seconds from the first /player request to each later one.
+    static func playerOffsets() -> [TimeInterval] {
         let times = FixtureProtocol.playerRequests().map(\.time).sorted()
-        return zip(times.dropFirst(), times).map { $0 - $1 }
+        guard let first = times.first else { return [] }
+        return times.dropFirst().map { $0 - first }
+    }
+
+    /// The pacer reserves slots 3 s apart, but a waiter can wake late, which shortens the next
+    /// arrival gap. So the check is on the k-th request leaving no earlier than 3k s after the
+    /// first one, less this allowance for the first request's own send latency.
+    static let sendJitter: TimeInterval = 0.5
+
+    static func spacedBySlots(_ offsets: [TimeInterval]) -> Bool {
+        offsets.enumerated().allSatisfy { $0.element >= 3.0 * Double($0.offset + 1) - sendJitter }
     }
 
     /// Extracts, then downloads through `DownloadEngine` with the first media URL broken.
@@ -264,13 +291,21 @@ struct RegressionChecks {
                 for id in ["Fixture0002", "Fixture0003", "Fixture0004"] { group.addTask { await isBotGate(id) } }
                 return await group.reduce(into: []) { $0.append($1) }
             }
-            let gaps = playerGaps()
-            check(results.allSatisfy { $0 } && gaps.count == 3 && gaps.allSatisfy { $0 >= 2.95 },
-                  "concurrent /player requests are at least 3 s apart; gaps=\(gaps)")
+            let offsets = playerOffsets()
+            check(results.allSatisfy { $0 } && offsets.count == 3 && spacedBySlots(offsets),
+                  "concurrent /player requests use slots 3 s apart; offsets from the first=\(offsets)")
         case "pace-retry":
             let gated = await isBotGate("Fixture0001")
-            let gaps = playerGaps()
-            check(gated && gaps.count == 1 && gaps[0] >= 2.95, "the retry after HTTP 429 waits 3 s; gaps=\(gaps)")
+            let offsets = playerOffsets()
+            check(gated && offsets.count == 1 && spacedBySlots(offsets), "the retry after HTTP 429 waits for the next 3 s slot; offsets=\(offsets)")
+        case "signed-in-wall":
+            // Review of PR #1: a bot wall for the anonymous profiles must not stop the profile
+            // that sends the user's sign-in cookies.
+            let signedIn = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", name: "SAPISID", value: "fixture-only")]))
+            let info = try await extract(client: signedIn)
+            let players = FixtureProtocol.playerRequests().count
+            check(!info.formats.isEmpty && players == 2,
+                  "after the wall only the cookie profile is tried, and it succeeds; player requests=\(players)")
 
         // Report 1 #5 / report 2 #4: cache is per request context and honours cancellation.
         case "cache":
@@ -325,6 +360,13 @@ struct RegressionChecks {
             let (_, error) = await download(audioExt: "webm")
             check((error as? URLError)?.code == .cancelled && umpPosts().isEmpty,
                   "a non-HTTP error propagates without UMP; error=\(String(describing: error)), umpPosts=\(umpPosts().count)")
+        case "ump-cut":
+            // Review of PR #1: a UMP stream cut between complete fragments is not a finished file.
+            let (file, error) = await download(audioExt: "webm")
+            let bytes = file.flatMap { try? Data(contentsOf: $0) }
+            let players = FixtureProtocol.playerRequests().count
+            check(error == nil && bytes == FixtureProtocol.mediaBytes && players == 2,
+                  "a short UMP stream is refused and the fresh URL is downloaded; players=\(players), savedBytes=\(bytes?.count ?? -1), error=\(String(describing: error))")
 
         // Report 1 #4 / report 2 #2, #1, #3: UMP parsing.
         case "ump-redirect":
@@ -345,6 +387,21 @@ struct RegressionChecks {
             let partial = UMP.assembleMP4(from: Bytes.umpPart(21, [0] + truncated))
             check(whole == Data(complete) && partial == nil,
                   "a complete MP4 is returned and a truncated one is rejected; partialBytes=\(partial?.count ?? 0)")
+        case "ump-mixed-streams":
+            let complete = Bytes.ftyp + Bytes.be32(12) + Array("mdat".utf8) + [1, 2, 3, 4]
+            let mixed = Bytes.umpPart(21, [0] + complete) + Bytes.umpPart(21, [1] + Bytes.be32(12) + Array("mdat".utf8) + [5, 6, 7, 8])
+            check(UMP.assembleMP4(from: mixed) == nil, "media parts with two header IDs are not merged into one file")
+
+        // Review of PR #1: CLI arguments must not turn into a different target.
+        case "cli-flags":
+            let unknown = await CLIRunner.run(arguments: ["ubit", "info", "--bogus", "value", "https://fixture.invalid/video"])
+            let before = FixtureProtocol.requests().count
+            let chromium = await CLIRunner.run(arguments: ["ubit", "info", "--cookies-from-browser", "brave", "https://fixture.invalid/video"])
+            let added = FixtureProtocol.requests().count - before
+            var settings = Settings()
+            let storedBrave = settings.setByKey("cookies", value: "brave")
+            check(unknown == 2 && chromium == 1 && added == 0 && !storedBrave,
+                  "unknown info flag exits 2, a Chromium cookie source fails before any request, settings refuse it; unknown=\(unknown), chromium=\(chromium), requests=\(added), stored=\(storedBrave)")
 
         // Report 1 #7 / report 2 #6, #1: Safari cookie parsing.
         case "safari-values":

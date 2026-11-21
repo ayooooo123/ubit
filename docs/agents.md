@@ -54,6 +54,8 @@ Inspect available qualities, codecs, byte sizes, durations, chapters, playlist i
 ubit info --json "$URL"
 ```
 
+`ubit info` and `ubit formats` accept only `--json`, `--cookies FILE`, `--cookies-from-browser B`, `--no-cookies` and `--proxy URL`. Any other flag exits with code `2`.
+
 Top-level JSON fields returned by `ubit info --json`:
 
 | Field | Type | Description |
@@ -123,6 +125,7 @@ When `--json` is passed to `ubit get`, `stdout` emits strictly valid newline-del
   3. Explicit Netscape Cookie File (`--cookies /path/to/cookies.txt`).
   4. Cookie-free (`--no-cookies`): forces unauthenticated extraction.
 - **YouTube Request Pacing & Bot Wall**:
-  One `ubit` process leaves at least 3 seconds between its YouTube `/player` requests, retries included, and caches a video's metadata for 5.5 hours per cookie set and proxy. Separate processes do not share this pacing or the cache. When YouTube answers "confirm you're not a bot", extraction stops at once with exit code `1` and an error that names the bot wall. Do not retry that URL in a loop: wait, route through another `--proxy`, or pass cookies.
+  One `ubit` process reserves its YouTube `/player` requests in slots 3 seconds apart, retries included, and caches a video's metadata for 5.5 hours per cookie set and proxy. Separate processes do not share this pacing or the cache. When YouTube answers "confirm you're not a bot" and no YouTube sign-in cookies are loaded, extraction stops at once with exit code `1` and an error that names the bot wall. With sign-in cookies, only the client profiles that send them are tried after the wall. Do not retry that URL in a loop: wait, route through another `--proxy`, or pass sign-in cookies.
+- **HTTP 403/410 on a Stream**: `ubit` re-extracts a refused stream URL up to two times. A YouTube SABR URL (one with `lsig=`) is first tried over UMP, which always fetches the whole stream; with `--section`, the clip is cut after that download, so it is not smaller.
 - **Unrecognized JS-Heavy Player Pages**:
   If static/API extraction fails on a custom video host, hand the URL to the built-in WebKit media-sniffer browser (`ubit browse <url>`), which hooks `fetch`, `XMLHttpRequest`, and `<video>` across all frames to capture dynamic HLS/DASH/MP4 URLs.

@@ -174,7 +174,9 @@ public struct YouTubeExtractor: SiteExtractor {
         }
 
         func store(_ key: CacheKey, _ info: MediaInfo) {
-            cache[key] = (info, Date().addingTimeInterval(5.5 * 3600))
+            let now = Date()
+            cache = cache.filter { $0.value.exp > now }   // a long GUI session must not keep expired entries
+            cache[key] = (info, now.addingTimeInterval(5.5 * 3600))
         }
 
         /// Drops the video's entries for every request context.
@@ -182,15 +184,21 @@ public struct YouTubeExtractor: SiteExtractor {
             cache = cache.filter { $0.key.videoID != videoID }
         }
 
-        /// Waits until this caller may send one /player request. The caller's slot is reserved
-        /// before the actor suspends, so concurrent callers queue one gap apart instead of
-        /// waking together. Cancellation ends the wait with `CancellationError`.
+        /// Waits until this caller may send one /player request. Slots are reserved 3 s apart
+        /// before the actor suspends, so concurrent callers queue behind each other instead of
+        /// waking together. A late wake-up can make one gap between actual sends shorter, but
+        /// the slots, and so the average rate, stay 3 s apart. Cancellation ends the wait with
+        /// `CancellationError` and frees the slot when no later caller has queued behind it.
         func pace() async throws {
             let now = ProcessInfo.processInfo.systemUptime
             let slot = max(now, nextPlayerSlot)
             nextPlayerSlot = slot + Self.playerGap
-            if slot > now {
+            guard slot > now else { return }
+            do {
                 try await Task.sleep(nanoseconds: UInt64((slot - now) * 1_000_000_000))
+            } catch {
+                if nextPlayerSlot == slot + Self.playerGap { nextPlayerSlot = slot }
+                throw error
             }
         }
     }
@@ -272,10 +280,16 @@ public struct YouTubeExtractor: SiteExtractor {
         if let cached = await YTGuard.shared.cached(cacheKey) { return cached }
         let watchCtx = await fetchWatchContext(videoID: videoID, client: client)
 
-        // Fail fast before firing any /player calls if the watch page itself already carries the IP bot-gate.
+        // After a bot-wall answer, only a profile that sends the user's YouTube sign-in cookies can
+        // still succeed. Without such cookies the wall ends extraction before any more /player
+        // requests; with them, only the cookie profiles are tried.
+        let hasSignIn = client.cookies.cookieValue(named: "SAPISID", forDomain: "youtube.com") != nil
+            || client.cookies.cookieValue(named: "__Secure-3PAPISID", forDomain: "youtube.com") != nil
+        var botWalled = false
         let watchReason = (watchCtx.playerResponse?["playabilityStatus"] as? [String: Any])?["reason"] as? String
         if watchCtx.playerResponse?["streamingData"] == nil && Self.isBotGateReason(watchReason) {
-            throw ExtractorError.botGate("YouTube")
+            guard hasSignIn else { throw ExtractorError.botGate("YouTube") }
+            botWalled = true
         }
         // Honor YouTube pre-roll ad slot wait if requested (avoids transient 403 before stream activation)
         if let adSlots = watchCtx.playerResponse?["adSlots"] as? [Any], !adSlots.isEmpty,
@@ -300,9 +314,10 @@ public struct YouTubeExtractor: SiteExtractor {
         var chosenHLSUA: String = Self.visionOSProfile.userAgent
         var cachedSolver: JSPlayerCipherSolver?
         var loadedSolver = false
-        var lastReason: String?
+        var lastReason: String? = botWalled ? watchReason : nil
 
         for profile in candidateProfiles {
+            if botWalled && !profile.supportsCookies { continue }
             let resp: [String: Any]
             do {
                 resp = try await callPlayer(
@@ -322,7 +337,8 @@ public struct YouTubeExtractor: SiteExtractor {
             if pStatus != "OK" && resp["streamingData"] == nil {
                 let r = (resp["playabilityStatus"] as? [String: Any])?["reason"] as? String
                 if Self.isBotGateReason(r) {
-                    throw ExtractorError.botGate("YouTube")
+                    guard hasSignIn else { throw ExtractorError.botGate("YouTube") }
+                    botWalled = true
                 }
                 if let r { lastReason = r }
                 continue

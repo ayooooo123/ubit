@@ -113,7 +113,8 @@ public final class CookieVault: @unchecked Sendable {
         return CookieVault()
     }
 
-    private static let chromiumFamily = ["chrome", "chromium", "brave", "edge", "vivaldi", "opera"]
+    /// Browser names whose cookies uBit cannot decrypt; `load` and `Settings` refuse them.
+    static let chromiumFamily = ["chrome", "chromium", "brave", "edge", "vivaldi", "opera"]
 
     /// Safari stores cookies in an unencrypted `Cookies.binarycookies` blob, so importing its
     /// session needs no keychain access and no Chromium-style AES unwrapping. macOS TCC still

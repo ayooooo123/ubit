@@ -409,16 +409,20 @@ public final class DownloadEngine: @unchecked Sendable {
                     // fails too, or the URL is not SABR-only, report a stale link so fetchStream
                     // invalidates the metadata cache and extracts a fresh URL.
                     guard fmt.url.contains("lsig=") else { throw HTTPError.staleLink(refusal) }
+                    // UMP always fetches the whole stream; with --section, the mux step trims it.
                     let ua = mergedHeaders["User-Agent"] ?? HTTPClient.defaultBrowserUA
                     let mp4: Data
                     do {
-                        mp4 = try await UMP.pull(mediaURL: fmt.url, userAgent: ua, client: client)
+                        mp4 = try await UMP.pull(mediaURL: fmt.url, userAgent: ua, expectedSize: fmt.filesize, client: client)
                     } catch is CancellationError {
                         throw CancellationError()
                     } catch {
                         throw HTTPError.staleLink(refusal)
                     }
                     try mp4.write(to: dest)
+                    // A refused ranged download can leave its resume files behind.
+                    try? FileManager.default.removeItem(at: dest.appendingPathExtension("part"))
+                    try? FileManager.default.removeItem(at: dest.appendingPathExtension("part.json"))
                     return (0, false)
                 }
             }

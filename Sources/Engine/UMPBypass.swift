@@ -102,8 +102,10 @@ public enum UMP {
     }
 
     /// Downloads one SABR (`lsig`) stream end to end: start the umbrella request, follow the
-    /// redirect part, and return the assembled MP4.
-    public static func pull(mediaURL: String, userAgent: String, client: HTTPClient) async throws -> Data {
+    /// redirect part, and return the assembled MP4. When `expectedSize` (the format's advertised
+    /// content length) is known, a result of any other length is an error: a stream cut between
+    /// two complete fragments still forms a valid box chain, so only the size can expose it.
+    public static func pull(mediaURL: String, userAgent: String, expectedSize: Int64?, client: HTTPClient) async throws -> Data {
         let separator = mediaURL.contains("?") ? "&" : "?"
         let headers = ["Content-Type": "application/octet-stream", "User-Agent": userAgent]
         let (probe, _) = try await client.fetchData(
@@ -117,18 +119,27 @@ public enum UMP {
             url: redirect, method: "POST", headers: headers, body: requestBody, includeCookies: false
         )
         guard let mp4 = assembleMP4(from: blob) else {
-            throw HTTPError.badURL("UMP: no media part")
+            throw HTTPError.badURL("UMP: no complete media")
+        }
+        if let expectedSize, expectedSize > 0, Int64(mp4.count) != expectedSize {
+            throw HTTPError.badURL("UMP: got \(mp4.count) of \(expectedSize) bytes")
         }
         return mp4
     }
 
-    /// Concatenates the media parts (type 21, minus their one-byte prefix) and returns the MP4
-    /// box chain that starts at `ftyp`. Nil unless the chain is complete: every box must fit,
-    /// the chain must end exactly at the end of the media bytes, and it must hold an `mdat`.
-    /// A truncated response therefore fails instead of being saved as a finished file.
+    /// Concatenates the media parts (type 21, minus their one-byte header ID) and returns the
+    /// MP4 box chain that starts at `ftyp`. Nil unless the chain is complete: every box must
+    /// fit, the chain must end exactly at the end of the media bytes, and it must hold an
+    /// `mdat`. Nil also when the parts carry more than one header ID, because that means more
+    /// than one stream and their bytes must not be merged into one file. A chain cut exactly
+    /// between two boxes still passes here; `pull` checks the size for that case.
     public static func assembleMP4(from data: Data) -> Data? {
         var media = Data()
+        var headerID: UInt8?
         for part in parts(in: data) where part.type == 21 {
+            guard let id = part.payload.first else { continue }
+            if headerID == nil { headerID = id }
+            guard id == headerID else { return nil }
             media.append(part.payload.dropFirst())
         }
         guard media.count > 8 else { return nil }

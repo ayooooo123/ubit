@@ -28,6 +28,7 @@ ubit info --json "<url>"
 - Check `isDRM` (`true` means Widevine/FairPlay encrypted — report immediately rather than retrying).
 - Check `entries` (non-empty for playlists, channels, sets, or `ytsearch:<query>` searches).
 - Check `subtitles` for human or ASR caption tracks (`--subs --sub-langs en --sub-files` downloads `.vtt` sidecars).
+- `info` and `formats` accept only `--json`, `--cookies`, `--cookies-from-browser`, `--no-cookies` and `--proxy`; any other flag exits with code `2`.
 
 ### 2. Download a Video or Audio File Deterministically
 
@@ -68,6 +69,6 @@ ubit info --json "ytsearch:blender open movie"
 ### 6. Handle Auth-Gated Links & Resume
 
 - **Cookies**: `ubit` uses `~/Library/Application Support/uBit/cookies.txt` by default (shared with `ubit browse`), or pass `--cookies-from-browser safari`, `--cookies-from-browser firefox`, `--cookies /path/to/cookies.txt`, or `--no-cookies`. Chrome/Brave/Edge are refused with an explicit error (keychain + AES unwrap not implemented).
-- **YouTube Bot Wall**: an error that says YouTube "refused anonymous playback" means the bot wall. Do not retry in a loop (one process already spaces its YouTube `/player` requests 3 seconds apart); wait, use another `--proxy`, or pass cookies.
+- **YouTube Bot Wall**: an error that says YouTube "refused anonymous playback" means the bot wall. Do not retry in a loop (one process already reserves its YouTube `/player` requests 3 seconds apart); wait, use another `--proxy`, or pass sign-in cookies.
 - **Sandbox Isolation**: Set `UBIT_CONFIG_DIR=/tmp/agent-ubit-$$` when running parallel workers.
 - **Exit Codes**: `0` = done, `1` = download/extractor error, `2` = bad CLI flags, `130` = interrupted (`.part` + `.part.json` saved; re-running the identical command resumes at byte-level).

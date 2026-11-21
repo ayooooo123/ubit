@@ -36,13 +36,16 @@ swiftc \
   -o "$OUT/checks"
 
 # visitor-first and visitor-reuse share one config directory: the second process must reuse
-# the visitor ID that the first one stored.
-CASES="${*:-watch-gate player-gate visitor-first visitor-reuse pace-concurrent pace-retry cache cache-context cache-cancelled normal stale section non-http-error ump-redirect ump-oversized-box ump-truncated safari-values safari-infinite-expiry chromium}"
+# the visitor ID that the first one stored. Naming visitor-reuse alone runs visitor-first first.
+CASES="${*:-watch-gate player-gate visitor-first visitor-reuse pace-concurrent pace-retry signed-in-wall cache cache-context cache-cancelled normal stale section non-http-error ump-cut ump-redirect ump-oversized-box ump-truncated ump-mixed-streams cli-flags safari-values safari-infinite-expiry chromium}"
 
 failed=""
 for case in $CASES; do
   config="$OUT/config-$case"
   case "$case" in visitor-*) config="$OUT/config-visitor" ;; esac
+  if [ "$case" = visitor-reuse ] && [ ! -f "$config/yt_visitor.txt" ]; then
+    UBIT_CONFIG_DIR="$config" "$OUT/checks" visitor-first >/dev/null || true
+  fi
   if ! UBIT_CONFIG_DIR="$config" "$OUT/checks" "$case"; then
     echo "FAIL $case (exit or signal)"
     failed="$failed $case"

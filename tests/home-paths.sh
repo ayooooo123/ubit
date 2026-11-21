@@ -7,6 +7,11 @@ case "${HOME:-}" in /?*) ;; *) echo "HOME must be an absolute path other than /"
 
 bad=0
 for f in "$@"; do
+  if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+    echo "FAIL $f: no such readable file"
+    bad=1
+    continue
+  fi
   n=$(LC_ALL=C grep -a -o -F "$HOME" "$f" | wc -l | tr -d ' ')
   if [ "$n" -gt 0 ]; then
     echo "FAIL $f: $n home-directory paths"

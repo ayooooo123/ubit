@@ -58,7 +58,7 @@ jobs:
       - name: Rust SDK rlibs hold no home-directory path
         run: |
           sdk/cargo.sh build --locked
-          ./tests/home-paths.sh target/debug/libubit.rlib target/debug/deps/*.rlib
+          find target -name '*.rlib' -print0 | xargs -0 ./tests/home-paths.sh
       - name: Upload Linux & Android release archives
         uses: actions/upload-artifact@v4
         with:

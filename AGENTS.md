@@ -28,6 +28,8 @@
 | `Sources/UI/BrowserWindow.swift` | `WKWebView` built-in browser (`⌘B`) with document-start `fetch`/`XHR`/media element sniffer across all frames, `WKContentRuleList` adblocker, and automatic cookie export |
 | `build.sh` | Compiles `arm64-apple-macos14.0` with `-Osize -whole-module-optimization -gnone -Xlinker -dead_strip`, strips non-global symbols, generates programmatic `AppIcon.icns`, ad-hoc signs `dist/uBit.app`, and packs `dist/ubit-0.3.3-darwin-arm64.tar.gz` |
 | `tests/swift/run.sh` | Builds `tests/swift/RegressionChecks.swift` with the app sources and runs each Swift regression case in its own process against a local `URLProtocol` fixture (no network) |
+| `tests/home-paths.sh` | Fails when a binary or rlib holds the home-directory path of the machine that built it; CI runs it on the macOS, Linux and Android binaries and on the SDK rlibs |
+| `sdk/cargo.sh` | Runs `cargo` with `--remap-path-prefix` (rustc) and `-ffile-prefix-map` (C/C++) for `$HOME` and the checkout, so that uBit and its dependencies build without home-directory paths |
 
 ## Architectural Rules & Invariants
 
@@ -50,6 +52,9 @@
 # Offline Swift regression checks (YouTube pacing/cache, UMP, stale-link refresh, Safari cookies)
 ./tests/swift/run.sh
 
+# No home-directory path in the shipped binary
+./tests/home-paths.sh dist/uBit.app/Contents/MacOS/ubit
+
 # Live E2E: sidx byte-range clip download + native ISO-BMFF MP4 mux + metadata
 UBIT_CONFIG_DIR=/tmp/ubit-e2e ./dist/ubit get -q 720 --section 0:05-0:15 --no-library --json -o /tmp/ubit-e2e 'https://www.youtube.com/watch?v=aqz-KE-bpKQ'
 
@@ -66,4 +71,4 @@ UBIT_CONFIG_DIR=/tmp/ubit-e2e UBIT_SMOKE_SCREENSHOT=/tmp/ubit-e2e/window.png ./d
 
 ## Embeddable C & Rust SDK (`sdk/`, `Cargo.toml`)
 
-`Cargo.toml` + `build.rs` compile `sdk/src/ubit_sdk.cpp` (`-std=c++20 -DUBIT_SDK`, backed by `linux/src/engine.hpp` + `softcrypto.hpp` with zero `dlopen` or `system()` calls) into the `ubit` Rust crate (`sdk/rust/lib.rs`, `sdk/rust/net.rs`). Every outbound connection goes through `ubit_net_vtable` (`sdk/include/ubit.h`) into `rustls` + `webpki-roots` and `ubit::is_public_address` (IANA special-purpose IPv4/IPv6 SSRF filter), while `WorkStealingDownloader` and `HLSEngine` keep native `std::thread` parallelism and per-call `ubit_cancel_t` + socket shutdown cancellation. Verify with `cargo test`.
+`Cargo.toml` + `build.rs` compile `sdk/src/ubit_sdk.cpp` (`-std=c++20 -DUBIT_SDK`, backed by `linux/src/engine.hpp` + `softcrypto.hpp` with zero `dlopen` or `system()` calls) into the `ubit` Rust crate (`sdk/rust/lib.rs`, `sdk/rust/net.rs`). Every outbound connection goes through `ubit_net_vtable` (`sdk/include/ubit.h`) into `rustls` + `webpki-roots` and `ubit::is_public_address` (IANA special-purpose IPv4/IPv6 SSRF filter), while `WorkStealingDownloader` and `HLSEngine` keep native `std::thread` parallelism and per-call `ubit_cancel_t` + socket shutdown cancellation. Verify with `sdk/cargo.sh test`. Build through `sdk/cargo.sh`, not plain `cargo`: a plain build puts the Cargo registry path under `$HOME` into the rlibs of rustls, tokio and the other dependencies. Then `./tests/home-paths.sh target/debug/deps/*.rlib` must pass. A project that uses the `ubit` crate as a dependency builds it with its own flags, so it needs the same `--remap-path-prefix` flags.

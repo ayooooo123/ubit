@@ -21,6 +21,8 @@ jobs:
           ./dist/ubit version
           ./dist/ubit --llms
           ./dist/ubit sites --json
+      - name: Built binary holds no home-directory path
+        run: ./tests/home-paths.sh dist/uBit.app/Contents/MacOS/ubit
       - name: Swift regression checks (offline fixtures)
         run: ./tests/swift/run.sh
       - name: Upload macOS release archive
@@ -48,6 +50,15 @@ jobs:
           /tmp/test-amd64/ubit version
           /tmp/test-amd64/ubit --llms
           /tmp/test-amd64/ubit sites --json
+      - name: Linux & Android binaries hold no home-directory path
+        run: |
+          mkdir -p /tmp/test-arm64
+          tar -xzf dist/ubit-*-linux-arm64.tar.gz -C /tmp/test-arm64
+          ./tests/home-paths.sh /tmp/test-amd64/ubit /tmp/test-arm64/ubit /tmp/test-android/ubit
+      - name: Rust SDK rlibs hold no home-directory path
+        run: |
+          sdk/cargo.sh build --locked
+          ./tests/home-paths.sh target/debug/libubit.rlib target/debug/deps/*.rlib
       - name: Upload Linux & Android release archives
         uses: actions/upload-artifact@v4
         with:

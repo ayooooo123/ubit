@@ -254,13 +254,19 @@ final class FixtureProtocol: URLProtocol {
             data = Data(Bytes.clipInit(sampleTicks: mode == "hls-decimal" ? 200 : 1000))
         case ("media.invalid", let path) where path.hasPrefix("/clip-"):
             data = Data(Bytes.clipSegment(Int(path.dropFirst(6).dropLast(4)) ?? 0))
-        case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4", "/cut-unknown.mp4", "/cut-later.mp4"].contains(path):
-            var bytes = mode == "sidx-fragments" || path == "/cut-later.mp4" ? Bytes.fragmentIndexedClip : Bytes.indexedClip
+        case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4", "/cut-unknown.mp4", "/cut-later.mp4", "/cut-padding.mp4"].contains(path):
+            var bytes = mode == "sidx-fragments" || path == "/cut-later.mp4" || path == "/cut-padding.mp4" ? Bytes.fragmentIndexedClip : Bytes.indexedClip
             if mode == "sidx-padding" { bytes += Bytes.box("free", Array(repeating: 0, count: 24)) }
-            if path == "/cut-later.mp4" {
+            if path == "/cut-later.mp4" || path == "/cut-padding.mp4" {
                 let data = Data(bytes)
                 let indexes = MP4Muxer.listBoxes(in: data, from: 0, to: data.count).filter { $0.type == "sidx" }
-                bytes.removeSubrange(indexes[2].endOffset...)
+                let offset = indexes[2].endOffset
+                if path == "/cut-later.mp4" {
+                    bytes.removeSubrange(offset...)
+                } else {
+                    let length = Bytes.clipSegment(2).count
+                    bytes.replaceSubrange(offset..<(offset + length), with: Bytes.box("free", Array(repeating: 0, count: length - 8)))
+                }
             } else if path.hasPrefix("/cut-") { bytes.removeLast(13 * Bytes.clipSegment(0).count) }
             if path != "/cut-200.mp4", let range, let dash = range.firstIndex(of: "-"),
                let start = Int(range.dropFirst(6).prefix(while: { $0 != "-" })),
@@ -1042,6 +1048,18 @@ struct RegressionChecks {
                 let got = samples(scale: 30000, ticks: 1001, count: 30, group: 30, base: 1.001, start: 1.2, end: end)
                 check(got == Array(0..<UInt64(frames)), "exclusive end \(end): \(got)")
             }
+            let video = MP4Track(trackID: 1, kind: .video, timescale: 30, stsdPayload: Data(), samples:
+                (0..<10).map { MP4Sample(offset: UInt64($0 + 10), size: 1, duration: 1, isSync: $0 == 0) })
+            let fromThird = MP4Muxer.trimTracks([video], section: SectionRange(start: 0.4, end: 0.5),
+                                                 baseStart: SectionTimeBase(ticks: 1, timescale: 3))
+            check(fromThird.first?.samples.map(\.offset) == [10, 11, 12, 13, 14], "the exclusive end omits frame 15 after a one-third-second fragment start")
+            let decode = [0, 2, -1, -1].enumerated().map {
+                MP4Sample(offset: UInt64($0.offset), size: 1, duration: 1, ctsOffset: Int32($0.element), isSync: $0.offset == 0)
+            }
+            var reordered = video
+            reordered.samples = decode
+            let display = MP4Muxer.trimTracks([reordered], section: SectionRange(start: 0, end: 0.1)).first
+            check(display?.samples.count == 4 && display?.editSegmentTicks == 3, "the clip retains the fourth decode sample but presents only the first three pictures")
         case "hls-decimal", "sidx-boundaries", "sidx-fragments", "sidx-padding":
             let hls = mode == "hls-decimal"
             let path = hls ? "/clip.m3u8" : "/indexed.mp4"
@@ -1122,7 +1140,7 @@ struct RegressionChecks {
             options.cookieSource = "none"
             let out = AppPaths.appSupportDir.appendingPathComponent("out")
             options.outputDir = out.path
-            let scenarios: [(String, Double?)] = [("200", 10), ("206", 10), ("206", 61), ("unknown", 61), ("unknown", nil), ("later", 12)]
+            let scenarios: [(String, Double?)] = [("200", 10), ("206", 10), ("206", 61), ("unknown", 61), ("unknown", nil), ("later", 12), ("padding", 12)]
             for (status, end) in scenarios {
                 options.section = SectionRange(start: start, end: end)
                 do {

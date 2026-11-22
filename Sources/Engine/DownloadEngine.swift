@@ -292,10 +292,12 @@ public final class DownloadEngine: @unchecked Sendable {
 
         var videoSectionBaseSec: Double = 0
         var audioSectionBaseSec: Double = 0
+        var videoSectionBase: SectionTimeBase?
+        var audioSectionBase: SectionTimeBase?
         var videoIsTS = false
         var audioIsTS = false
 
-        func fetchStream(_ fmt: MediaFormat, to dest: URL, priorBytes: Int64) async throws -> (baseSec: Double, isTS: Bool) {
+        func fetchStream(_ fmt: MediaFormat, to dest: URL, priorBytes: Int64) async throws -> (base: SectionTimeBase?, baseSec: Double, isTS: Bool) {
             var mergedHeaders = fmt.headers ?? [:]
             if let ref = options.referer, mergedHeaders["Referer"] == nil { mergedHeaders["Referer"] = ref }
 
@@ -325,7 +327,7 @@ public final class DownloadEngine: @unchecked Sendable {
                         }
                     }
                 }
-                return (startTime, !isFMP4)
+                return (nil, startTime, !isFMP4)
 
             case .dash:
                 try await DASHEngine.downloadRepresentation(
@@ -344,14 +346,14 @@ public final class DownloadEngine: @unchecked Sendable {
                         }
                     }
                 }
-                return (0, false)
+                return (nil, 0, false)
 
             case .http:
                 var lastIndexedByte: Int64?
                 let isMP4Section = options.section != nil && (fmt.ext == "mp4" || fmt.ext == "m4a")
                 if isMP4Section, let sec = options.section {
                     switch try await tryDownloadSectionViaSidx(client: client, fmt: fmt, headers: mergedHeaders, section: sec, destination: dest) {
-                    case .downloaded(let start): return (start, false)
+                    case .downloaded(let base): return (base, 0, false)
                     case .wholeFile(let last): lastIndexedByte = last
                     }
                 }
@@ -380,7 +382,7 @@ public final class DownloadEngine: @unchecked Sendable {
                         throw error
                     }
                 }
-                return (0, false)
+                return (nil, 0, false)
             }
         }
 
@@ -395,6 +397,7 @@ public final class DownloadEngine: @unchecked Sendable {
         if let vFmt = selected.video {
             let res = try await fetchStream(vFmt, to: vTemp, priorBytes: 0)
             hasVFile = true
+            videoSectionBase = res.base
             videoSectionBaseSec = res.baseSec
             videoIsTS = res.isTS
             vActualBytes = (try? FileManager.default.attributesOfItem(atPath: vTemp.path)[.size] as? Int64) ?? 0
@@ -404,6 +407,7 @@ public final class DownloadEngine: @unchecked Sendable {
                 let synthAudio = MediaFormat(id: "hls-audio", url: hlsAudioURL, ext: "m4a", proto: .hls, vcodec: "none", acodec: "mp4a", headers: vFmt.headers)
                 let aRes = try await fetchStream(synthAudio, to: aTemp, priorBytes: vActualBytes)
                 hasAFile = true
+                audioSectionBase = aRes.base
                 audioSectionBaseSec = aRes.baseSec
                 audioIsTS = aRes.isTS
             }
@@ -411,6 +415,7 @@ public final class DownloadEngine: @unchecked Sendable {
         if let aFmt = selected.audio {
             let res = try await fetchStream(aFmt, to: aTemp, priorBytes: vActualBytes)
             hasAFile = true
+            audioSectionBase = res.base
             audioSectionBaseSec = res.baseSec
             audioIsTS = res.isTS
         }
@@ -487,7 +492,7 @@ public final class DownloadEngine: @unchecked Sendable {
                 sourceFiles.append(vTemp)
                 var vt = videoIsTS ? try TSDemuxer.demuxToTracks(tsFileURL: vTemp) : try MP4Muxer.readTracks(from: vTemp, sourceIndex: srcIdx)
                 if let sec = options.section {
-                    vt = MP4Muxer.trimTracks(vt, section: sec, baseStartTimeSec: videoSectionBaseSec)
+                    vt = MP4Muxer.trimTracks(vt, section: sec, baseStartTimeSec: videoSectionBaseSec, baseStart: videoSectionBase)
                 }
                 if !sponsorCutIntervals.isEmpty {
                     vt = MP4Muxer.removeIntervals(vt, intervals: sponsorCutIntervals)
@@ -502,7 +507,7 @@ public final class DownloadEngine: @unchecked Sendable {
                 var at = audioIsTS ? try TSDemuxer.demuxToTracks(tsFileURL: aTemp) : try MP4Muxer.readTracks(from: aTemp, sourceIndex: srcIdx)
                 at = at.filter { $0.kind == .audio }
                 if let sec = options.section {
-                    at = MP4Muxer.trimTracks(at, section: sec, baseStartTimeSec: audioSectionBaseSec)
+                    at = MP4Muxer.trimTracks(at, section: sec, baseStartTimeSec: audioSectionBaseSec, baseStart: audioSectionBase)
                 }
                 if !sponsorCutIntervals.isEmpty {
                     at = MP4Muxer.removeIntervals(at, intervals: sponsorCutIntervals)
@@ -590,7 +595,7 @@ public final class DownloadEngine: @unchecked Sendable {
     }
 
     private enum IndexedSection {
-        case downloaded(start: Double)
+        case downloaded(base: SectionTimeBase)
         case wholeFile(lastIndexedByte: Int64?)
     }
 
@@ -619,16 +624,35 @@ public final class DownloadEngine: @unchecked Sendable {
             if next < size {
                 let remaining = size - next
                 guard remaining >= 8 else { return fallback }
-                let trailer: Data
-                if next + 7 < Int64(head.count) {
-                    trailer = head[Int(next)..<Int(next + 8)]
-                } else {
-                    trailer = try await client.fetchRangeBytes(url: fmt.url, range: ByteRange(start: next, end: next + 7), headers: headers)
+                func probe(_ start: Int64, _ length: Int) async throws -> Data? {
+                    guard start >= 0, start <= Int64(head.count) - Int64(length) else {
+                        let end = start + Int64(length - 1)
+                        guard end < size else { return nil }
+                        let data = try await client.fetchRangeBytes(
+                            url: fmt.url, range: ByteRange(start: start, end: end), headers: headers)
+                        return data.count == length ? data : nil
+                    }
+                    return head[Int(start)..<(Int(start) + length)]
                 }
+                guard let header = try await probe(next, 8) else { return fallback }
                 // A trailing random-access index or padding does not hold media samples.
-                let type = trailer.fourCC(4)
-                guard type == "mfra" || type == "free" || type == "skip",
-                      Int64(trailer.beU32(0)) == remaining else { return fallback }
+                let type = header.fourCC(4)
+                guard type == "mfra" || type == "free" || type == "skip" else { return fallback }
+                let boxSize: Int64
+                let size32 = header.beU32(0)
+                if size32 == 1 {
+                    // 64-bit size: the header is 16 bytes.
+                    guard remaining >= 16, let extended = try await probe(next + 8, 8) else { return fallback }
+                    let size64 = extended.beU64(0)
+                    guard size64 >= 16, size64 <= UInt64(Int64.max) else { return fallback }
+                    boxSize = Int64(size64)
+                } else if size32 == 0 {
+                    // Size 0 means the box extends to the end of the file.
+                    boxSize = remaining
+                } else {
+                    boxSize = Int64(size32)
+                }
+                guard boxSize == remaining else { return fallback }
             }
         }
         let overlaps: (SidxSegment) -> Bool = { $0.endTimeSec > reqStart && $0.startTimeSec < reqEnd }
@@ -645,11 +669,15 @@ public final class DownloadEngine: @unchecked Sendable {
             throw HTTPError.rangeUnsupported
         }
 
+        for segment in parsed.segments where segment.byteRange.start >= bodyRange.start && segment.byteRange.end <= bodyRange.end {
+            let local = ByteRange(start: segment.byteRange.start - bodyRange.start, end: segment.byteRange.end - bodyRange.start)
+            guard MP4Muxer.indexReferenceContainsMedia(in: bodyBytes, range: local) else { throw HTTPError.rangeUnsupported }
+        }
         var combined = Data(capacity: initBytes.count + bodyBytes.count)
         combined.append(initBytes)
         combined.append(bodyBytes)
         try combined.write(to: destination, options: .atomic)
-        return .downloaded(start: firstSeg.startTimeSec)
+        return .downloaded(base: SectionTimeBase(ticks: firstSeg.startTicks, timescale: firstSeg.timescale))
     }
 
     private func chooseSubtitles(available: [SubtitleTrack], langSpec: String) -> [SubtitleTrack] {

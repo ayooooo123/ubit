@@ -301,6 +301,10 @@ public struct YouTubeExtractor: SiteExtractor {
 
     private func extractVideo(videoID: String, client: HTTPClient) async throws -> MediaInfo {
         try Task.checkCancellation()
+        if client.defaultHeaders.keys.contains(where: { $0.caseInsensitiveCompare("Cookie") == .orderedSame }),
+           Self.signInCookie(in: client.cookies) != nil {
+            throw ExtractorError.unsupported("Cannot combine an explicit Cookie header with stored YouTube sign-in cookies.")
+        }
         let cacheKey = YTGuard.CacheKey(videoID: videoID, context: Self.cacheContext(for: client))
         if let cached = await YTGuard.shared.cached(cacheKey) { return cached }
         let watchCtx = await fetchWatchContext(videoID: videoID, client: client)

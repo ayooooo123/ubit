@@ -177,6 +177,15 @@ final class FixtureProtocol: URLProtocol {
             // A VOD playlist of 15 segments, 4 s each.
             let segments = (0..<15).map { "#EXTINF:4.0,\nseg-\($0).ts" }.joined(separator: "\n")
             data = Data("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n\(segments)\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", let path) where path.hasPrefix("/partial/"):
+            status = 206
+            data = Data("bc".utf8)
+            switch path {
+            case "/partial/eof": headers["Content-Range"] = "bytes 1-2/3"
+            case "/partial/short": headers["Content-Range"] = "bytes 1-2/6"
+            case "/partial/shifted": headers["Content-Range"] = "bytes 2-3/4"
+            default: headers["Content-Range"] = "bytes 1-3/4"
+            }
         case ("media.invalid", let path) where path.hasPrefix("/seg-"):
             data = Data(path.utf8)
         case ("media.invalid", "/clip.m3u8"):
@@ -512,6 +521,12 @@ struct RegressionChecks {
             // extraction asks two client profiles. Only a usable SAPISID may be sent as SAPISIDHASH.
             let expired = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", expires: 1, name: "SAPISID", value: "fixture-only")]))
             let valid = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", name: "SAPISID", value: "fixture-only")]))
+            let override = HTTPClient(cookies: valid.cookies, extraHeaders: ["cOoKiE": "theme=light"])
+            let before = FixtureProtocol.requests().count
+            var conflict = false
+            do { _ = try await extract(client: override) } catch ExtractorError.unsupported { conflict = true }
+            check(conflict && FixtureProtocol.requests().count == before,
+                  "conflicting cookie sources are refused before the first request")
             _ = try await extract(client: expired)
             _ = try await extract(client: valid)
             let sent = FixtureProtocol.playerRequests().map(\.authorization)
@@ -671,6 +686,16 @@ struct RegressionChecks {
             check(text == "whole" && pastEnd && String(decoding: suffix, as: UTF8.self) == "whole.mp3"
                   && refused == 2 && FixtureProtocol.requests().count == before,
                   "valid ranges return the requested bytes through EOF; invalid bounds make no request")
+            let bounds = ByteRange(start: 1, end: 3)
+            let atEOF = try await client.fetchRangeBytes(url: "https://media.invalid/partial/eof", range: bounds)
+            check(atEOF == Data("bc".utf8), "a partial answer can end at the actual file end")
+            for route in ["short", "shifted", "truncated"] {
+                var rejected = false
+                do {
+                    _ = try await client.fetchRangeBytes(url: "https://media.invalid/partial/\(route)", range: bounds)
+                } catch HTTPError.rangeUnsupported { rejected = true }
+                check(rejected, "refuse an incomplete or misaligned partial answer: \(route)")
+            }
         case "hls-raw-section", "http-raw-section":
             // A raw MP3 stream (the shape that the SoundCloud extractor returns) with a 0:20-0:26
             // section is not trimmed. Over plain HTTP it is saved whole; over HLS, the segments that

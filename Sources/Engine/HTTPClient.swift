@@ -340,18 +340,32 @@ public final class HTTPClient: @unchecked Sendable {
 
     /// Returns the bytes `range.start...range.end` (fewer at the end of the file). A server that
     /// ignores `Range` answers 200 with the whole file; the requested bytes are then cut out of it,
-    /// so a caller never takes the start of the file for the requested bytes. A 206 answer whose
-    /// `Content-Range` starts at another offset is refused.
+    /// so a caller never takes the start of the file for the requested bytes. A partial answer
+    /// must contain the full requested interval, or prove that it ends at EOF.
     public func fetchRangeBytes(url: String, range: ByteRange, headers: [String: String]? = nil) async throws -> Data {
         guard range.start >= 0, range.end >= range.start else { throw HTTPError.rangeUnsupported }
         var hdrs = headers ?? [:]
         hdrs["Range"] = "bytes=\(range.start)-\(range.end)"
         let (data, http) = try await fetchData(url: url, headers: hdrs)
         if http.statusCode == 206 {
-            if let cr = http.value(forHTTPHeaderField: "Content-Range"),
-               let first = cr.split(separator: " ").last?.split(separator: "-").first,
-               let start = Int64(first), start != range.start {
+            guard let value = http.value(forHTTPHeaderField: "Content-Range"),
+                  let space = value.firstIndex(of: " "), value[..<space].lowercased() == "bytes" else {
                 throw HTTPError.rangeUnsupported
+            }
+            let interval = value[value.index(after: space)...]
+            guard let dash = interval.firstIndex(of: "-"), let slash = interval.firstIndex(of: "/"), dash < slash,
+                  let first = Int64(interval[..<dash]), first == range.start,
+                  let last = Int64(interval[interval.index(after: dash)..<slash]), last >= first,
+                  !data.isEmpty, last - first == Int64(data.count - 1) else {
+                throw HTTPError.rangeUnsupported
+            }
+            let length = interval[interval.index(after: slash)...]
+            if length == "*" {
+                guard last == range.end else { throw HTTPError.rangeUnsupported }
+            } else {
+                guard let size = Int64(length), size > last, last == min(range.end, size - 1) else {
+                    throw HTTPError.rangeUnsupported
+                }
             }
             return data
         }

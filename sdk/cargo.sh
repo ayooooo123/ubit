@@ -13,13 +13,24 @@ cd "$(dirname "$0")/.."
 # their paths unless -fdebug-prefix-map is also given.
 PHOME=$(cd "$HOME" && pwd -P)
 PPWD=$(pwd -P)
-RUSTFLAGS="${RUSTFLAGS:-}"
-MAP=""
+# Cargo accepts a unit separator between arguments. Preserve its normal precedence:
+# encoded flags, when set, take priority over whitespace-separated RUSTFLAGS.
+sep=$(printf '\037')
+if [ "${CARGO_ENCODED_RUSTFLAGS+x}" != x ]; then
+  CARGO_ENCODED_RUSTFLAGS=
+  set -f
+  for flag in ${RUSTFLAGS:-}; do
+    CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS:+$CARGO_ENCODED_RUSTFLAGS$sep}$flag"
+  done
+fi
+CC_SHELL_ESCAPED_FLAGS=1
 for pair in "$HOME=~" "$PHOME=~" "$PWD=." "$PPWD=."; do
-  RUSTFLAGS="$RUSTFLAGS --remap-path-prefix=$pair"
-  MAP="$MAP -ffile-prefix-map=$pair -fdebug-prefix-map=$pair"
+  CARGO_ENCODED_RUSTFLAGS="${CARGO_ENCODED_RUSTFLAGS:+$CARGO_ENCODED_RUSTFLAGS$sep}--remap-path-prefix=$pair"
+  # cc-rs reads shell-quoted arguments. Escape any quote in the literal path.
+  quoted=$(printf '%s' "$pair" | sed "s/'/'\\\\''/g")
+  flags="'-ffile-prefix-map=$quoted' '-fdebug-prefix-map=$quoted'"
+  CFLAGS="${CFLAGS:+$CFLAGS }$flags"
+  CXXFLAGS="${CXXFLAGS:+$CXXFLAGS }$flags"
 done
-CFLAGS="${CFLAGS:-}$MAP"
-CXXFLAGS="${CXXFLAGS:-}$MAP"
-export RUSTFLAGS CFLAGS CXXFLAGS
+export CARGO_ENCODED_RUSTFLAGS CC_SHELL_ESCAPED_FLAGS CFLAGS CXXFLAGS
 exec cargo "$@"

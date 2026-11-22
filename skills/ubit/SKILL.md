@@ -70,6 +70,8 @@ ubit info --json "ytsearch:blender open movie"
 
 ### 6. Handle Auth-Gated Links & Resume
 
+- Do not combine an explicit `Cookie` header with stored YouTube sign-in cookies. Video extraction rejects the conflict before it requests the watch page.
+
 - **Cookies**: `ubit` uses `~/Library/Application Support/uBit/cookies.txt` by default (shared with `ubit browse`), or pass `--cookies-from-browser safari`, `--cookies-from-browser firefox`, `--cookies /path/to/cookies.txt`, or `--no-cookies`. Chrome/Brave/Edge are refused with an explicit error (keychain + AES unwrap not implemented).
 - **YouTube Bot Wall**: an error that says YouTube "refused anonymous playback" means the bot wall. Do not retry in a loop. Each process grants permits for `/player` attempts at least 3 seconds apart. This interval applies to permits, not HTTP starts. A `--proxy` value must be an `http://`, `https://`, `socks5://`, `socks5h://` or `socks://` URL with a host (all socks schemes use SOCKS version 5); any other value exits with code `2`, and the error does not repeat the value.
 - **Sandbox Isolation**: Set `UBIT_CONFIG_DIR=/tmp/agent-ubit-$$` when running parallel workers.

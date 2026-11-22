@@ -663,7 +663,9 @@ public enum MP4Muxer {
         let base = baseStartTimeSec == 0 ? nil : Decimal(string: String(baseStartTimeSec))
         func relativeTime(_ value: Double) -> Double {
             guard let base, let absolute = Decimal(string: String(value)) else { return value - baseStartTimeSec }
-            return ((absolute - base) as NSDecimalNumber).doubleValue
+            // Swift rounds the decimal text to the nearest Double. Foundation's
+            // doubleValue can return the next representable value instead.
+            return Double((absolute - base).description) ?? (value - baseStartTimeSec)
         }
         let targetStart = max(0, relativeTime(section.start ?? 0))
         let targetEnd = section.end.map { max(targetStart, relativeTime($0)) }
@@ -675,10 +677,8 @@ public enum MP4Muxer {
             var lastSyncSec: Double = 0
             for s in vTrack.samples {
                 let sec = Double(accTicks) / Double(vTrack.timescale)
-                if s.isSync && sec <= targetStart + 0.001 {
-                    lastSyncSec = sec
-                }
                 if sec > targetStart { break }
+                if s.isSync { lastSyncSec = sec }
                 accTicks += UInt64(s.duration)
             }
             if Double(accTicks) / Double(vTrack.timescale) > targetStart { effectiveStart = lastSyncSec }

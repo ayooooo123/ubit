@@ -342,29 +342,27 @@ public enum HLSEngine {
         var selected = pl.segments
         var startTime: Double = 0
         if let sec = section {
-            let start = sec.start ?? 0
-            let end = sec.end ?? .infinity
-            // Accumulate EXTINF in its original decimal units. Convert each boundary
-            // only once, rather than adding already rounded binary durations.
+            let start = Decimal(string: String(sec.start ?? 0)) ?? .greatestFiniteMagnitude
+            let end = sec.end.flatMap { Decimal(string: String($0)) } ?? .greatestFiniteMagnitude
+            // Compare in playlist units. Convert only the base of the saved stream.
             var elapsed: Decimal = 0
-            var segEnd = 0.0
-            var previousStart = 0.0
+            var previousStart: Decimal = 0
             var filtered: [HLSVals.Segment] = []
             for (index, seg) in pl.segments.enumerated() {
-                let segStart = segEnd
+                let segStart = elapsed
                 elapsed += seg.playlistDuration
-                segEnd = (elapsed as NSDecimalNumber).doubleValue
                 defer { previousStart = segStart }
                 if segStart >= end { break }
-                guard max(start, segStart) < min(end, segEnd) else { continue }
+                guard max(start, segStart) < min(end, elapsed) else { continue }
                 if filtered.isEmpty {
-                    startTime = segStart
+                    var base = segStart
                     // Keep the previous segment for keyframe preroll at an exact boundary,
                     // but only after finding a segment with media inside the section.
                     if segStart == start, index > 0 {
                         filtered.append(pl.segments[index - 1])
-                        startTime = previousStart
+                        base = previousStart
                     }
+                    startTime = Double(base.description)!
                 }
                 filtered.append(seg)
             }

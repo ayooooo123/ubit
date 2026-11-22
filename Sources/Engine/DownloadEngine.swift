@@ -698,8 +698,10 @@ public final class DownloadEngine: @unchecked Sendable {
                 } else {
                     trailer = try await client.fetchRangeBytes(url: fmt.url, range: ByteRange(start: next, end: next + 7), headers: headers)
                 }
-                // FFmpeg can put a movie fragment random access box after the last media.
-                guard trailer.fourCC(4) == "mfra", Int64(trailer.beU32(0)) == remaining else { return fallback }
+                // A trailing random-access index or padding does not hold media samples.
+                let type = trailer.fourCC(4)
+                guard type == "mfra" || type == "free" || type == "skip",
+                      Int64(trailer.beU32(0)) == remaining else { return fallback }
             }
         }
         let overlaps: (SidxSegment) -> Bool = { $0.endTimeSec > reqStart && $0.startTimeSec < reqEnd }

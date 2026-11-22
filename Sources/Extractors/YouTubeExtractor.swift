@@ -254,13 +254,29 @@ public struct YouTubeExtractor: SiteExtractor {
         var playerResponse: [String: Any]?
     }
 
-    private func fetchWatchContext(videoID: String, client: HTTPClient) async -> WatchContext {
+    // A missing optional response is recoverable. A cancelled request is not.
+    private func optionalRequest<T>(_ operation: () async throws -> T?) async throws -> T? {
+        do {
+            let result = try await operation()
+            try Task.checkCancellation()
+            return result
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch let error as URLError where error.code == .cancelled {
+            throw error
+        } catch {
+            try Task.checkCancellation()
+            return nil
+        }
+    }
+
+    private func fetchWatchContext(videoID: String, client: HTTPClient) async throws -> WatchContext {
         var ctx = WatchContext()
         ctx.visitorData = await YTGuard.shared.visitor()
-        if let (html, _) = try? await client.fetchText(
+        if let (html, _) = try await optionalRequest({ try await client.fetchText(
             url: "https://www.youtube.com/watch?v=\(videoID)&bpctr=9999999999&has_verified=1",
             headers: ["Accept-Language": "en-US,en;q=0.9"]
-        ) {
+        ) }) {
             if ctx.visitorData == nil, let v = ExtractorUtils.firstMatch("\"VISITOR_DATA\"\\s*:\\s*\"([^\"]+)\"", in: html) {
                 ctx.visitorData = v
                 await YTGuard.shared.saveVisitor(v)
@@ -274,7 +290,7 @@ public struct YouTubeExtractor: SiteExtractor {
             }
         }
         if ctx.visitorData == nil,
-           let (sw, _) = try? await client.fetchText(url: "https://www.youtube.com/sw.js_data", includeCookies: false),
+           let (sw, _) = try await optionalRequest({ try await client.fetchText(url: "https://www.youtube.com/sw.js_data", includeCookies: false) }),
            let v = ExtractorUtils.firstMatch("\"(Cgt[A-Za-z0-9_-]{10,})\"", in: sw) {
             ctx.visitorData = v
             await YTGuard.shared.saveVisitor(v)
@@ -283,20 +299,16 @@ public struct YouTubeExtractor: SiteExtractor {
     }
 
     /// Verifies that YouTube's GVS CDN actually serves bytes near the END of the stream (catching >1.5MB PO-token 403 traps).
-    private func verifyTailRangePlayable(url: String, contentLength: Int64?, userAgent: String, client: HTTPClient) async -> Bool {
+    private func verifyTailRangePlayable(url: String, contentLength: Int64?, userAgent: String, client: HTTPClient) async throws -> Bool {
         let clen = contentLength ?? 0
         let probeStart = clen > 131_072 ? (clen - 4096) : 0
         let probeEnd = clen > 131_072 ? (clen - 1) : 2047
-        do {
-            let chunk = try await client.fetchRangeBytes(
+        let chunk = try await optionalRequest { try await client.fetchRangeBytes(
                 url: url,
                 range: ByteRange(start: probeStart, end: probeEnd),
                 headers: ["User-Agent": userAgent]
-            )
-            return !chunk.isEmpty
-        } catch {
-            return false
-        }
+        ) }
+        return chunk?.isEmpty == false
     }
 
     private func extractVideo(videoID: String, client: HTTPClient) async throws -> MediaInfo {
@@ -307,7 +319,7 @@ public struct YouTubeExtractor: SiteExtractor {
         }
         let cacheKey = YTGuard.CacheKey(videoID: videoID, context: Self.cacheContext(for: client))
         if let cached = await YTGuard.shared.cached(cacheKey) { return cached }
-        let watchCtx = await fetchWatchContext(videoID: videoID, client: client)
+        let watchCtx = try await fetchWatchContext(videoID: videoID, client: client)
 
         // After a bot-wall answer, only a profile that sends the user's YouTube sign-in cookies can
         // still succeed. Without such cookies the wall ends extraction before any more /player
@@ -326,7 +338,7 @@ public struct YouTubeExtractor: SiteExtractor {
            let skipMsStr = ExtractorUtils.firstMatch("\"skipOffsetMilliseconds\"\\s*:\\s*\"?(\\d+)\"?", in: adStr),
            let skipMs = Int(skipMsStr), skipMs > 0 {
             let waitMs = min(4000, skipMs)
-            try? await Task.sleep(nanoseconds: UInt64(waitMs) * 1_000_000)
+            try await Task.sleep(nanoseconds: UInt64(waitMs) * 1_000_000)
         }
 
         let candidateProfiles: [YTClientProfile] = [
@@ -346,20 +358,13 @@ public struct YouTubeExtractor: SiteExtractor {
 
         for profile in candidateProfiles {
             if botWalled && !profile.supportsCookies { continue }
-            let resp: [String: Any]
-            do {
-                resp = try await callPlayer(
+            guard let resp = try await optionalRequest({ try await callPlayer(
                     videoID: videoID,
                     profile: profile,
                     visitorData: watchCtx.visitorData,
                     sts: profile.requiresJS ? watchCtx.sts : nil,
                     client: client
-                )
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                continue
-            }
+            ) }) else { continue }
 
             let pStatus = (resp["playabilityStatus"] as? [String: Any])?["status"] as? String ?? ""
             if pStatus != "OK" && resp["streamingData"] == nil {
@@ -384,7 +389,7 @@ public struct YouTubeExtractor: SiteExtractor {
 
             if needsJS && !loadedSolver {
                 loadedSolver = true
-                cachedSolver = try? await loadPlayerCipherSolver(videoID: videoID, knownJSURL: watchCtx.jsURL, client: client)
+                cachedSolver = try await optionalRequest { try await loadPlayerCipherSolver(videoID: videoID, knownJSURL: watchCtx.jsURL, client: client) }
             }
 
             var parsed: [MediaFormat] = []
@@ -444,7 +449,7 @@ public struct YouTubeExtractor: SiteExtractor {
 
             // Pre-flight tail-range probe to reject partial-preview GVS PO-token 403 streams BEFORE downloading!
             if let probeTarget = parsed.first(where: { ($0.filesize ?? 0) > 2_000_000 }) ?? parsed.first {
-                let playable = await verifyTailRangePlayable(
+                let playable = try await verifyTailRangePlayable(
                     url: probeTarget.url,
                     contentLength: probeTarget.filesize,
                     userAgent: profile.userAgent,
@@ -483,7 +488,7 @@ public struct YouTubeExtractor: SiteExtractor {
         // Append HLS m3u8 variants (live streams, or resilient fallback if all HTTPS streams were gated)
         if let hlsManifest = chosenHLSManifest ?? ((watchCtx.playerResponse?["streamingData"] as? [String: Any])?["hlsManifestUrl"] as? String) {
             if isLive || formats.isEmpty {
-                if let hlsFmts = try? await HLSEngine.extractFormats(client: client, playlistURL: hlsManifest, headers: ["User-Agent": chosenHLSUA], idPrefix: "hls") {
+                if let hlsFmts = try await optionalRequest({ try await HLSEngine.extractFormats(client: client, playlistURL: hlsManifest, headers: ["User-Agent": chosenHLSUA], idPrefix: "hls") }) {
                     for var hf in hlsFmts {
                         hf.isLive = isLive
                         formats.append(hf)
@@ -537,6 +542,7 @@ public struct YouTubeExtractor: SiteExtractor {
             subtitles: subtitles,
             chapters: chapters
         )
+        try Task.checkCancellation()
         await YTGuard.shared.store(cacheKey, info)
         return info
     }

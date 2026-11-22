@@ -103,6 +103,7 @@ final class FixtureProtocol: URLProtocol {
             data = ["hls-fallback-nowatch", "hls-fallback-lateprofile"].contains(mode)
                 ? Data("<script>var ytcfg = {\"VISITOR_DATA\":\"\(visitor)\"};</script>".utf8)
                 : Data("<script>var ytcfg = {\"VISITOR_DATA\":\"\(visitor)\"};</script><script>var ytInitialPlayerResponse = \(json);</script>".utf8)
+            if mode == "cancel-watch" { failure = URLError(.cancelled) }
         case (_, let path) where path.hasSuffix("/player"):
             if mode == "auth-header" && playerNumber % 2 == 1 {
                 // Not the bot wall, so extraction goes on to the next client profile.
@@ -140,7 +141,9 @@ final class FixtureProtocol: URLProtocol {
                     "streamingData": streaming,
                 ])
             }
+            if mode == "cancel-player" { failure = URLError(.cancelled) }
         case ("media.invalid", "/media"):
+            if mode == "cancel-probe" { failure = URLError(.cancelled); break }
             // The first URL breaks only in the download phase; extraction's tail probe still works.
             // ump-cold refuses every ranged GET from the start.
             let broken = (phase && mediaNumber == 1) || mode == "ump-cold"
@@ -194,8 +197,9 @@ final class FixtureProtocol: URLProtocol {
             // An HLS playlist of 15 fragmented MP4 segments, 4 s each, with four 1 s samples in each
             // segment. The boxes are the smallest tree that uBit's reader accepts, not a file that
             // a standard player can read (the stsd box is empty, and mvhd, tkhd, mfhd and tfdt are missing).
-            let duration = mode == "hls-decimal" ? "0.800000" : "4.0"
-            let segments = (0..<15).map { "#EXTINF:\(duration),\nclip-\($0).m4s" }.joined(separator: "\n")
+            let duration = mode == "hls-ntsc" ? "1.001" : (mode == "hls-decimal" ? "0.800000" : "4.0")
+            let count = mode == "hls-ntsc" ? 7 : 15
+            let segments = (0..<count).map { "#EXTINF:\(duration),\nclip-\($0).m4s" }.joined(separator: "\n")
             data = Data("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"clip-init.mp4\"\n\(segments)\n#EXT-X-ENDLIST\n".utf8)
         case ("media.invalid", "/clip-init.mp4"):
             data = Data(Bytes.clipInit(sampleTicks: mode == "hls-decimal" ? 200 : 1000))
@@ -203,6 +207,7 @@ final class FixtureProtocol: URLProtocol {
             data = Data(Bytes.clipSegment(Int(path.dropFirst(6).dropLast(4)) ?? 0))
         case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4", "/cut-unknown.mp4"].contains(path):
             var bytes = mode == "sidx-fragments" ? Bytes.fragmentIndexedClip : Bytes.indexedClip
+            if mode == "sidx-padding" { bytes += Bytes.box("free", Array(repeating: 0, count: 24)) }
             if path.hasPrefix("/cut-") { bytes.removeLast(13 * Bytes.clipSegment(0).count) }
             if path != "/cut-200.mp4", let range, let dash = range.firstIndex(of: "-"),
                let start = Int(range.dropFirst(6).prefix(while: { $0 != "-" })),
@@ -431,6 +436,15 @@ struct RegressionChecks {
 
     static func run(_ mode: String) async throws {
         switch mode {
+        case "cancel-watch", "cancel-player", "cancel-probe":
+            do {
+                _ = try await extract()
+                check(false, "extraction returned metadata after cancellation")
+            } catch let error as URLError where error.code == .cancelled {}
+            let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
+            let steps = ["/watch", "/youtubei/v1/player", "/media"]
+            let limit = mode == "cancel-watch" ? 1 : (mode == "cancel-player" ? 2 : 3)
+            check(paths == Array(steps.prefix(limit)), "the cancelled request was the last request: \(paths)")
         // Bot-gate fail-fast and visitor persistence (controls for the carried feature).
         case "watch-gate":
             let gated = await isBotGate("Fixture0001")
@@ -767,7 +781,32 @@ struct RegressionChecks {
                 : !formats.isEmpty && formats.allSatisfy { $0.hasSuffix(":hls") } && failure.isEmpty
             check(ok && umpPosts().isEmpty,
                   "after every range test fails, the HLS playlist is used when there is player data and a playlist; formats=\(formats), failure=\(failure), umpPosts=\(umpPosts().count)")
-        case "hls-decimal", "sidx-boundaries", "sidx-fragments":
+        case "hls-ntsc":
+            let url = "https://media.invalid/clip.m3u8"
+            let dest = AppPaths.appSupportDir.appendingPathComponent("unexpected.mp4")
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: url, destination: dest,
+                                                       section: SectionRange(start: 7.007, end: 8))
+                check(false, "a section starting at decimal EOF produced a stream")
+            } catch where error.localizedDescription.contains("outside the stream") {}
+            let parts = FixtureProtocol.requests().filter { $0.url.path.hasPrefix("/clip-") }
+            check(parts.isEmpty && !FileManager.default.fileExists(atPath: dest.path), "decimal EOF needs neither init nor media")
+        case "trim-boundaries", "trim-keyframe":
+            func samples(scale: UInt32, ticks: UInt32, count: Int, group: Int, base: Double, start: Double, end: Double) -> [UInt64] {
+                let track = MP4Track(trackID: 1, kind: .video, timescale: scale, stsdPayload: Data(),
+                                     samples: (0..<count).map { MP4Sample(offset: UInt64($0), size: 1, duration: ticks, isSync: $0 % group == 0) })
+                return MP4Muxer.trimTracks([track], section: SectionRange(start: start, end: end), baseStartTimeSec: base).first?.samples.map(\.offset) ?? []
+            }
+            if mode == "trim-keyframe" {
+                let got = samples(scale: 1, ticks: 1, count: 12, group: 4, base: 0, start: 7.9995, end: 7.9999)
+                check(got == [4, 5, 6, 7], "a section before a sync frame uses the preceding keyframe: \(got)")
+                return
+            }
+            for (end, frames) in [(1.701699, 21), (1.7017, 21), (1.701701, 22)] {
+                let got = samples(scale: 30000, ticks: 1001, count: 30, group: 30, base: 1.001, start: 1.2, end: end)
+                check(got == Array(0..<UInt64(frames)), "exclusive end \(end): \(got)")
+            }
+        case "hls-decimal", "sidx-boundaries", "sidx-fragments", "sidx-padding":
             let hls = mode == "hls-decimal"
             let path = hls ? "/clip.m3u8" : "/indexed.mp4"
             let url = "https://media.invalid" + path
@@ -787,8 +826,12 @@ struct RegressionChecks {
             } catch where error.localizedDescription.contains("outside the stream") {}
             let media = FixtureProtocol.requests().filter { $0.url.path == path || $0.url.path.hasPrefix("/clip-") }
             let files = (try? FileManager.default.contentsOfDirectory(atPath: out.path)) ?? []
-            let onlyMetadata = hls ? !media.isEmpty && media.allSatisfy { $0.url.path == path }
+            var onlyMetadata = hls ? !media.isEmpty && media.allSatisfy { $0.url.path == path }
                                    : media.count == 1 && media[0].range == "bytes=0-65535"
+            if mode == "sidx-padding" {
+                let next = Bytes.indexedClip.count
+                onlyMetadata = media.map(\.range) == ["bytes=0-65535", "bytes=\(next)-\(next + 7)"]
+            }
             check(files.isEmpty && (mode == "sidx-fragments" || onlyMetadata),
                   "at EOF no file is saved; a complete index needs no media request; paths=\(media.map(\.url.path)), files=\(files)")
 
@@ -816,7 +859,8 @@ struct RegressionChecks {
             options.cookieSource = "none"
             let out = AppPaths.appSupportDir.appendingPathComponent("out")
             options.outputDir = out.path
-            for (status, end) in [("200", 10.0), ("206", 10.0), ("unknown", 61.0)] {
+            let scenarios: [(String, Double?)] = [("200", 10), ("206", 10), ("206", 61), ("unknown", 61), ("unknown", nil)]
+            for (status, end) in scenarios {
                 options.section = SectionRange(start: start, end: end)
                 do {
                     _ = try await DownloadEngine().downloadSingle(url: "https://media.invalid/cut-\(status).mp4", settings: settings, options: options)

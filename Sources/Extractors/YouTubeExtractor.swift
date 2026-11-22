@@ -273,15 +273,17 @@ public struct YouTubeExtractor: SiteExtractor {
 
     /// Words that can follow the object of an instruction and start a new part of the sentence:
     /// prepositions, conjunctions and adverbs ("verify your age on this device", "confirm your
-    /// identity using your phone", "confirm your identity online"). Words that end in "ly" are
-    /// adverbs too. A noun after the object instead makes it part of a longer name ("your
-    /// identity provider settings").
+    /// identity using your phone", "confirm your identity online", "confirm your identity right
+    /// now", "verify your age upon signing in"). Words that end in "ly" are adverbs too. A noun
+    /// after the object instead makes it part of a longer name ("your identity provider
+    /// settings").
     private static let functionWords: Set<String> = [
-        "about", "above", "after", "again", "ahead", "also", "and", "as", "at", "because", "before",
-        "below", "but", "by", "first", "for", "from", "here", "if", "in", "inside", "instead", "into",
-        "later", "now", "offline", "on", "once", "online", "or", "please", "since", "so", "soon",
-        "then", "through", "to", "today", "unless", "until", "using", "via", "when", "while",
-        "with", "within", "without",
+        "about", "above", "across", "after", "again", "against", "ahead", "along", "also", "and",
+        "around", "as", "at", "because", "before", "below", "beyond", "but", "by", "during", "first",
+        "for", "from", "here", "if", "in", "inside", "instead", "into", "later", "now", "offline",
+        "on", "once", "online", "or", "per", "please", "prior", "right", "since", "so", "soon",
+        "then", "there", "through", "to", "today", "toward", "towards", "under", "unless", "until",
+        "upon", "using", "via", "when", "whenever", "where", "while", "with", "within", "without",
     ]
 
     /// Characters that join two words into one compound word.
@@ -289,11 +291,11 @@ public struct YouTubeExtractor: SiteExtractor {
 
     /// True for "verify" or "confirm", an optional "that", and an object that ends there:
     /// after it comes the end of the text, a character that is not a letter (punctuation, a
-    /// digit or a symbol, also after a space), or a word from `functionWords` or a word that
-    /// ends in "ly". A hyphen or apostrophe followed by a letter continues the word. So "verify
-    /// your agent settings", "confirm your identity provider settings", "confirm your
-    /// identity-provider settings" and "verify the cable is not a bottleneck" are not
-    /// instructions.
+    /// digit such as a footnote mark, or a symbol, also after a space), or a word from
+    /// `functionWords` or a word that ends in "ly". A hyphen or apostrophe followed by a letter
+    /// continues the word. So "verify your agent settings", "confirm your identity provider
+    /// settings", "confirm your identity-provider settings" and "verify the cable is not a
+    /// bottleneck" are not instructions.
     private static func isInstruction(_ text: String) -> Bool {
         var rest = Substring(text)
         if rest.hasPrefix("please ") { rest = rest.dropFirst(7) }
@@ -311,7 +313,7 @@ public struct YouTubeExtractor: SiteExtractor {
                 return functionWords.contains(word) || (word.count > 3 && word.hasSuffix("ly"))
             }
             if joiners.contains(next), after.dropFirst().first?.isLetter == true { return false }
-            return !next.isLetter && !next.isNumber
+            return !next.isLetter
         }
     }
 

@@ -219,6 +219,41 @@ final class FixtureProtocol: URLProtocol {
             case "object=ab%2FCD": data = Data("BBBB".utf8)
             default: status = 404
             }
+        case ("media.invalid", "/dots.m3u8"):
+            data = Data("#EXTM3U\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@0\nhttps://media.invalid/a/../dots.ts\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@0\ndots.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/live-dots.m3u8"):
+            let seq = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            let segment = seq == 0 ? "#EXT-X-BYTERANGE:2@0\nhttps://media.invalid/a/../dots.ts" : "#EXT-X-BYTERANGE:2@0\ndots.ts\n#EXT-X-ENDLIST"
+            data = Data("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:\(seq)\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n\(segment)\n".utf8)
+        case ("media.invalid", "/v6.m3u8"):
+            // hls-v6-scope reads one loopback address with and without a zone, whole. hls-v6-forms
+            // reads byte ranges from two spellings of one address that send different Host fields.
+            let (first, second, range) = mode == "hls-v6-scope" ? ("[::1]", "[::1%25lo0]", "") : ("[::1]", "[0:0:0:0:0:0:0:1]", "#EXT-X-BYTERANGE:2@0\n")
+            data = Data("#EXTM3U\n#EXTINF:2,\n\(range)https://\(first)/v6.ts\n#EXTINF:2,\n\(range)https://\(second)/v6.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/live-v6.m3u8"):
+            let seq = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            let segment = seq == 0 ? "https://[::1]/v6.ts" : "https://[::1%25lo0]/v6.ts\n#EXT-X-ENDLIST"
+            data = Data("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:\(seq)\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n\(segment)\n".utf8)
+        case ("media.invalid", "/dots.ts"), ("media.invalid", "/a/../dots.ts"), (_, "/v6.ts"):
+            // URLSession sends an absolute path with dot segments as written, so this origin
+            // routes the two targets separately. Neither object changes; only hls-live-dot-tagged
+            // sends an ETag. Under a scoped and an unscoped address, /v6.ts is one object that
+            // changes after its first read; under two Host forms, it is two fixed objects.
+            let object: Data
+            if url.path == "/v6.ts" {
+                let reads = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+                object = Data((mode == "hls-v6-forms" ? url.host == "::1" : reads == 0) ? "AAAA".utf8 : "BBBB".utf8)
+            } else {
+                object = Data((url.path == "/dots.ts" && ["hls-dot-routes", "hls-live-dot-routes"].contains(mode) ? "BBBB" : "AAAA").utf8)
+            }
+            if mode == "hls-live-dot-tagged" { headers["ETag"] = "\"A\"" }
+            if let range {
+                let bounds = range.dropFirst(6).split(separator: "-").compactMap { Int($0) }
+                guard bounds.count == 2 else { status = 400; break }
+                status = 206
+                headers["Content-Range"] = "bytes \(bounds[0])-\(bounds[1])/4"
+                data = object.subdata(in: bounds[0]..<(bounds[1]+1))
+            } else { data = object }
         case ("media.invalid", "/lost-after-headers"):
             // A 403 response, and then the connection is lost before any body byte.
             status = 403
@@ -279,7 +314,8 @@ final class FixtureProtocol: URLProtocol {
                     player = nil
                 case "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age", "watch-blocked-notice", "watch-header-age",
                      "watch-verify-human", "watch-open-details", "watch-details-summary", "watch-confirm-identity",
-                     "watch-identity-phone", "watch-age-device", "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online":
+                     "watch-identity-phone", "watch-age-device", "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online",
+                     "watch-identity-right-now", "watch-age-upon", "watch-age-footnote":
                     player = Self.playerPayload(status: "OK", streaming: Self.directStreaming(1, hls: true), title: title)
                 case "hls-fallback-watchlist":
                     player = Self.hlsOnlyPlayer(title: title)
@@ -304,7 +340,8 @@ final class FixtureProtocol: URLProtocol {
                 case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age",
                      "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
                      "watch-details-summary", "watch-confirm-identity", "watch-identity-phone", "watch-age-device",
-                     "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online":
+                     "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online", "watch-identity-right-now",
+                     "watch-age-upon", "watch-age-footnote":
                     data = Self.wallPage(player: player, mode: mode)
                 case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson",
                      "watch-agent-settings", "watch-ordinary-objects":
@@ -579,6 +616,9 @@ final class FixtureProtocol: URLProtocol {
         case "watch-age-parenthesis": html += "<main role=\"alert\"><p>Verify your age (18 or older) to continue watching.</p></main>"
         case "watch-identity-dash": html += "<main role=\"alert\"><p>Confirm your identity — this is required to watch the video.</p></main>"
         case "watch-identity-online": html += "<main role=\"alert\"><p>Please confirm your identity online to continue watching.</p></main>"
+        case "watch-identity-right-now": html += "<main role=\"alert\"><p>Confirm your identity right now to continue watching.</p></main>"
+        case "watch-age-upon": html += "<main role=\"alert\"><p>Please verify your age upon signing in to watch this video.</p></main>"
+        case "watch-age-footnote": html += "<main role=\"alert\"><p>Verify your age<sup>1</sup> to continue watching.</p></main>"
         default: html += "<main>Verify your identity before playback can continue. Playback is blocked.</main>"
         }
         if let player {
@@ -967,7 +1007,8 @@ struct RegressionChecks {
         case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age",
              "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
              "watch-details-summary", "watch-confirm-identity", "watch-identity-phone", "watch-age-device",
-             "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online":
+             "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online", "watch-identity-right-now",
+             "watch-age-upon", "watch-age-footnote":
             let before = FixtureProtocol.requests().count
             let error = await extractError()
             let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
@@ -1901,6 +1942,33 @@ struct RegressionChecks {
             let queries = FixtureProtocol.requests().filter { $0.url.path == "/route.ts" }.map { URLComponents(url: $0.url, resolvingAgainstBaseURL: false)?.percentEncodedQuery ?? "" }
             check(saved == Data("AAAABBBB".utf8) && queries == ["object=ab%2fCD", "object=ab%2FCD"],
                   "each playlist URI is requested as written; saved=\(saved.map { String(decoding: $0, as: UTF8.self) } ?? "none"), queries=\(queries)")
+        // Two spellings that the edition key joins can still be separate routes. Each spelling is
+        // requested, and spellings that give different bytes stop the download.
+        case "hls-dot-routes", "hls-dot-same", "hls-live-dot-routes", "hls-live-dot-tagged":
+            let file = AppPaths.appSupportDir.appendingPathComponent("dots.ts")
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            var rejected = false
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/\(mode.hasPrefix("hls-live-") ? "live-dots" : "dots").m3u8", destination: file, connections: 1)
+            } catch HTTPError.rangeUnsupported { rejected = true }
+            let saved = try? Data(contentsOf: file)
+            let targets = Set(FixtureProtocol.requests().map(\.url.path).filter { $0.hasSuffix("dots.ts") })
+            let outcome = ["hls-dot-same", "hls-live-dot-tagged"].contains(mode) ? !rejected && saved == Data("AAAA".utf8) : rejected && saved == nil
+            check(outcome && targets == ["/a/../dots.ts", "/dots.ts"],
+                  "a pinned copy serves only the spelling that it read; saved=\(saved.map { String(decoding: $0, as: UTF8.self) } ?? "none"), rejected=\(rejected), targets=\(targets.sorted())")
+        // A scoped and an unscoped loopback address send the same request, so they are one
+        // resource. Two Host forms of one address can be separate routes, so each is requested.
+        case "hls-v6-scope", "hls-live-v6-scope", "hls-v6-forms":
+            let file = AppPaths.appSupportDir.appendingPathComponent("v6.ts")
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            var rejected = false
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/\(mode == "hls-live-v6-scope" ? "live-v6" : "v6").m3u8", destination: file, connections: 1)
+            } catch HTTPError.rangeUnsupported { rejected = true }
+            let saved = try? Data(contentsOf: file)
+            let hosts = Set(FixtureProtocol.requests().filter { $0.url.path == "/v6.ts" }.compactMap(\.url.host))
+            check(rejected && saved == nil && hosts.count == 2,
+                  "two spellings of one IPv6 address give one edition or no file; saved=\(saved.map { String(decoding: $0, as: UTF8.self) } ?? "none"), rejected=\(rejected), hosts=\(hosts.sorted())")
         case "hls-short-range":
             let folder = AppPaths.appSupportDir.appendingPathComponent("out")
             var options = DownloadRequestOptions()

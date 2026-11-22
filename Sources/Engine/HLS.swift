@@ -60,14 +60,15 @@ public enum HLSEngine {
         return URL(string: rel, relativeTo: base)?.absoluteURL.absoluteString ?? rel
     }
 
-    /// The resource that a request for `url` reads, for edition checks only: requests use the
-    /// URL as the playlist wrote it, because an origin can route two spellings differently.
-    /// The key keeps the path and the query as URLSession sends them, with their
-    /// percent-encoding unchanged. It drops what does not reach the origin or cannot name
-    /// another resource: the fragment, user information (URLSession sends no credentials before
-    /// a challenge), the case of the scheme and the host, the spelling of an IPv6 address and of
-    /// the port, and dot segments. An IPv6 zone stays as written. Two URLs with one key must give
-    /// one edition, so a key that joins two resources can only stop a download.
+    /// The group of spellings that can name one resource, for edition checks only. Requests use
+    /// the URL as the playlist wrote it, because an origin can route two spellings differently,
+    /// and a pinned source serves only the URL that opened it. Every spelling in a group is
+    /// requested itself, and all of them must give one edition, so a group that joins two
+    /// resources can only stop a download. The key keeps the path and the query as URLSession
+    /// sends them, with their percent-encoding unchanged. It drops the fragment, user
+    /// information (URLSession sends no credentials before a challenge), the case of the scheme
+    /// and the host, the spelling of an IPv6 address and of the port, an IPv6 zone (a scoped and
+    /// an unscoped loopback address send the same request), and dot segments.
     static func resourceKey(_ url: String) -> String {
         guard let parts = URLComponents(string: url), let scheme = parts.scheme?.lowercased(),
               let host = parts.percentEncodedHost, !host.isEmpty else { return url }
@@ -78,16 +79,16 @@ public enum HLSEngine {
         return "\(scheme)://\(canonicalHost(host)):\(port)\(path)\(query)"
     }
 
-    /// A lowercase host name, or an IPv6 literal in its shortest form with its zone unchanged.
+    /// A lowercase host name, or an IPv6 literal in its shortest form without its zone.
     private static func canonicalHost(_ host: String) -> String {
         guard host.hasPrefix("["), host.hasSuffix("]") else { return host.lowercased() }
         let inner = host.dropFirst().dropLast()
-        let zoneStart = inner.range(of: "%25")?.lowerBound ?? inner.endIndex
-        var address = in6_addr()
+        let address = inner[..<(inner.range(of: "%25")?.lowerBound ?? inner.endIndex)]
+        var bytes = in6_addr()
         var text = [CChar](repeating: 0, count: Int(INET6_ADDRSTRLEN))
-        guard inet_pton(AF_INET6, String(inner[..<zoneStart]), &address) == 1,
-              inet_ntop(AF_INET6, &address, &text, socklen_t(text.count)) != nil else { return host.lowercased() }
-        return "[" + String(cString: text) + inner[zoneStart...] + "]"
+        guard inet_pton(AF_INET6, String(address), &bytes) == 1,
+              inet_ntop(AF_INET6, &bytes, &text, socklen_t(text.count)) != nil else { return host.lowercased() }
+        return "[" + String(cString: text) + "]"
     }
 
     /// RFC 3986, 5.2.4, for an absolute path.
@@ -490,11 +491,14 @@ public enum HLSEngine {
         // with a byte range is pinned (a strong ETag or a complete copy). A resource that is only
         // read whole keeps the digest of its first read, and every later read must give the same
         // bytes. `resourceKey` groups the spellings of one resource; requests use each spelling.
+        // A pinned source serves only the URL that opened it, because an origin can route two
+        // spellings that `resourceKey` joins to different objects.
         var seen = Set<String>(), repeated = Set<String>(), ranged = Set<String>()
-        var firstURL: [String: String] = [:]
+        var spellings: [String: [String]] = [:]
         func note(_ url: String, ranged isRanged: Bool) {
             let key = resourceKey(url)
-            if seen.insert(key).inserted { firstURL[key] = url } else { repeated.insert(key) }
+            if !seen.insert(key).inserted { repeated.insert(key) }
+            if spellings[key]?.contains(url) != true { spellings[key, default: []].append(url) }
             if isRanged { ranged.insert(key) }
         }
         if let url = pl.initURL { note(url, ranged: pl.initByteRange != nil) }
@@ -502,19 +506,29 @@ public enum HLSEngine {
         var shared = repeated.intersection(ranged)
         let wholeReads = WholeReads(repeated.subtracting(shared))
         var sources: [String: RangeSource] = [:]
+        // One spelling keeps a strong ETag or a complete copy. Several spellings each give a
+        // complete copy, and all copies must be the same bytes.
+        func pin(_ key: String) async throws {
+            let urls = spellings[key] ?? []
+            if urls.count == 1 { sources[urls[0]] = try await RangeSource.open(urls[0], client: client, headers: headers); return }
+            var first: SHA256.Digest?
+            for url in urls {
+                let copy = try await RangeSource.snapshotOf(url, client: client, headers: headers)
+                let digest = SHA256.hash(data: copy)
+                if let first, digest != first { throw HTTPError.rangeUnsupported }
+                first = digest
+                sources[url] = .snapshot(copy)
+            }
+        }
         var initData: Data?
         if let initU = pl.initURL {
             let key = resourceKey(initU)
-            if shared.remove(key) != nil {
-                sources[key] = try await RangeSource.open(initU, client: client, headers: headers)
-            }
-            let data = try await fetchPart(initU, range: pl.initByteRange, client: client, headers: headers, source: sources[key])
+            if shared.remove(key) != nil { try await pin(key) }
+            let data = try await fetchPart(initU, range: pl.initByteRange, client: client, headers: headers, source: sources[initU])
             try await wholeReads.check(key, data)
             initData = data
         }
-        for (key, url) in firstURL where shared.contains(key) {
-            sources[key] = try await RangeSource.open(url, client: client, headers: headers)
-        }
+        for key in shared { try await pin(key) }
         let pinned = sources
 
         actor KeyStore {
@@ -567,7 +581,7 @@ public enum HLSEngine {
                         let seg = selected[pos]
                         let segFile = segWorkDir.appendingPathComponent(String(format: "%06d.seg", pos))
                         let resource = resourceKey(seg.url)
-                        var raw = try await fetchPart(seg.url, range: seg.byteRange, client: client, headers: headers, source: pinned[resource])
+                        var raw = try await fetchPart(seg.url, range: seg.byteRange, client: client, headers: headers, source: pinned[seg.url])
                         try await wholeReads.check(resource, raw)
                         if let kurl = seg.keyURL {
                             try Task.checkCancellation()
@@ -639,7 +653,10 @@ public enum HLSEngine {
         // complete body. An EVENT playlist can list every past URI, so copies are kept only
         // for byte ranges and only up to `snapshotBudget` bytes in total. An evicted copy and a
         // whole read leave a digest, and a later range of that resource compares a new complete
-        // copy. The maps use `resourceKey`; requests use the URL that the playlist wrote.
+        // copy. The maps use `resourceKey`; requests use the URL that the playlist wrote. The
+        // first spelling of a resource owns its entry. An origin can route two spellings that
+        // `resourceKey` joins to different objects, so another spelling reads a complete copy,
+        // and that copy must match the edition of the first spelling.
         var liveSources: [String: RangeSource] = [:]
         var digests: [String: SHA256.Digest] = [:]
         var snapshotOrder: [String] = []
@@ -660,8 +677,30 @@ public enum HLSEngine {
             // Older copies go first. The newest copy stays until it has served its range.
             while snapshotBytes > snapshotBudget, snapshotOrder.count > 1 { evict(snapshotOrder[0]) }
         }
+        var firstSpelling: [String: String] = [:]
+        var taggedDigests: [String: SHA256.Digest] = [:]
+        func editionDigest(_ key: String, first: String) async throws -> SHA256.Digest {
+            if let digest = digests[key] ?? taggedDigests[key] { return digest }
+            switch liveSources[key] {
+            case .snapshot(let bytes)?: return SHA256.hash(data: bytes)
+            case .tagged?:
+                let whole = try await fetchPart(first, range: nil, client: client, headers: headers, source: liveSources[key])
+                let digest = SHA256.hash(data: whole)
+                taggedDigests[key] = digest
+                return digest
+            case nil: throw HTTPError.rangeUnsupported
+            }
+        }
         func livePart(_ url: String, range: ByteRange?) async throws -> Data {
             let key = resourceKey(url)
+            let first = firstSpelling[key] ?? url
+            firstSpelling[key] = first
+            if url != first {
+                let expected = try await editionDigest(key, first: first)
+                let fresh = try await RangeSource.snapshotOf(url, client: client, headers: headers)
+                guard SHA256.hash(data: fresh) == expected else { throw HTTPError.rangeUnsupported }
+                return try await fetchPart(url, range: range, client: client, headers: headers, source: .snapshot(fresh))
+            }
             if let digest = digests[key] {
                 // Compare one complete response rather than append bytes from a different edition.
                 let fresh = try await RangeSource.snapshotOf(url, client: client, headers: headers)

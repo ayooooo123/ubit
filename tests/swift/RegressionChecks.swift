@@ -116,18 +116,41 @@ final class FixtureProtocol: URLProtocol {
             status = 403
         case ("media.invalid", "/live-editions.m3u8"):
             let seq = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
-            let segment = mode == "hls-live-whole"
+            let segment = mode.hasPrefix("hls-live-whole")
                 ? (seq == 0 ? "pack.ts" : "#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST")
                 : (seq == 0 ? "#EXT-X-BYTERANGE:2@0\npack.ts" : (seq == 1 ? "other.ts" : "#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST"))
             data = Data("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:\(seq)\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n\(segment)\n".utf8)
         case ("media.invalid", "/other.ts"): data = Data("xx".utf8)
+        case ("media.invalid", "/event.m3u8"):
+            // An EVENT playlist keeps every past entry. The first poll lists three
+            // entries; the second lists all of them and ends the recording.
+            let poll = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            let ranged = mode == "hls-event-ranged"
+            let count = poll == 0 ? 3 : (ranged ? 70 : 64)
+            var text = "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n"
+            for i in 0..<count { text += "#EXTINF:1,\n" + (ranged ? "#EXT-X-BYTERANGE:1024@0\n" : "") + "ev-\(i).bin\n" }
+            if poll > 0 {
+                if ranged { text += "#EXTINF:1,\n#EXT-X-BYTERANGE:1024@1024\nev-0.bin\n" }
+                text += "#EXT-X-ENDLIST\n"
+            }
+            data = Data(text.utf8)
+        case ("media.invalid", let path) where path.hasPrefix("/ev-"):
+            // 1 MiB untagged objects; object N holds only the byte N.
+            let body = Data(repeating: UInt8(Int(path.dropFirst(4).dropLast(4)) ?? 255), count: 1 << 20)
+            if let range {
+                let bounds = range.dropFirst(6).split(separator: "-").compactMap { Int($0) }
+                guard bounds.count == 2 else { status = 400; break }
+                status = 206
+                headers["Content-Range"] = "bytes \(bounds[0])-\(bounds[1])/\(body.count)"
+                data = body.subdata(in: bounds[0]..<(bounds[1] + 1))
+            } else { data = body }
         case ("media.invalid", "/editions.m3u8"):
             data = Data("#EXTM3U\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@0\npack.ts\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST\n".utf8)
         case ("media.invalid", "/pack.ts"):
-            // hls-live-whole: every read after the first comes from a new edition.
+            // hls-live-whole-changed: every read after the first comes from a new edition.
             let changed = range == "bytes=2-3" || Self.lock.withLock {
                 (mode == "hls-live-changed" && Self.seen.contains { $0.url.path == url.path && $0.range == nil })
-                    || (mode == "hls-live-whole" && Self.seen.contains { $0.url.path == url.path })
+                    || (mode == "hls-live-whole-changed" && Self.seen.contains { $0.url.path == url.path })
             }
             let edition = Data((changed ? "BBBB" : "AAAA").utf8)
             if mode != "hls-untagged-edition" && !mode.hasPrefix("hls-live-") { headers["ETag"] = changed ? "\"B\"" : "\"A\"" }
@@ -565,6 +588,16 @@ struct RegressionChecks {
     static func check(_ ok: Bool, _ message: String) {
         print("\(ok ? "PASS" : "FAIL") \(FixtureProtocol.mode): \(message)")
         if !ok { exit(1) }
+    }
+
+    /// The highest physical memory footprint of this process so far.
+    static func peakFootprint() -> Int64 {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
+        }
+        return result == KERN_SUCCESS ? info.ledger_phys_footprint_peak : 0
     }
 
     static func extract(_ id: String = "Fixture0001", client: HTTPClient = HTTPClient()) async throws -> MediaInfo {
@@ -1302,7 +1335,7 @@ struct RegressionChecks {
             try await transfer("allowed")
             let bytes = try Data(contentsOf: file)
             check(String(decoding: bytes, as: UTF8.self) == "/allowed/piece-1.m4s/allowed/piece-2.m4s/allowed/piece-3.m4s", "a later operation assembles only its own three segments")
-        case "hls-live-stable", "hls-live-changed", "hls-live-whole":
+        case "hls-live-stable", "hls-live-changed", "hls-live-whole", "hls-live-whole-changed":
             let file = AppPaths.appSupportDir.appendingPathComponent("live.ts")
             // The CLI creates the output folder before a live recording starts.
             try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
@@ -1312,13 +1345,31 @@ struct RegressionChecks {
             } catch HTTPError.rangeUnsupported { rejected = true }
             let saved = try? Data(contentsOf: file)
             switch mode {
-            case "hls-live-changed":
-                check(rejected && saved == nil, "a returning untagged URI with new content stops the recording: saved=\(String(describing: saved))")
+            case "hls-live-changed", "hls-live-whole-changed":
+                check(rejected && saved == nil, "a returning or ranged URI with new content stops the recording: saved=\(String(describing: saved))")
             case "hls-live-whole":
-                // A whole read and a later range of the same URI must come from one edition.
+                // A whole read and a later range of the same unchanged URI form one edition.
                 check(saved == Data("AAAAAA".utf8), "a range after a whole read uses the same edition: \(String(decoding: saved ?? Data(), as: UTF8.self))")
             default:
                 check(saved == Data("AAxxAA".utf8), "a returning untagged URI contributes the original bytes: \(String(decoding: saved ?? Data(), as: UTF8.self))")
+            }
+        case "hls-event-whole", "hls-event-ranged":
+            let file = AppPaths.appSupportDir.appendingPathComponent("event.ts")
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            let before = Self.peakFootprint()
+            _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/event.m3u8", destination: file)
+            let growth = Self.peakFootprint() - before
+            let saved = try Data(contentsOf: file, options: .alwaysMapped)
+            if mode == "hls-event-whole" {
+                // 64 whole 1 MiB segments: the recorder must not keep the recording in memory.
+                let intact = saved.count == 64 << 20 && saved[saved.count - 1] == 63
+                check(intact && growth < 32 << 20, "an EVENT recording keeps no copy of whole segments: \(saved.count) bytes saved, peak grew \(growth >> 20) MiB")
+            } else {
+                // 70 ranged 1 MiB objects exceed the 64 MiB copy budget, so the first object
+                // lost its copy; its later range must come from a new complete read that matches.
+                let full = FixtureProtocol.requests().filter { $0.url.path == "/ev-0.bin" && $0.range == nil }.count
+                let expected = (0..<70).reduce(into: Data()) { $0.append(Data(repeating: UInt8($1), count: 1024)) } + Data(repeating: 0, count: 1024)
+                check(saved == expected && full == 2, "an evicted copy is replaced by a matching complete read: \(saved.count) bytes, \(full) complete reads of the first object")
             }
         case "hls-changed-edition", "hls-untagged-edition":
             let file = AppPaths.appSupportDir.appendingPathComponent("clip.ts")

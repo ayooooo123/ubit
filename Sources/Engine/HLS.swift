@@ -567,26 +567,45 @@ public enum HLSEngine {
         var recordedSec: Double = 0
         var keyCache: [String: Data] = [:]
 
+        // Every URI keeps its edition: a strong ETag, a complete copy, or a digest of the
+        // complete body. An EVENT playlist can list every past URI, so copies are kept only
+        // for byte ranges and only up to `snapshotBudget` bytes; an evicted copy and a whole
+        // read leave a digest, and a later range of that URI compares a new complete copy.
         var liveSources: [String: RangeSource] = [:]
-        var retired: [String: SHA256.Digest] = [:]
+        var digests: [String: SHA256.Digest] = [:]
+        var snapshotOrder: [String] = []
+        var snapshotBytes = 0
+        let snapshotBudget = 64 << 20
+        func evict(_ url: String) {
+            guard case .snapshot(let bytes)? = liveSources[url] else { return }
+            liveSources.removeValue(forKey: url)
+            digests[url] = SHA256.hash(data: bytes)
+            snapshotBytes -= bytes.count
+            snapshotOrder.removeAll { $0 == url }
+        }
+        func keep(_ url: String, _ source: RangeSource) {
+            liveSources[url] = source
+            guard case .snapshot(let bytes) = source else { return }
+            snapshotOrder.append(url)
+            snapshotBytes += bytes.count
+            // The newest copy stays even when it alone exceeds the budget: its ranges need it.
+            while snapshotBytes > snapshotBudget, snapshotOrder.count > 1 { evict(snapshotOrder[0]) }
+        }
         func livePart(_ url: String, range: ByteRange?) async throws -> Data {
-            if let digest = retired[url] {
-                // A previously untagged URI returned to the live window. Compare one
-                // complete response rather than append bytes from a different edition.
+            if let digest = digests[url] {
+                // Compare one complete response rather than append bytes from a different edition.
                 let fresh = try await RangeSource.snapshotOf(url, client: client, headers: headers)
                 guard SHA256.hash(data: fresh) == digest else { throw HTTPError.rangeUnsupported }
-                liveSources[url] = .snapshot(fresh)
-                retired.removeValue(forKey: url)
+                guard range != nil else { return fresh }
+                digests.removeValue(forKey: url)
+                keep(url, .snapshot(fresh))
             } else if liveSources[url] == nil {
                 guard range != nil else {
-                    // A later playlist can name a byte range of this URI, so keep the
-                    // edition of the whole read: its strong ETag, or else its bytes until
-                    // the playlist drops the URI.
                     let (data, response) = try await client.fetchData(url: url, headers: headers)
-                    liveSources[url] = HTTPClient.strongTag(response).map { .tagged($0) } ?? .snapshot(data)
+                    if let tag = HTTPClient.strongTag(response) { liveSources[url] = .tagged(tag) } else { digests[url] = SHA256.hash(data: data) }
                     return data
                 }
-                liveSources[url] = try await RangeSource.open(url, client: client, headers: headers)
+                keep(url, try await RangeSource.open(url, client: client, headers: headers))
             }
             return try await fetchPart(url, range: range, client: client, headers: headers, source: liveSources[url])
         }
@@ -597,15 +616,10 @@ public enum HLSEngine {
             if !firstIteration {
                 let (txt, u) = try await client.fetchText(url: playlistURL, headers: headers)
                 currentPL = parseMediaPlaylist(txt, baseURL: u)
-                if !liveSources.isEmpty {
+                if !snapshotOrder.isEmpty {
                     var active = Set(currentPL.segments.map(\.url))
                     if let url = currentPL.initURL { active.insert(url) }
-                    for (url, source) in liveSources where !active.contains(url) {
-                        if case .snapshot(let bytes) = source {
-                            retired[url] = SHA256.hash(data: bytes)
-                            liveSources.removeValue(forKey: url)
-                        }
-                    }
+                    for url in snapshotOrder where !active.contains(url) { evict(url) }
                 }
             }
             firstIteration = false

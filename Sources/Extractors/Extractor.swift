@@ -11,8 +11,8 @@ public enum ExtractorError: LocalizedError {
     case notFound(String)
     case drmProtected
     case loginRequired(String)
-    /// YouTube refused anonymous playback (its "confirm you're not a bot" wall). Not a sign-in
-    /// prompt and not fixable inside the app: the refusal is decided server-side per video.
+    case playbackDenied(String)
+    /// The provider requires verification. Local credentials do not complete that check.
     case botGate(String)
 
     public var errorDescription: String? {
@@ -21,12 +21,36 @@ public enum ExtractorError: LocalizedError {
         case .notFound(let m): return m
         case .drmProtected: return "This media is protected by DRM and can't be downloaded."
         case .loginRequired(let site): return "\(site) asked to sign in. Open uBit's Browser (⌘B) and sign in to \(site), or pass --cookies."
-        case .botGate(let site): return "\(site) refused anonymous playback for this video (\"confirm you're not a bot\"). The decision is made server-side per video; retry later, send the request out a different route (--proxy socks5://host:port), or pass --cookies."
+        case .playbackDenied(let reason): return reason
+        case .botGate(let site): return "\(site) requires verification. Extraction stopped."
         }
     }
 }
 
 public enum ExtractorUtils {
+    /// Optional metadata may be absent. A refusal or cancellation must reach the caller.
+    static func optionalRequest<T>(_ operation: () async throws -> T?) async throws -> T? {
+        do {
+            let result = try await operation()
+            try Task.checkCancellation()
+            return result
+        } catch {
+            try Task.checkCancellation()
+            guard !mustStop(error) else { throw error }
+            return nil
+        }
+    }
+
+    static func mustStop(_ error: Error) -> Bool {
+        switch error {
+        case is CancellationError, ExtractorError.botGate, ExtractorError.loginRequired,
+             ExtractorError.playbackDenied, ExtractorError.drmProtected: return true
+        case let transport as URLError: return !HTTPClient.canRetryTransport(transport)
+        case HTTPError.status(let code, _): return (400..<500).contains(code) && code != 404
+        default: return false
+        }
+    }
+
     public static func hostMatches(_ url: URL, domains: [String]) -> Bool {
         guard let h = url.host?.lowercased() else { return false }
         return domains.contains { h == $0 || h.hasSuffix("." + $0) }
@@ -265,8 +289,9 @@ public enum ExtractorRegistry {
             } catch let e as ExtractorError {
                 throw e
             } catch {
+                if ExtractorUtils.mustStop(error) { throw error }
                 // Fall back to generic HTML/manifest extractor if site-specific API changed
-                if let fallback = try? await GenericExtractor.extract(url: parsedURL, client: client),
+                if let fallback = try await ExtractorUtils.optionalRequest({ try await GenericExtractor.extract(url: parsedURL, client: client) }),
                    !fallback.formats.isEmpty {
                     return fallback
                 }
@@ -311,18 +336,18 @@ public enum GenericExtractor {
         var formats: [MediaFormat] = []
         var seenURLs = Set<String>()
 
-        func addCandidate(_ raw: String) async {
+        func addCandidate(_ raw: String) async throws {
             let clean = ExtractorUtils.unescapeJSString(raw).trimmingCharacters(in: .whitespacesAndNewlines)
             guard !clean.isEmpty, !clean.hasPrefix("blob:") else { return }
             guard let resolved = URL(string: clean, relativeTo: finalURL)?.absoluteURL.absoluteString else { return }
             guard seenURLs.insert(resolved).inserted else { return }
             let low = resolved.lowercased()
             if low.contains(".m3u8") {
-                if let hls = try? await HLSEngine.extractFormats(client: client, playlistURL: resolved, headers: headers, idPrefix: "hls-\(formats.count)") {
+                if let hls = try await ExtractorUtils.optionalRequest({ try await HLSEngine.extractFormats(client: client, playlistURL: resolved, headers: headers, idPrefix: "hls-\(formats.count)") }) {
                     formats.append(contentsOf: hls)
                 }
             } else if low.contains(".mpd") {
-                if let (dash, _, _) = try? await DASHEngine.extractFormats(client: client, mpdURL: resolved, headers: headers, idPrefix: "dash-\(formats.count)") {
+                if let (dash, _, _) = try await ExtractorUtils.optionalRequest({ try await DASHEngine.extractFormats(client: client, mpdURL: resolved, headers: headers, idPrefix: "dash-\(formats.count)") }) {
                     formats.append(contentsOf: dash)
                 }
             } else {
@@ -344,7 +369,7 @@ public enum GenericExtractor {
         for metaName in ["og:video:secure_url", "og:video:url", "og:video", "twitter:player:stream", "og:audio:secure_url", "og:audio"] {
             if let v = ExtractorUtils.metaContent(metaName, in: html),
                (v.contains(".mp4") || v.contains(".m3u8") || v.contains(".webm") || v.contains(".mp3") || v.contains(".m4a") || metaName.contains("stream")) {
-                await addCandidate(v)
+                try await addCandidate(v)
             }
         }
 
@@ -352,23 +377,23 @@ public enum GenericExtractor {
         for ldJSON in ExtractorUtils.allMatches("<script[^>]+type=[\"']application/ld\\+json[\"'][^>]*>([\\s\\S]*?)</script>", in: html, options: [.caseInsensitive]) {
             if let d = ldJSON.data(using: .utf8), let obj = try? JSONSerialization.jsonObject(with: d) {
                 for u in collectJSONLDMediaURLs(obj) {
-                    await addCandidate(u)
+                    try await addCandidate(u)
                 }
             }
         }
 
         // 3. HTML5 <video>, <audio>, <source src="...">
         for src in ExtractorUtils.allMatches("<(?:video|audio|source)[^>]+src=[\"']([^\"']+)[\"']", in: html, options: [.caseInsensitive]) {
-            await addCandidate(src)
+            try await addCandidate(src)
         }
 
         // 4. Inline HLS / MP4 URLs in page scripts
         for m3u8 in ExtractorUtils.allMatches("(https?:\\\\?/\\\\?/[^\"'\\s<>]+\\.m3u8(?:\\?[^\"'\\s<>]*)?)", in: html) {
-            await addCandidate(m3u8)
+            try await addCandidate(m3u8)
         }
         if formats.isEmpty {
             for mp4 in ExtractorUtils.allMatches("(https?:\\\\?/\\\\?/[^\"'\\s<>]+\\.(?:mp4|m4a|webm)(?:\\?[^\"'\\s<>]*)?)", in: html) {
-                await addCandidate(mp4)
+                try await addCandidate(mp4)
             }
         }
 

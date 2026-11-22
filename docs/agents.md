@@ -4,6 +4,10 @@
 
 A single 1.6 MB native macOS `arm64` binary (`ubit`) handles extraction across 35+ sites, multi-connection work-stealing HTTP `Range` downloads, HLS/DASH segment assembly, `sidx` byte-range clip trimming, ISO-BMFF MP4/M4A muxing, and `AudioToolbox`/`AVFoundation` WAV/FLAC/MOV conversion — with **no Python, no `yt-dlp`, and no `ffmpeg` required** for standard containers.
 
+## Platform scope
+
+The section and YouTube access rules below apply to the macOS Swift client. Linux, Android, WASM and the Rust SDK use a separate C++ engine. On Linux arm64, that engine returned success for a truncated indexed MP4 and saved the wrong interval from an HLS playlist. Check the decoded frames before relying on a clip from that engine.
+
 ---
 
 ## 1. Quick Discovery (`--llms`)
@@ -34,13 +38,13 @@ VIDEO_PATH="$(ubit get -q 720 --no-library --quiet -o /tmp/work 'https://www.you
 ```
 
 ### Pattern B: Fast Byte-Range Clip Extraction (`--section`) for Multimodal / VLM Inspection
-`ubit` trims tracks on the native MP4 path before any output conversion. Video starts on the preceding sync keyframe. An M4A input can therefore produce a trimmed WAV, while converting raw MP3 input to M4A does not trim it.
+On the native macOS Swift CLI, `ubit` trims tracks on the native MP4 path before any output conversion. Video starts on the preceding sync keyframe. An M4A input can therefore produce a trimmed WAV, while converting raw MP3 input to M4A does not trim it.
 
-For indexed MP4/M4A input, `ubit` requests the start of the file through the index (at least 32 KiB, or 64 KiB if the position is unknown). It takes the initialization data from that response and requests the overlapping media bytes. If a section extends beyond the index, `ubit` checks whether further media can follow. When the references reach the known file end or leave only a single recognized random-access or padding box, it needs no further media bytes to reject a section outside the stream. Otherwise it can fetch the whole file, for example to trim a later fragment. The downloaded file must contain the bytes that the index references, even when the first response did not give the total file size. Without a usable index, for DASH, or after a YouTube UMP fallback, the transfer can also include the whole stream. If the server ignores byte ranges, it can send the whole file for each request.
+On the native macOS Swift CLI, for indexed MP4/M4A input, `ubit` requests the start of the file through the index (at least 32 KiB, or 64 KiB if the position is unknown). It takes the initialization data from that response and requests the overlapping media bytes. If a section extends beyond the index, `ubit` checks whether further media can follow. When the references reach the known file end or leave only a single recognized random-access or padding box, it needs no further media bytes to reject a section outside the stream. Otherwise it can fetch the whole file, for example to trim a later fragment. The downloaded file must contain the bytes that the index references, even when the first response did not give the total file size. Without a usable index, or for DASH, the transfer can also include the whole stream. If the server ignores byte ranges, it can send the whole file for each request.
 
-When `ubit` downloads a whole MP4 or M4A over HTTP to trim a section, it checks each top-level segment index against the file length. If a later index refers to missing bytes, the command fails instead of saving a partial clip.
+On that path, when `ubit` downloads a whole MP4 or M4A over HTTP to trim a section, it checks each top-level segment index against the file length. If a later index refers to missing bytes, the command fails instead of saving a partial clip.
 
-For HLS, at least one segment must contain media inside the requested interval. A section that starts at or beyond the end of the playlist fails without fetching a media segment. At an exact segment boundary, `ubit` also keeps the previous segment, if present, for keyframe preroll. WebM and raw MP3, Opus, FLAC or WAV do not go through the MP4 trimmer: `ubit` saves the whole file over plain HTTP, or the selected segments over HLS.
+On that path, for HLS, at least one segment must contain media inside the requested interval. A section that starts at or beyond the end of the playlist fails without fetching a media segment. At an exact segment boundary, `ubit` also keeps the previous segment, if present, for keyframe preroll. WebM and raw MP3, Opus, FLAC or WAV do not go through the MP4 trimmer: `ubit` saves the whole file over plain HTTP, or the selected segments over HLS.
 
 ```sh
 ubit get -q 720 --section 1:15-1:30 --no-library --quiet -o /tmp/clips "$URL"
@@ -54,7 +58,7 @@ AUDIO_WAV="$(ubit get -a --to wav --section 0:00-5:00 --no-library --quiet -o /t
 ```
 
 ### Pattern D: Structured Metadata & Subtitle Probe (`ubit info --json`)
-Inspect available qualities, codecs, byte sizes, durations, chapters, playlist items, and subtitle tracks without saving a media file. Extraction can still request stream bytes (YouTube extraction tests byte ranges on one format), and a server that ignores byte ranges sends the whole response:
+Inspect available qualities, codecs, byte sizes, durations, chapters, playlist items, and subtitle tracks without saving a media file. Extraction can still request stream bytes, and a server that ignores byte ranges sends the whole response. Such a response does not prove that the provider authorized access, and `ubit` does not claim that a provider verification check was completed:
 
 ```sh
 ubit info --json "$URL"
@@ -114,7 +118,7 @@ When `--json` is passed to `ubit get`, `stdout` emits strictly valid newline-del
 | Exit Code | Meaning | Agent Action |
 | ---: | --- | --- |
 | `0` | All URLs succeeded | Read output path from `done.path` or `--quiet` stdout |
-| `1` | Extraction, auth, DRM, or network error | Inspect `error` field; if auth-gated, pass `--cookies` / `--cookies-from-browser firefox` or ask user to sign in via `ubit browse <url>` |
+| `1` | Extraction, auth, DRM, network, provider refusal, or challenge error | Inspect `error`. A provider refusal or challenge is terminal for that URL: do not retry with another identity or route. For ordinary auth-gated content, pass `--cookies` / `--cookies-from-browser firefox` or ask the user to sign in via `ubit browse <url>` |
 | `2` | Invalid CLI usage / flag syntax | Fix invocation flags (check `ubit get --help`) |
 | `130` | Interrupted (`SIGINT`) | Re-run the exact same command to resume from `.part` + `.part.json` |
 
@@ -130,13 +134,13 @@ When `--json` is passed to `ubit get`, `stdout` emits strictly valid newline-del
   2b. Safari (`--cookies-from-browser safari`): reads `~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies` (falling back to `~/Library/Cookies`). The file is unencrypted, so no keychain access is needed. Chrome/Brave/Edge are rejected with an explicit error: their cookie values need the browser's keychain password and an AES unwrap.
   3. Explicit Netscape Cookie File (`--cookies /path/to/cookies.txt`).
   4. Cookie-free (`--no-cookies`): forces unauthenticated extraction.
-- **YouTube Request Pacing & Bot Wall**:
+- **YouTube Request Pacing & Challenges**:
   In one `ubit` process, the pacer grants permission for one YouTube `/player` attempt at a time, at least 3 seconds after the previous grant. Retries need a permit too. A caller can pause after it gets permission, so two HTTP requests can start less than 3 seconds apart.
 
-  The process caches a video's metadata for 5.5 hours per request context: the cookies for `/watch` and `/player`, the User-Agent, extra headers and the proxy. Separate processes do not share the pacer or the cache. When YouTube answers "confirm you're not a bot" and no usable YouTube sign-in cookie is loaded (a nonempty, unexpired `SAPISID` or `__Secure-3PAPISID` that a `/player` request sends; when two cookies of one name match, the request sends the one with the longer path), extraction stops at once with exit code `1` and an error that names the bot wall. With such a cookie, only the client profiles that send it are tried after the wall. Do not retry that URL in a loop.
-- **Stream errors:** `ubit` can refresh a refused stream URL up to twice. A UMP download requires an advertised content length and must return exactly that many bytes. It downloads the whole stream even for `--section`.
-- **YouTube format selection:** Extraction tests one direct format per profile that it tries and stops at the first profile that passes. It does not test the remaining formats of that profile. If no direct format passes, HLS requires player data from the watch page or from a profile that named a playlist without direct formats. `ubit` selects the first playlist URL named by a tried profile. It uses the watch-page URL only if no tried profile named one. If the selected URL is unreadable, `ubit` does not try another playlist. Without usable metadata and formats, no media download starts.
+  The process caches a video's metadata for 5.5 hours per request context: the cookies for `/watch` and `/player`, the User-Agent, extra headers and the proxy. Separate processes do not share the pacer or the cache. When YouTube returns a playability or verification challenge, such as "confirm you're not a bot", extraction stops at once with exit code `1` and an error that names the challenge. This stop applies whether or not a sign-in cookie is loaded. `ubit` does not complete the challenge, switch to another client profile or `User-Agent`, invalidate the cache to re-extract the URL, or try another route. Sign-in cookies still authenticate ordinary requests that YouTube allows; they do not turn a refusal or challenge into a retry. Do not retry that URL in a loop.
+- **Provider refusals:** For a media or extraction request, HTTP 403 (access denied), 410 (gone), 429 (rate limited), or a playability or verification challenge ends that URL's operation. `ubit` makes no further request for that URL, does not refresh a stale URL, does not switch client identity, and does not try another route. It saves no output for that URL. A successful byte-range response or an HTTP status from one request is not proof that a provider verification check passed. Other network errors, such as timeouts and resets, keep their ordinary retry behavior.
+- **YouTube format selection:** Extraction may try more than one client profile for ordinary format selection. A refusal or challenge is not a format-selection failure: it ends extraction instead of advancing to another profile or route. If no direct format is available, HLS requires player data from the watch page or from a profile that named a playlist without direct formats. `ubit` selects the first playlist URL named by a tried profile. It uses the watch-page URL only if no tried profile named one. If the selected URL is unreadable, `ubit` does not try another playlist. Without usable metadata and formats, no media download starts.
 - **Cookie headers:** YouTube video extraction rejects an explicit `Cookie` header before the first request, even if the cookie vault is empty. The error does not repeat the value.
 - **Proxy Values**: `--proxy` and the `proxy` setting accept only `http://`, `https://`, `socks5://`, `socks5h://` or `socks://` URLs with a host. Every socks scheme uses SOCKS version 5, so `socks4://` and `socks4a://` are refused. Any other value exits with code `2` (or fails the download, for a value that was already stored) before a request is sent, so a mistyped proxy never sends traffic directly. The error does not repeat the value, because a proxy URL can hold a password.
 - **Unrecognized JS-Heavy Player Pages**:
-  If static/API extraction fails on a custom video host, hand the URL to the built-in WebKit media-sniffer browser (`ubit browse <url>`), which hooks `fetch`, `XMLHttpRequest`, and `<video>` across all frames to capture dynamic HLS/DASH/MP4 URLs.
+  If static/API extraction fails on a custom video host for a reason other than a provider refusal or challenge, hand the URL to the built-in WebKit media-sniffer browser (`ubit browse <url>`), which hooks `fetch`, `XMLHttpRequest`, and `<video>` across all frames to capture dynamic HLS/DASH/MP4 URLs.

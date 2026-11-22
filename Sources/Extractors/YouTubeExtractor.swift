@@ -70,7 +70,6 @@ public struct YouTubeExtractor: SiteExtractor {
         let requiresJS: Bool
     }
 
-    /// Primary 2026 client: Apple VisionOS (`VISIONOS` 1.02, ID 101) — requires NO GVS PO token on HTTPS, DASH, or HLS, and NO JS cipher!
     private static let visionOSProfile = YTClientProfile(
         label: "visionos",
         name: "VISIONOS",
@@ -103,7 +102,6 @@ public struct YouTubeExtractor: SiteExtractor {
         requiresJS: false
     )
 
-    /// Signed-in & age-restricted fallback: Samsung Smart TV (`TVHTML5` UKS9800, ID 7) — zero GVS PO token + supports SAPISIDHASH cookies!
     private static let tvSamsungProfile = YTClientProfile(
         label: "tv_samsung",
         name: "TVHTML5",
@@ -228,7 +226,6 @@ public struct YouTubeExtractor: SiteExtractor {
     /// The SAPISID value for SAPISIDHASH sign-in: the `SAPISID` (or else `__Secure-3PAPISID`)
     /// cookie that a /player request actually sends (in scope, not expired, and not shadowed by a
     /// cookie of the same name with a longer path), when its value is nonempty.
-    /// The bot-wall decision and the Authorization header both use this one test.
     static func signInCookie(in cookies: CookieVault) -> String? {
         let sent = cookies.effectiveCookies(for: URL(string: playerURL)!).filter { !$0.value.isEmpty }
         return (sent.first { $0.name == "SAPISID" } ?? sent.first { $0.name == "__Secure-3PAPISID" })?.value
@@ -242,9 +239,41 @@ public struct YouTubeExtractor: SiteExtractor {
         }
     }
 
-    private static func isBotGateReason(_ reason: String?) -> Bool {
-        let r = (reason ?? "").lowercased()
-        return r.contains("not a bot") || r.contains("unusual traffic")
+    private static func checkPlaybackDecision(_ response: [String: Any]) throws {
+        if let failure = response["error"] as? [String: Any] {
+            throw ExtractorError.playbackDenied(failure["message"] as? String ?? "YouTube declined playback.")
+        }
+        guard let decision = response["playabilityStatus"] as? [String: Any],
+              let status = decision["status"] as? String else {
+            throw ExtractorError.playbackDenied("YouTube did not confirm playback.")
+        }
+        let reason = decision["reason"] as? String ?? ""
+        if isChallenge(reason) { throw ExtractorError.botGate("YouTube") }
+        if status == "LOGIN_REQUIRED" { throw ExtractorError.loginRequired("YouTube") }
+        if status != "OK" {
+            throw ExtractorError.playbackDenied(reason.isEmpty ? "YouTube declined playback (\(status))." : reason)
+        }
+        if decision["errorScreen"] != nil { throw ExtractorError.playbackDenied("YouTube declined playback.") }
+    }
+
+    private static func isChallenge(_ text: String) -> Bool {
+        text.localizedCaseInsensitiveContains("not a bot") ||
+            text.localizedCaseInsensitiveContains("unusual traffic") ||
+            text.localizedCaseInsensitiveContains("verify your") ||
+            text.localizedCaseInsensitiveContains("confirm your age")
+    }
+
+    private static func playerResponse(in html: String, at url: URL) throws -> [String: Any]? {
+        if url.path.hasPrefix("/sorry/") || url.host == "accounts.google.com" ||
+            url.host?.hasPrefix("consent.") == true || html.localizedCaseInsensitiveContains("g-recaptcha") {
+            throw ExtractorError.botGate("YouTube")
+        }
+        if let response = ExtractorUtils.extractJSONAfter("ytInitialPlayerResponse =", in: html) as? [String: Any] {
+            try checkPlaybackDecision(response)
+            return response
+        }
+        if isChallenge(html) { throw ExtractorError.botGate("YouTube") }
+        return nil
     }
 
     private struct WatchContext {
@@ -254,29 +283,14 @@ public struct YouTubeExtractor: SiteExtractor {
         var playerResponse: [String: Any]?
     }
 
-    // A missing optional response is recoverable. A cancelled request is not.
-    private func optionalRequest<T>(_ operation: () async throws -> T?) async throws -> T? {
-        do {
-            let result = try await operation()
-            try Task.checkCancellation()
-            return result
-        } catch is CancellationError {
-            throw CancellationError()
-        } catch let error as URLError where error.code == .cancelled {
-            throw error
-        } catch {
-            try Task.checkCancellation()
-            return nil
-        }
-    }
-
     private func fetchWatchContext(videoID: String, client: HTTPClient) async throws -> WatchContext {
         var ctx = WatchContext()
         ctx.visitorData = await YTGuard.shared.visitor()
-        if let (html, _) = try await optionalRequest({ try await client.fetchText(
-            url: "https://www.youtube.com/watch?v=\(videoID)&bpctr=9999999999&has_verified=1",
+        if let (html, pageURL) = try await ExtractorUtils.optionalRequest({ try await client.fetchText(
+            url: "https://www.youtube.com/watch?v=\(videoID)",
             headers: ["Accept-Language": "en-US,en;q=0.9"]
         ) }) {
+            ctx.playerResponse = try Self.playerResponse(in: html, at: pageURL)
             if ctx.visitorData == nil, let v = ExtractorUtils.firstMatch("\"VISITOR_DATA\"\\s*:\\s*\"([^\"]+)\"", in: html) {
                 ctx.visitorData = v
                 await YTGuard.shared.saveVisitor(v)
@@ -285,12 +299,9 @@ public struct YouTubeExtractor: SiteExtractor {
                 ctx.jsURL = jsRel.hasPrefix("http") ? jsRel : "https://www.youtube.com\(jsRel)"
             }
             ctx.sts = ExtractorUtils.firstMatch("\"signatureTimestamp\"\\s*:\\s*(\\d+)", in: html).flatMap(Int.init)
-            if let ipr = ExtractorUtils.extractJSONAfter("var ytInitialPlayerResponse =", in: html) as? [String: Any] {
-                ctx.playerResponse = ipr
-            }
         }
         if ctx.visitorData == nil,
-           let (sw, _) = try await optionalRequest({ try await client.fetchText(url: "https://www.youtube.com/sw.js_data", includeCookies: false) }),
+           let (sw, _) = try await ExtractorUtils.optionalRequest({ try await client.fetchText(url: "https://www.youtube.com/sw.js_data", includeCookies: false) }),
            let v = ExtractorUtils.firstMatch("\"(Cgt[A-Za-z0-9_-]{10,})\"", in: sw) {
             ctx.visitorData = v
             await YTGuard.shared.saveVisitor(v)
@@ -298,12 +309,12 @@ public struct YouTubeExtractor: SiteExtractor {
         return ctx
     }
 
-    /// Verifies that YouTube's GVS CDN actually serves bytes near the END of the stream (catching >1.5MB PO-token 403 traps).
+    /// Confirms that the advertised media resource serves a range before selecting it.
     private func verifyTailRangePlayable(url: String, contentLength: Int64?, userAgent: String, client: HTTPClient) async throws -> Bool {
         let clen = contentLength ?? 0
         let probeStart = clen > 131_072 ? (clen - 4096) : 0
         let probeEnd = clen > 131_072 ? (clen - 1) : 2047
-        let chunk = try await optionalRequest { try await client.fetchRangeBytes(
+        let chunk = try await ExtractorUtils.optionalRequest { try await client.fetchRangeBytes(
                 url: url,
                 range: ByteRange(start: probeStart, end: probeEnd),
                 headers: ["User-Agent": userAgent]
@@ -321,16 +332,6 @@ public struct YouTubeExtractor: SiteExtractor {
         if let cached = await YTGuard.shared.cached(cacheKey) { return cached }
         let watchCtx = try await fetchWatchContext(videoID: videoID, client: client)
 
-        // After a bot-wall answer, only a profile that sends the user's YouTube sign-in cookies can
-        // still succeed. Without such cookies the wall ends extraction before any more /player
-        // requests; with them, only the cookie profiles are tried.
-        let hasSignIn = Self.signInCookie(in: client.cookies) != nil
-        var botWalled = false
-        let watchReason = (watchCtx.playerResponse?["playabilityStatus"] as? [String: Any])?["reason"] as? String
-        if watchCtx.playerResponse?["streamingData"] == nil && Self.isBotGateReason(watchReason) {
-            guard hasSignIn else { throw ExtractorError.botGate("YouTube") }
-            botWalled = true
-        }
         // Honor YouTube pre-roll ad slot wait if requested (avoids transient 403 before stream activation)
         if let adSlots = watchCtx.playerResponse?["adSlots"] as? [Any], !adSlots.isEmpty,
            let adJSON = try? JSONSerialization.data(withJSONObject: adSlots),
@@ -354,28 +355,13 @@ public struct YouTubeExtractor: SiteExtractor {
         var chosenHLSUA: String = Self.visionOSProfile.userAgent
         var cachedSolver: JSPlayerCipherSolver?
         var loadedSolver = false
-        var lastReason: String? = botWalled ? watchReason : nil
 
         for profile in candidateProfiles {
-            if botWalled && !profile.supportsCookies { continue }
-            guard let resp = try await optionalRequest({ try await callPlayer(
-                    videoID: videoID,
-                    profile: profile,
-                    visitorData: watchCtx.visitorData,
-                    sts: profile.requiresJS ? watchCtx.sts : nil,
-                    client: client
-            ) }) else { continue }
+            let resp = try await callPlayer(videoID: videoID, profile: profile,
+                                            visitorData: watchCtx.visitorData,
+                                            sts: profile.requiresJS ? watchCtx.sts : nil, client: client)
 
-            let pStatus = (resp["playabilityStatus"] as? [String: Any])?["status"] as? String ?? ""
-            if pStatus != "OK" && resp["streamingData"] == nil {
-                let r = (resp["playabilityStatus"] as? [String: Any])?["reason"] as? String
-                if Self.isBotGateReason(r) {
-                    guard hasSignIn else { throw ExtractorError.botGate("YouTube") }
-                    botWalled = true
-                }
-                if let r { lastReason = r }
-                continue
-            }
+            try Self.checkPlaybackDecision(resp)
             guard let sd = resp["streamingData"] as? [String: Any] else { continue }
 
             if chosenHLSManifest == nil, let hlsM = sd["hlsManifestUrl"] as? String {
@@ -389,7 +375,7 @@ public struct YouTubeExtractor: SiteExtractor {
 
             if needsJS && !loadedSolver {
                 loadedSolver = true
-                cachedSolver = try await optionalRequest { try await loadPlayerCipherSolver(videoID: videoID, knownJSURL: watchCtx.jsURL, client: client) }
+                cachedSolver = try await ExtractorUtils.optionalRequest { try await loadPlayerCipherSolver(videoID: videoID, knownJSURL: watchCtx.jsURL, client: client) }
             }
 
             var parsed: [MediaFormat] = []
@@ -447,7 +433,6 @@ public struct YouTubeExtractor: SiteExtractor {
                 ))
             }
 
-            // Pre-flight tail-range probe to reject partial-preview GVS PO-token 403 streams BEFORE downloading!
             if let probeTarget = parsed.first(where: { ($0.filesize ?? 0) > 2_000_000 }) ?? parsed.first {
                 let playable = try await verifyTailRangePlayable(
                     url: probeTarget.url,
@@ -485,10 +470,10 @@ public struct YouTubeExtractor: SiteExtractor {
         let thumb = "https://i.ytimg.com/vi/\(videoID)/maxresdefault.jpg"
 
         var formats = chosenFormats
-        // Append HLS m3u8 variants (live streams, or resilient fallback if all HTTPS streams were gated)
+        // An ordinary player response can advertise HLS instead of direct formats.
         if let hlsManifest = chosenHLSManifest ?? ((watchCtx.playerResponse?["streamingData"] as? [String: Any])?["hlsManifestUrl"] as? String) {
             if isLive || formats.isEmpty {
-                if let hlsFmts = try await optionalRequest({ try await HLSEngine.extractFormats(client: client, playlistURL: hlsManifest, headers: ["User-Agent": chosenHLSUA], idPrefix: "hls") }) {
+                if let hlsFmts = try await ExtractorUtils.optionalRequest({ try await HLSEngine.extractFormats(client: client, playlistURL: hlsManifest, headers: ["User-Agent": chosenHLSUA], idPrefix: "hls") }) {
                     for var hf in hlsFmts {
                         hf.isLive = isLive
                         formats.append(hf)
@@ -498,14 +483,7 @@ public struct YouTubeExtractor: SiteExtractor {
         }
 
         if formats.isEmpty {
-            let reason = (lastReason ?? "").lowercased()
-            if reason.contains("not a bot") || reason.contains("unusual traffic") {
-                throw ExtractorError.botGate("YouTube")
-            }
-            if reason.contains("sign in") {
-                throw ExtractorError.loginRequired("YouTube")
-            }
-            throw ExtractorError.notFound("YouTube: \(lastReason ?? "No playable non-DRM streams returned")")
+            throw ExtractorError.notFound("YouTube: No playable non-DRM streams returned")
         }
 
         // Subtitles from watch page player response (or chosen response)
@@ -570,8 +548,6 @@ public struct YouTubeExtractor: SiteExtractor {
         var bodyObj: [String: Any] = [
             "videoId": videoID,
             "context": context,
-            "contentCheckOk": true,
-            "racyCheckOk": true,
         ]
         if let sts {
             bodyObj["playbackContext"] = [
@@ -602,13 +578,13 @@ public struct YouTubeExtractor: SiteExtractor {
             headers["X-Origin"] = "https://www.youtube.com"
         }
 
-        // Every attempt, including a retry after HTTP 429/5xx, waits for its own pacing slot, so
+        // Each retry after a transient server error waits for its own pacing slot.
         // the HTTP client's own (unpaced) retry loop is turned off for this request.
         var attempt = 0
         while true {
             try await YTGuard.shared.pace()
             do {
-                let json = try await client.fetchJSON(
+                let (data, _) = try await client.fetchData(
                     url: Self.playerURL,
                     method: "POST",
                     headers: headers,
@@ -616,10 +592,13 @@ public struct YouTubeExtractor: SiteExtractor {
                     includeCookies: profile.supportsCookies,
                     retries: 1
                 )
-                return (json as? [String: Any]) ?? [:]
-            } catch HTTPError.status(let code, _) where attempt < 2 && [429, 500, 502, 503, 504].contains(code) {
+                guard let response = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
+                    throw ExtractorError.notFound("YouTube did not return a player response.")
+                }
+                return response
+            } catch HTTPError.status(let code, _) where attempt < 2 && [500, 502, 503, 504].contains(code) {
                 attempt += 1
-            } catch let error as URLError where attempt < 2 && error.code != .cancelled {
+            } catch let error as URLError where attempt < 2 && HTTPClient.canRetryTransport(error) {
                 attempt += 1
             }
         }
@@ -660,7 +639,7 @@ public struct YouTubeExtractor: SiteExtractor {
         while let cont = continuation, pageCount < 25 {
             continuation = nil
             pageCount += 1
-            if let nextResp = try? await callInnerTube(endpoint: "browse", payload: ["continuation": cont], client: client) {
+            if let nextResp = try await ExtractorUtils.optionalRequest({ try await callInnerTube(endpoint: "browse", payload: ["continuation": cont], client: client) }) {
                 Self.collectPlaylistItems(in: nextResp, entries: &entries, continuation: &continuation)
             }
         }
@@ -691,7 +670,7 @@ public struct YouTubeExtractor: SiteExtractor {
         // Convert channel ID UC... -> uploads playlist UU... for complete video feed!
         if channelID.hasPrefix("UC") && channelID.count == 24 {
             let uploadsList = "UU" + channelID.dropFirst(2)
-            if var pl = try? await extractPlaylist(listID: uploadsList, webpageURL: url.absoluteString, client: client), !pl.entries.isEmpty {
+            if var pl = try await ExtractorUtils.optionalRequest({ try await extractPlaylist(listID: uploadsList, webpageURL: url.absoluteString, client: client) }), !pl.entries.isEmpty {
                 pl.title = channelTitle
                 pl.id = channelID
                 return pl
@@ -813,7 +792,8 @@ public struct YouTubeExtractor: SiteExtractor {
     private func loadPlayerCipherSolver(videoID: String, knownJSURL: String?, client: HTTPClient) async throws -> JSPlayerCipherSolver? {
         var resolvedJSURL = knownJSURL
         if resolvedJSURL == nil {
-            let (embedHTML, _) = try await client.fetchText(url: "https://www.youtube.com/embed/\(videoID)")
+            let (embedHTML, pageURL) = try await client.fetchText(url: "https://www.youtube.com/embed/\(videoID)")
+            _ = try Self.playerResponse(in: embedHTML, at: pageURL)
             if let jsRel = ExtractorUtils.firstMatch("\"jsUrl\":\"([^\"]+base\\.js)\"", in: embedHTML) {
                 resolvedJSURL = jsRel.hasPrefix("http") ? jsRel : "https://www.youtube.com\(jsRel)"
             }

@@ -1,8 +1,10 @@
 # uBit (`ubit` / `uBit.app`)
 
-Download video and audio from the web — a **~1 MB** native desktop app and **agent-ready CLI** for **macOS (`arm64`)** and **Linux (`x86_64` & `arm64`)**. No Python, no `yt-dlp`, no FFmpeg required for MP4/M4A, and zero Pro paywalls.
+Download video and audio from the web — a **~1 MB** native macOS desktop app and an **agent-ready CLI** for **macOS (`arm64`)** and **Linux (`x86_64` & `arm64`)**. No Python, no `yt-dlp`, no FFmpeg required for MP4/M4A, and zero Pro paywalls.
 
 - **[Agent & Automation Docs (`docs/agents.md`)](docs/agents.md)** · **[Agent Skill (`skills/ubit/SKILL.md`)](skills/ubit/SKILL.md)** · **[`llms.txt`](llms.txt)** · **[Architecture (`AGENTS.md`)](AGENTS.md)**
+
+**Platform scope.** The `--section` checks and provider-refusal rules in this document describe the native macOS `arm64` Swift CLI. The Linux, Termux/Android and WASM builds and the Rust SDK use a separate C++ engine. Its section path reads only the first segment index, does not check later indexes, and does not preserve the same HLS trim base. It can save a short or shifted clip and exit `0`. Check a non-macOS clip before you rely on its interval. The C++ engine's refusal behavior is not covered by the macOS contract.
 
 ---
 
@@ -53,6 +55,8 @@ ubit get -a --to wav --no-library --quiet <url>                # zero-FFmpeg 16-
 ubit get --json <url>                                          # stream NDJSON events: start, info, progress, process, done
 ```
 
+**Provider refusals.** On the native macOS Swift CLI, a provider access denial (HTTP 403), 410, 429, or a playability/verification challenge ends that URL's operation. uBit does not retry with another URL, client identity or route, and it saves no output for that URL. It does not claim that a provider verification check was completed. Sign-in cookies still authenticate ordinary requests; they do not justify a retry after a refusal.
+
 See **[`docs/agents.md`](docs/agents.md)** for full NDJSON schemas, exit codes (`0`, `1`, `2`, `130`), `UBIT_CONFIG_DIR` sandbox isolation, and authentication workflows.
 
 
@@ -85,7 +89,7 @@ ubit browse <url>                       # open in the WebKit media-sniffer brows
 - **Pure-Swift ISO-BMFF & MPEG-TS Muxer (`Sources/Mux/MP4Box.swift`, `TSDemuxer.swift`)**:
   - Reads progressive MP4 (`stbl`), fragmented DASH/HLS fMP4 (`moof`/`traf`/`trun`), and 188-byte MPEG-TS (`PAT`/`PMT`/`PES` H.264 Annex-B + ADTS AAC).
   - Writes fast-start (`moov` before `mdat`) MP4 and M4A containers with `tx3g` timed-text subtitles, QuickTime `chap` + Nero `chpl` chapters, iTunes metadata (`©nam`, `©ART`, `©day`, `©cmt`, `desc`, `covr` JPEG cover art), and macOS Finder `com.apple.metadata:kMDItemWhereFroms`.
-  - For indexed MP4/M4A, `--section` reads initialization data and the `sidx` index from the start of the file, then requests the overlapping media bytes. This saves transfer only if the server honors byte ranges. HLS uses the overlapping segments and, at an exact start boundary, the previous segment for preroll. A section starting at the end of a playlist has no media and fails. WebM and raw MP3, Opus, FLAC or WAV are not trimmed: uBit saves the entire HTTP file or the selected HLS segments.
+  - On the native macOS Swift build, for indexed MP4/M4A, `--section` reads initialization data and the `sidx` index from the start of the file, then requests the overlapping media bytes. This saves transfer only if the server honors byte ranges. Before it saves a trimmed whole-file clip, it checks each top-level index against the file length. HLS uses the overlapping segments and, at an exact start boundary, the previous segment for preroll. A section starting at the end of a playlist has no media and fails. WebM and raw MP3, Opus, FLAC or WAV are not trimmed: uBit saves the entire HTTP file or the selected HLS segments.
 - **Built-in Media-Sniffer Browser (`Sources/UI/BrowserWindow.swift`)**: `WKWebView` (`⌘B`) with document-start `fetch` / `XMLHttpRequest` / `<video>` inspection across all frames, `WKContentRuleList` ad/tracker blocking, and automatic cookie export to `~/Library/Application Support/uBit/cookies.txt`.
 
 ## Build from Source
@@ -94,7 +98,7 @@ ubit browse <url>                       # open in the WebKit media-sniffer brows
 ./build.sh
 ```
 
-Produces `dist/uBit.app`, `dist/ubit`, and `dist/ubit-0.3.0-darwin-arm64.tar.gz`.
+Produces `dist/uBit.app`, `dist/ubit`, and `dist/ubit-0.3.3-darwin-arm64.tar.gz`.
 
 ## License
 

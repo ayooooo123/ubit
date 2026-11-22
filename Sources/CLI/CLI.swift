@@ -867,6 +867,10 @@ public enum CLIRunner {
               --json                    Stream NDJSON events (start, info, progress, process, done, error, stopped)
               --quiet                   Print only saved file paths
               --no-library              Omit from app library
+
+        A provider access denial (403), 410, 429 or playability challenge ends that URL.
+        uBit does not retry with another URL, identity or route,
+        and it saves no output for that URL.
         """)
     }
 
@@ -874,11 +878,11 @@ public enum CLIRunner {
         print("""
         # uBit (\(UBIT_VERSION)) — Agent CLI Contract
 
-        Binary: `ubit` (also inside `uBit.app/Contents/MacOS/ubit`). Zero external dependencies required for MP4, M4A, MOV, WAV, AIFF, FLAC.
+        Binary: `ubit` (also inside `uBit.app/Contents/MacOS/ubit`). Zero external dependencies required for MP4, M4A, MOV, WAV, AIFF, FLAC. This manifest describes the native macOS Swift CLI; the Linux, Termux/Android, WASM and Rust SDK engines use a separate C++ engine.
 
         ## Commands
         - `ubit get <url>... [flags]` — Download video/audio. Prefer `--json` (NDJSON events on stdout) or `--quiet` (prints only final saved file path(s), one per line).
-        - `ubit info <url> --json` — Probe metadata (`id`, `title`, `site`, `author`, `duration`, `isLive`, `isDRM`, `formats`, `subtitles`, `chapters`, `entries`) without saving a media file. To test byte ranges, YouTube extraction requests a small byte range of one stream for each client profile that it tries, and it stops at the first profile that passes (a server that ignores the range sends the whole stream). `info` and `formats` accept only `--json`, `--cookies FILE`, `--cookies-from-browser B`, `--no-cookies` and `--proxy URL`; any other flag exits with code `2`.
+        - `ubit info <url> --json` — Probe metadata (`id`, `title`, `site`, `author`, `duration`, `isLive`, `isDRM`, `formats`, `subtitles`, `chapters`, `entries`) without saving a media file. A server that ignores byte ranges sends the whole stream. A byte-range response does not prove that the provider authorized access, and uBit does not claim that a provider verification check was completed. `info` and `formats` accept only `--json`, `--cookies FILE`, `--cookies-from-browser B`, `--no-cookies` and `--proxy URL`; any other flag exits with code `2`.
         - `ubit formats <url> --json` — Return JSON array of `MediaFormat` objects (`id`, `ext`, `proto`, `vcodec`, `acodec`, `width`, `height`, `fps`, `bitrate`, `filesize`).
         - `ubit list --json` — Return JSON array of library/queue items (`id`, `url`, `title`, `state`, `path`, `downloadedBytes`, `totalBytes`).
         - `ubit subs [list|add <url>|remove <n>|check] [--json] [--quiet]` — Manage channel/playlist subscriptions.
@@ -897,9 +901,10 @@ public enum CLIRunner {
           - `{"event":"stopped","url":"..."}`
         - `--quiet` — Suppress progress bars; print ONLY saved absolute file paths to stdout (ideal for command substitution `FILE=$(ubit get --quiet ...)`).
         - `--no-library` — Ephemeral run; do not append agent scratch downloads to the user's GUI library.
-        - `--section START-END` — Trim tracks on the native MP4 path before output conversion (e.g. `0:30-1:15` or `90-135`). Video starts on the preceding sync keyframe. For indexed MP4/M4A, uBit reads the initialization data and index (64 KiB if the index position is unknown), then requests overlapping media bytes. A server that ignores ranges can send the whole file each time. Without a usable index, for DASH, or after a YouTube UMP fallback, the transfer can include the whole stream.
+        - `--section START-END` — Trim tracks on the native MP4 path before output conversion (e.g. `0:30-1:15` or `90-135`). Video starts on the preceding sync keyframe. For indexed MP4/M4A, uBit reads the initialization data and index (64 KiB if the index position is unknown), then requests overlapping media bytes. A server that ignores ranges can send the whole file each time. Without a usable index or for DASH, the transfer can include the whole stream. This contract describes the native macOS Swift CLI; the Linux, Termux/Android, WASM and Rust SDK engines read only the first segment index and do not check later indexes or use the same HLS trim base.
+        - Provider refusals: HTTP 403 (access denied), 410, 429 or a playability/verification challenge ends that URL's operation. uBit does not retry with another URL, client identity or route, and it saves no output for that URL. Sign-in cookies still authenticate ordinary requests; they do not justify a retry after a refusal.
         - HLS sections need positive overlap with at least one segment. At an exact start boundary, uBit also keeps the previous segment for preroll, if present. A section starting at or beyond the playlist end fails. WebM and raw MP3, Opus, FLAC or WAV are not trimmed: uBit saves the entire file over plain HTTP or the selected segments over HLS.
-        - YouTube extraction tests one direct format per tried profile and keeps the first profile that passes. Without a direct format, HLS requires player data from the watch page or from a profile that named a playlist without direct formats. The first playlist URL named by a tried profile takes precedence. The watch-page URL is used only if no profile named one, not when the profile URL is unreadable. YouTube video extraction rejects raw Cookie headers before the first request, even with an empty cookie vault.
+        - YouTube extraction may try more than one profile for ordinary format selection. A refusal or challenge ends extraction instead of advancing to another profile or route. Without a direct format, HLS requires player data from the watch page or from a profile that named a playlist without direct formats. The first playlist URL named by a tried profile takes precedence. The watch-page URL is used only if no profile named one, not when the profile URL is unreadable. YouTube video extraction rejects raw Cookie headers before the first request, even with an empty cookie vault.
         - `-a --to wav` — Extract 16-bit 44.1 kHz stereo PCM `.wav` natively via macOS AudioToolbox (zero FFmpeg) for ASR/transcription pipelines.
         - `-q <best|2160|1440|1080|720|480|360>` / `-f <vid+aid>` — Bound resolution or select exact stream IDs.
         - `--subs --sub-langs en --sub-files` — Download WebVTT `.vtt` subtitle sidecar files alongside media.

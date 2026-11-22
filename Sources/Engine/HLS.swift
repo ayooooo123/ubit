@@ -375,8 +375,11 @@ public enum HLSEngine {
             selected = filtered
         }
 
-        let segWorkDir = destination.deletingLastPathComponent().appendingPathComponent(".\(destination.lastPathComponent).segs", isDirectory: true)
+        // Segment positions are relative to this selection, not to the playlist.
+        let segWorkDir = destination.deletingLastPathComponent()
+            .appendingPathComponent(".segs-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: segWorkDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: segWorkDir) }
 
         var initData: Data?
         if let initU = pl.initURL {
@@ -436,13 +439,6 @@ public enum HLSEngine {
                         try Task.checkCancellation()
                         let seg = selected[pos]
                         let segFile = segWorkDir.appendingPathComponent(String(format: "%06d.seg", pos))
-                        if let attrs = try? FileManager.default.attributesOfItem(atPath: segFile.path),
-                           let sz = attrs[.size] as? Int64, sz > 0 {
-                            let (_, est, frac) = await tracker.add(bytes: sz)
-                            let cur = await tracker.currentBytes()
-                            onProgress?(cur, est, frac, 0)
-                            continue
-                        }
                         var raw: Data
                         if let br = seg.byteRange {
                             raw = try await client.fetchRangeBytes(url: seg.url, range: br, headers: headers)
@@ -450,6 +446,7 @@ public enum HLSEngine {
                             raw = try await client.fetchData(url: seg.url, headers: headers).0
                         }
                         if let kurl = seg.keyURL {
+                            try Task.checkCancellation()
                             let key = try await keyStore.get(kurl, client: client, headers: headers)
                             raw = try decryptAES128(data: raw, key: key, iv: seg.iv, sequence: seg.mediaSequence)
                         }
@@ -460,11 +457,12 @@ public enum HLSEngine {
                     }
                 }
             }
-            try await group.waitForAll()
+            // Throw the first failed fetch and cancel outstanding workers on group exit.
+            for try await _ in group {}
         }
 
         // Concatenate init + segments into destination atomically
-        let partOut = destination.appendingPathExtension("part")
+        let partOut = segWorkDir.appendingPathComponent("assembled")
         FileManager.default.createFile(atPath: partOut.path, contents: nil)
         let fh = try FileHandle(forWritingTo: partOut)
         var firstBytes = Data()
@@ -474,6 +472,7 @@ public enum HLSEngine {
         }
         var totalDur: Double = 0
         for pos in 0..<selected.count {
+            try Task.checkCancellation()
             totalDur += selected[pos].duration
             let segFile = segWorkDir.appendingPathComponent(String(format: "%06d.seg", pos))
             let d = try Data(contentsOf: segFile)
@@ -485,7 +484,6 @@ public enum HLSEngine {
             try FileManager.default.removeItem(at: destination)
         }
         try FileManager.default.moveItem(at: partOut, to: destination)
-        try? FileManager.default.removeItem(at: segWorkDir)
 
         let isFMP4 = initData != nil || (firstBytes.count >= 8 && String(decoding: firstBytes[4..<8], as: UTF8.self) == "ftyp") || (firstBytes.first != 0x47)
         return (isFMP4, totalDur, startTime)
@@ -502,6 +500,7 @@ public enum HLSEngine {
     ) async throws -> (isFMP4: Bool, duration: Double) {
         let partOut = destination.appendingPathExtension("part")
         FileManager.default.createFile(atPath: partOut.path, contents: nil)
+        defer { try? FileManager.default.removeItem(at: partOut) }
         let fh = try FileHandle(forWritingTo: partOut)
         defer { try? fh.close() }
 

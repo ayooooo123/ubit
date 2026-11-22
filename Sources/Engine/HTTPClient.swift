@@ -3,16 +3,17 @@ import Foundation
 public enum HTTPError: LocalizedError {
     case badURL(String)
     case status(Int, String)
-    case staleLink(Int)
     case rangeUnsupported
+    case incomplete(received: Int64, expected: Int64)
     case canceled
 
     public var errorDescription: String? {
         switch self {
         case .badURL(let u): return "Invalid URL: \(u)"
         case .status(let code, let u): return "HTTP \(code) from \(URL(string: u)?.host ?? u)"
-        case .staleLink(let code): return "Stream link expired (HTTP \(code))"
         case .rangeUnsupported: return "Server stopped serving byte ranges"
+        case .incomplete(let received, let expected):
+            return "Incomplete download: received \(received) of \(expected) bytes"
         case .canceled: return "Canceled"
         }
     }
@@ -91,6 +92,7 @@ private actor WorkStealingQueue {
     private var pending: [ByteRange]
     private var active: [Int: ActiveWorker] = [:]
     private var nextID: Int = 1
+    private var stopped = false
     private let minStealSize: Int64 = 512 * 1024 // 512 KB minimum split
 
     init(state: ChunkStateFile, stateURL: URL, initialSplits: Int) {
@@ -113,6 +115,7 @@ private actor WorkStealingQueue {
     }
 
     func claimWork() -> (workerID: Int, range: ByteRange)? {
+        guard !stopped else { return nil }
         if !pending.isEmpty {
             let r = pending.removeFirst()
             let id = nextID
@@ -145,7 +148,8 @@ private actor WorkStealingQueue {
     }
 
     /// Returns true if worker should keep reading, false if its tail was stolen and it reached its new endPos.
-    func recordChunk(workerID: Int, start: Int64, length: Int) -> (keepGoing: Bool, allowedLength: Int, totalDone: Int64) {
+    func writeChunk(_ bytes: Data, fd: Int32, workerID: Int, start: Int64) throws -> (keepGoing: Bool, allowedLength: Int, totalDone: Int64) {
+        guard !stopped else { return (false, 0, state.downloadedBytes) }
         guard var w = active[workerID] else {
             return (false, 0, state.downloadedBytes)
         }
@@ -154,8 +158,17 @@ private actor WorkStealingQueue {
             active.removeValue(forKey: workerID)
             return (false, 0, state.downloadedBytes)
         }
-        let clampedEnd = min(maxEnd, start + Int64(length) - 1)
-        let allowed = Int(clampedEnd - start + 1)
+        let allowed = min(bytes.count, Int(maxEnd - start + 1))
+        let clampedEnd = start + Int64(allowed - 1)
+        try bytes.withUnsafeBytes { raw in
+            var written = 0
+            while written < allowed {
+                let count = pwrite(fd, raw.baseAddress!.advanced(by: written), allowed - written, start + Int64(written))
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: count == 0 ? Int(EIO) : Int(errno)) }
+                written += count
+            }
+        }
         state.addCompleted(ByteRange(start: start, end: clampedEnd))
         w.currentPos = clampedEnd + 1
         let keepGoing = w.currentPos <= w.endPos
@@ -167,10 +180,15 @@ private actor WorkStealingQueue {
         return (keepGoing, allowed, state.downloadedBytes)
     }
 
-    func failWorker(workerID: Int) {
-        if let w = active.removeValue(forKey: workerID), w.currentPos <= w.endPos {
-            pending.insert(ByteRange(start: w.currentPos, end: w.endPos), at: 0)
-        }
+    /// A cancelled or refused worker is terminal: no pending tail may start another request.
+    func stop() {
+        stopped = true
+        pending.removeAll()
+        active.removeAll()
+    }
+
+    func completion() -> (covered: Bool, received: Int64) {
+        (state.missingRanges().isEmpty && state.totalSize > 0, state.downloadedBytes)
     }
 
     func flushState() {
@@ -179,13 +197,24 @@ private actor WorkStealingQueue {
         }
     }
 
-    func downloadedBytes() -> Int64 {
-        state.downloadedBytes
-    }
 }
 
 public final class HTTPClient: @unchecked Sendable {
     public static let defaultBrowserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15"
+
+    static func canRetryTransport(_ error: Error) -> Bool {
+        guard let transport = error as? URLError else { return false }
+        switch transport.code {
+        case .timedOut, .networkConnectionLost, .cannotConnectToHost, .notConnectedToInternet: return true
+        default: return false
+        }
+    }
+
+    /// Provider refusals. A refusal is terminal: it is never retried, and it never becomes a
+    /// reason to ask the provider for another URL.
+    static func isRefusal(_ code: Int) -> Bool {
+        switch code { case 401, 403, 407, 410, 429, 451: return true; default: return false }
+    }
 
     /// True for a proxy URL that `init` can install: an http, https, socks, socks5 or socks5h
     /// scheme and a host. URLSession speaks SOCKS version 5 for every socks scheme, so socks4
@@ -294,10 +323,7 @@ public final class HTTPClient: @unchecked Sendable {
                 if (200..<300).contains(http.statusCode) {
                     return (data, http)
                 }
-                if http.statusCode == 403 || http.statusCode == 410 {
-                    throw HTTPError.status(http.statusCode, url)
-                }
-                if [429, 500, 502, 503, 504].contains(http.statusCode) && attempt + 1 < retries {
+                if [500, 502, 503, 504].contains(http.statusCode) && attempt + 1 < retries {
                     try await Task.sleep(nanoseconds: UInt64(400_000_000 * (1 << attempt)))
                     continue
                 }
@@ -308,7 +334,7 @@ public final class HTTPClient: @unchecked Sendable {
                 throw error
             } catch {
                 lastErr = error
-                if attempt + 1 < retries, (error as? URLError) != nil {
+                if attempt + 1 < retries, Self.canRetryTransport(error) {
                     try await Task.sleep(nanoseconds: UInt64(400_000_000 * (1 << attempt)))
                     continue
                 }
@@ -355,30 +381,56 @@ public final class HTTPClient: @unchecked Sendable {
         let (data, http) = try await fetchData(url: url, headers: hdrs)
         if http.statusCode == 206 {
             guard let value = http.value(forHTTPHeaderField: "Content-Range"),
-                  let space = value.firstIndex(of: " "), value[..<space].lowercased() == "bytes" else {
+                  let content = Self.parseContentRange(value),
+                  content.first == range.start,
+                  !data.isEmpty,
+                  Int64(data.count - 1) == content.last - content.first else {
                 throw HTTPError.rangeUnsupported
             }
-            let interval = value[value.index(after: space)...]
-            guard let dash = interval.firstIndex(of: "-"), let slash = interval.firstIndex(of: "/"), dash < slash,
-                  let first = Int64(interval[..<dash]), first == range.start,
-                  let last = Int64(interval[interval.index(after: dash)..<slash]), last >= first,
-                  !data.isEmpty, last - first == Int64(data.count - 1) else {
-                throw HTTPError.rangeUnsupported
-            }
-            let length = interval[interval.index(after: slash)...]
-            if length == "*" {
-                guard last == range.end else { throw HTTPError.rangeUnsupported }
-                return (data, nil)
-            } else {
-                guard let size = Int64(length), size > last, last == min(range.end, size - 1) else {
+            if let size = content.total {
+                guard size > content.last, content.last == min(range.end, size - 1) else {
                     throw HTTPError.rangeUnsupported
                 }
                 return (data, size)
             }
+            guard content.last == range.end else { throw HTTPError.rangeUnsupported }
+            return (data, nil)
+        }
+        // A server that ignores Range answers 200 with the whole file. A body shorter than its
+        // Content-Length was cut in transit; it is not a smaller file.
+        if http.value(forHTTPHeaderField: "Content-Encoding") == nil,
+           http.expectedContentLength > 0,
+           http.expectedContentLength != Int64(data.count) {
+            throw HTTPError.incomplete(received: Int64(data.count), expected: http.expectedContentLength)
         }
         guard Int64(data.count) > range.start else { throw HTTPError.rangeUnsupported }
         let last = min(range.end, Int64(data.count - 1))
         return (data.subdata(in: Int(range.start)..<(Int(last) + 1)), Int64(data.count))
+    }
+
+    private struct ContentRange {
+        let first: Int64
+        let last: Int64
+        let total: Int64?
+    }
+
+    /// Parses one `Content-Range: bytes first-last/total` value. Nil for every other shape,
+    /// including a multipart range list, so a caller never guesses which bytes arrived.
+    private static func parseContentRange(_ value: String) -> ContentRange? {
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        guard trimmed.lowercased().hasPrefix("bytes ") else { return nil }
+        let interval = trimmed.dropFirst("bytes ".count)
+        guard !interval.contains(","),
+              let dash = interval.firstIndex(of: "-"),
+              let slash = interval.lastIndex(of: "/"),
+              dash < slash,
+              let first = Int64(interval[..<dash]),
+              let last = Int64(interval[interval.index(after: dash)..<slash]),
+              first >= 0, last >= first else { return nil }
+        let totalText = interval[interval.index(after: slash)...].trimmingCharacters(in: .whitespaces)
+        if totalText == "*" { return ContentRange(first: first, last: last, total: nil) }
+        guard let total = Int64(totalText), total > last else { return nil }
+        return ContentRange(first: first, last: last, total: total)
     }
 
     /// Probes total file size and range support using a tiny `Range: bytes=0-0` request.
@@ -388,19 +440,17 @@ public final class HTTPClient: @unchecked Sendable {
         let req = try makeRequest(url: url, headers: hdrs)
         let (_, resp) = try await session.bytes(for: req)
         guard let http = resp as? HTTPURLResponse else { return (nil, false, nil) }
-        if http.statusCode == 403 || http.statusCode == 410 {
-            throw HTTPError.staleLink(http.statusCode)
-        }
         guard (200..<300).contains(http.statusCode) else {
             throw HTTPError.status(http.statusCode, url)
         }
         let etag = http.value(forHTTPHeaderField: "ETag")
-        if http.statusCode == 206, let cr = http.value(forHTTPHeaderField: "Content-Range") {
-            // bytes 0-0/12345678
-            if let slash = cr.lastIndex(of: "/"),
-               let total = Int64(cr[cr.index(after: slash)...].trimmingCharacters(in: .whitespaces)) {
-                return (total, true, etag)
+        if http.statusCode == 206 {
+            // A 206 with `*` gives no file size, and this body's length is not the file length.
+            guard let value = http.value(forHTTPHeaderField: "Content-Range"),
+                  let range = Self.parseContentRange(value), range.first == 0, range.last == 0 else {
+                throw HTTPError.rangeUnsupported
             }
+            return (range.total, true, etag)
         }
         let clen = http.expectedContentLength > 0 ? http.expectedContentLength : nil
         return (clen, false, etag)
@@ -419,33 +469,51 @@ public final class HTTPClient: @unchecked Sendable {
         let partURL = destination.appendingPathExtension("part")
         let stateURL = destination.appendingPathExtension("part.json")
 
-        let probe = try await probeRemote(url: url, headers: headers)
+        let probe: (totalSize: Int64?, acceptsRanges: Bool, etag: String?)
+        do {
+            probe = try await probeRemote(url: url, headers: headers)
+        } catch {
+            Self.discardRefusedTransfer(partURL: partURL, stateURL: stateURL, after: error)
+            throw error
+        }
         let totalSize = probe.totalSize ?? knownSize
 
         guard let total = totalSize, total > 512 * 1024, probe.acceptsRanges, connections > 1 else {
-            // Single-stream streaming download (with Range resume if .part exists and server supports ranges)
-            try await singleStreamDownload(
-                url: url,
-                partURL: partURL,
-                destination: destination,
-                headers: headers,
-                acceptsRanges: probe.acceptsRanges,
-                totalSize: totalSize,
-                onProgress: onProgress
-            )
+            // A parallel `.part` is preallocated to the full length, so its size is not a safe
+            // resume offset for a single sequential stream.
+            if FileManager.default.fileExists(atPath: stateURL.path) {
+                try? FileManager.default.removeItem(at: stateURL)
+                try? FileManager.default.removeItem(at: partURL)
+            }
+            do {
+                try await singleStreamDownload(
+                    url: url,
+                    partURL: partURL,
+                    destination: destination,
+                    headers: headers,
+                    acceptsRanges: probe.acceptsRanges,
+                    totalSize: totalSize,
+                    onProgress: onProgress
+                )
+            } catch {
+                Self.discardRefusedTransfer(partURL: partURL, stateURL: stateURL, after: error)
+                throw error
+            }
             try? FileManager.default.removeItem(at: stateURL)
             return
         }
 
-        // Load or create chunk state
+        // Load or create chunk state. A state file is trusted only when the part file has the
+        // advertised length and every completed range is sorted, disjoint and inside the file.
         var chunkState: ChunkStateFile
-        if FileManager.default.fileExists(atPath: partURL.path),
+        if let partSize = Self.fileSize(partURL), partSize == total,
            let stateData = try? Data(contentsOf: stateURL),
            let saved = try? JSONDecoder().decode(ChunkStateFile.self, from: stateData),
-           saved.totalSize == total,
+           Self.isValidResumeState(saved, total: total),
            (saved.etag == nil || probe.etag == nil || saved.etag == probe.etag) {
             chunkState = saved
         } else {
+            try? FileManager.default.removeItem(at: stateURL)
             FileManager.default.createFile(atPath: partURL.path, contents: nil)
             let fh = try FileHandle(forWritingTo: partURL)
             try fh.truncate(atOffset: UInt64(total))
@@ -453,9 +521,8 @@ public final class HTTPClient: @unchecked Sendable {
             chunkState = ChunkStateFile(totalSize: total, etag: probe.etag, completed: [])
         }
 
-        let initialDone = chunkState.downloadedBytes
-        onProgress?(initialDone, total)
-        if initialDone >= total {
+        onProgress?(chunkState.downloadedBytes, total)
+        if chunkState.missingRanges().isEmpty {
             if FileManager.default.fileExists(atPath: destination.path) {
                 try FileManager.default.removeItem(at: destination)
             }
@@ -477,7 +544,8 @@ public final class HTTPClient: @unchecked Sendable {
             try await withThrowingTaskGroup(of: Void.self) { group in
                 for _ in 0..<numWorkers {
                     group.addTask { [self] in
-                        while !Task.isCancelled {
+                        while true {
+                            try Task.checkCancellation()
                             guard let claim = await workQueue.claimWork() else { break }
                             try await self.runRangeWorker(
                                 workerID: claim.workerID,
@@ -490,20 +558,55 @@ public final class HTTPClient: @unchecked Sendable {
                                 onProgress: onProgress
                             )
                         }
+                        try Task.checkCancellation()
                     }
                 }
-                try await group.waitForAll()
+                for try await _ in group {}
             }
         } catch {
             await workQueue.flushState()
+            Self.discardRefusedTransfer(partURL: partURL, stateURL: stateURL, after: error)
             throw error
         }
 
+        try Task.checkCancellation()
+        let completion = await workQueue.completion()
+        guard completion.covered else {
+            await workQueue.flushState()
+            throw HTTPError.incomplete(received: completion.received, expected: total)
+        }
         await workQueue.flushState()
         if FileManager.default.fileExists(atPath: destination.path) {
             try FileManager.default.removeItem(at: destination)
         }
         try FileManager.default.moveItem(at: partURL, to: destination)
+        try? FileManager.default.removeItem(at: stateURL)
+    }
+
+    /// Size of an existing file, or nil when it is missing.
+    private static func fileSize(_ url: URL) -> Int64? {
+        guard let attrs = try? FileManager.default.attributesOfItem(atPath: url.path) else { return nil }
+        return (attrs[.size] as? NSNumber)?.int64Value
+    }
+
+    /// A resume file is usable only when it describes this exact file: sorted, disjoint ranges
+    /// that all lie inside the advertised length. Anything else starts from zero.
+    private static func isValidResumeState(_ state: ChunkStateFile, total: Int64) -> Bool {
+        guard state.totalSize == total else { return false }
+        var cursor: Int64 = 0
+        for range in state.completed {
+            guard range.start >= cursor, range.start >= 0, range.end >= range.start, range.end < total else {
+                return false
+            }
+            cursor = range.end + 1
+        }
+        return true
+    }
+
+    // Do not leave media from a refused operation available for resume.
+    private static func discardRefusedTransfer(partURL: URL, stateURL: URL, after error: Error) {
+        guard case HTTPError.status(let code, _) = error, isRefusal(code) else { return }
+        try? FileManager.default.removeItem(at: partURL)
         try? FileManager.default.removeItem(at: stateURL)
     }
 
@@ -524,9 +627,12 @@ public final class HTTPClient: @unchecked Sendable {
         let maxWindowBytes: Int64 = isGoogleVideo ? 8 * 1024 * 1024 : Int64.max
 
         while curStart <= origEnd {
-            try Task.checkCancellation()
+            if Task.isCancelled {
+                await workQueue.stop()
+                throw CancellationError()
+            }
             do {
-                let reqEnd = (maxWindowBytes == Int64.max) ? origEnd : min(origEnd, curStart + maxWindowBytes - 1)
+                let reqEnd = curStart + min(origEnd - curStart, maxWindowBytes - 1)
                 var hdrs = headers ?? [:]
                 hdrs["Range"] = "bytes=\(curStart)-\(reqEnd)"
                 let req = try makeRequest(url: url, headers: hdrs)
@@ -534,20 +640,29 @@ public final class HTTPClient: @unchecked Sendable {
                 guard let http = resp as? HTTPURLResponse else {
                     throw HTTPError.badURL(url)
                 }
-                if http.statusCode == 403 || http.statusCode == 410 {
-                    await workQueue.failWorker(workerID: workerID)
-                    throw HTTPError.staleLink(http.statusCode)
+                if Self.isRefusal(http.statusCode) {
+                    throw HTTPError.status(http.statusCode, url)
                 }
-                guard http.statusCode == 206 else {
-                    await workQueue.failWorker(workerID: workerID)
+                guard http.statusCode == 206,
+                      let value = http.value(forHTTPHeaderField: "Content-Range"),
+                      let content = Self.parseContentRange(value),
+                      content.first == curStart,
+                      content.last == reqEnd,
+                      content.last < totalSize else {
                     throw HTTPError.rangeUnsupported
                 }
-
+                if let total = content.total, total != totalSize {
+                    throw HTTPError.rangeUnsupported
+                }
+                let declared = content.last - content.first + 1
+                var received: Int64 = 0
                 var buf = Data()
                 buf.reserveCapacity(131_072)
                 var flushCounter = 0
 
                 for try await b in bytes {
+                    guard received < declared else { throw HTTPError.rangeUnsupported }
+                    received += 1
                     buf.append(b)
                     if buf.count >= 65_536 {
                         let res = try await commitBuffer(&buf, workerID: workerID, offset: curStart, fd: fd, totalSize: totalSize, workQueue: workQueue, onProgress: onProgress)
@@ -556,9 +671,9 @@ public final class HTTPClient: @unchecked Sendable {
                         if flushCounter % 16 == 0 {
                             await workQueue.flushState()
                         }
-                        if !res.keepGoing { return }
+                        if !res.keepGoing && curStart <= origEnd { return }
                         if Task.isCancelled {
-                            await workQueue.failWorker(workerID: workerID)
+                            await workQueue.stop()
                             throw CancellationError()
                         }
                     }
@@ -566,20 +681,14 @@ public final class HTTPClient: @unchecked Sendable {
                 if !buf.isEmpty {
                     let res = try await commitBuffer(&buf, workerID: workerID, offset: curStart, fd: fd, totalSize: totalSize, workQueue: workQueue, onProgress: onProgress)
                     curStart += Int64(res.written)
-                    if !res.keepGoing { return }
+                    if !res.keepGoing && curStart <= origEnd { return }
                 }
+                guard received == declared else { throw HTTPError.incomplete(received: received, expected: declared) }
                 attempts = 0
-                if reqEnd >= origEnd { return }
-            } catch is CancellationError {
-                await workQueue.failWorker(workerID: workerID)
-                throw CancellationError()
-            } catch let e as HTTPError {
-                await workQueue.failWorker(workerID: workerID)
-                throw e
             } catch {
                 attempts += 1
-                if attempts >= 4 {
-                    await workQueue.failWorker(workerID: workerID)
+                if attempts >= 4 || Task.isCancelled || !Self.canRetryTransport(error) {
+                    await workQueue.stop()
                     throw error
                 }
                 try await Task.sleep(nanoseconds: UInt64(350_000_000 * attempts))
@@ -596,23 +705,9 @@ public final class HTTPClient: @unchecked Sendable {
         workQueue: WorkStealingQueue,
         onProgress: (@Sendable (Int64, Int64) -> Void)?
     ) async throws -> (keepGoing: Bool, written: Int) {
-        let count = buf.count
-        await limiter.consume(count)
-        let decision = await workQueue.recordChunk(workerID: workerID, start: offset, length: count)
-        if decision.allowedLength > 0 {
-            try buf.withUnsafeBytes { rawPtr in
-                guard let base = rawPtr.baseAddress else { return }
-                var written = 0
-                while written < decision.allowedLength {
-                    let w = pwrite(fd, base.advanced(by: written), decision.allowedLength - written, offset + Int64(written))
-                    if w < 0 {
-                        if errno == EINTR { continue }
-                        throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
-                    }
-                    written += w
-                }
-            }
-        }
+        await limiter.consume(buf.count)
+        try Task.checkCancellation()
+        let decision = try await workQueue.writeChunk(buf, fd: fd, workerID: workerID, start: offset)
         buf.removeAll(keepingCapacity: true)
         onProgress?(decision.totalDone, totalSize)
         return (decision.keepGoing, decision.allowedLength)
@@ -627,11 +722,15 @@ public final class HTTPClient: @unchecked Sendable {
         totalSize: Int64?,
         onProgress: (@Sendable (Int64, Int64) -> Void)?
     ) async throws {
+        // A `.part` that reaches or passes the advertised length cannot be proven to hold real
+        // bytes: a parallel preallocation has the full length and may have no state file. Both
+        // cases start from zero.
         var existingOffset: Int64 = 0
-        if acceptsRanges, let attrs = try? FileManager.default.attributesOfItem(atPath: partURL.path),
-           let sz = attrs[.size] as? Int64, sz > 0 {
+        if acceptsRanges, let sz = Self.fileSize(partURL), sz > 0,
+           totalSize.map({ sz < $0 }) ?? true {
             existingOffset = sz
         } else {
+            try? FileManager.default.removeItem(at: partURL)
             FileManager.default.createFile(atPath: partURL.path, contents: nil)
         }
 
@@ -642,24 +741,41 @@ public final class HTTPClient: @unchecked Sendable {
         let req = try makeRequest(url: url, headers: hdrs)
         let (bytes, resp) = try await session.bytes(for: req)
         guard let http = resp as? HTTPURLResponse else { throw HTTPError.badURL(url) }
-        if http.statusCode == 403 || http.statusCode == 410 {
-            throw HTTPError.staleLink(http.statusCode)
-        }
         guard (200..<300).contains(http.statusCode) else {
             throw HTTPError.status(http.statusCode, url)
         }
-        if http.statusCode == 200 && existingOffset > 0 {
-            FileManager.default.createFile(atPath: partURL.path, contents: nil)
+
+        var expectedTotal = totalSize ?? 0
+        var restart = false
+        if http.statusCode == 206 {
+            guard let value = http.value(forHTTPHeaderField: "Content-Range"),
+                  let content = Self.parseContentRange(value),
+                  content.first == existingOffset else {
+                throw HTTPError.rangeUnsupported
+            }
+            guard let total = content.total ?? totalSize, total > 0, content.last == total - 1,
+                  totalSize == nil || totalSize == total else { throw HTTPError.rangeUnsupported }
+            expectedTotal = total
+        } else {
+            // 200 is the whole file, even when the request carried a resume range.
+            restart = existingOffset > 0
             existingOffset = 0
+            if expectedTotal == 0,
+               http.value(forHTTPHeaderField: "Content-Encoding") == nil,
+               http.expectedContentLength > 0 {
+                expectedTotal = http.expectedContentLength
+            }
         }
 
         let fh = try FileHandle(forWritingTo: partURL)
         defer { try? fh.close() }
-        if existingOffset > 0 {
+        if restart {
+            try fh.truncate(atOffset: 0)
+            try fh.seek(toOffset: 0)
+        } else if existingOffset > 0 {
             try fh.seekToEnd()
         }
 
-        let expectedTotal = totalSize ?? (http.expectedContentLength > 0 ? existingOffset + http.expectedContentLength : 0)
         var downloaded = existingOffset
         var buf = Data()
         buf.reserveCapacity(65_536)
@@ -680,6 +796,10 @@ public final class HTTPClient: @unchecked Sendable {
             try fh.write(contentsOf: buf)
             downloaded += Int64(buf.count)
             onProgress?(downloaded, expectedTotal)
+        }
+        try fh.truncate(atOffset: UInt64(downloaded))
+        if expectedTotal > 0 && downloaded != expectedTotal {
+            throw HTTPError.incomplete(received: downloaded, expected: expectedTotal)
         }
         try fh.close()
         if FileManager.default.fileExists(atPath: destination.path) {

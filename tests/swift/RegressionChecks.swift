@@ -1,4 +1,4 @@
-// Regression checks for the Swift YouTube, UMP and Safari cookie code.
+// Regression checks for the Swift YouTube, fail-closed HTTP and Safari cookie code.
 //
 // `tests/swift/run.sh` compiles this file together with every app source except
 // `Sources/main.swift` and runs one case per process, each with its own UBIT_CONFIG_DIR.
@@ -40,19 +40,40 @@ final class FixtureProtocol: URLProtocol {
 
     static let firstVisitor = "CgtFixtureVisitorFirst00000000000000"
     static let secondVisitor = "CgtFixtureVisitorSecond0000000000000"
+    static let parallelBytes = Data((0..<614_400).map { UInt8(truncatingIfNeeded: ($0 / 1021) ^ $0) })
     static let mediaBytes = Data("fixture-media-payload-for-the-http-path".utf8)
-    /// Modes in which every range test fails and extraction must decide on the HLS fallback.
-    /// hls-fallback: every /player response names a playlist, and the watch page has player data.
-    /// hls-fallback-nowatch: as hls-fallback, but the watch page has no player data.
-    /// hls-fallback-watchlist: only the watch page names a playlist.
-    /// hls-fallback-lateprofile: the watch page has no player data; the first /player response has a
-    /// direct format, and the later ones name only a playlist.
-    static let hlsFallbackModes: Set<String> = ["hls-fallback", "hls-fallback-nowatch", "hls-fallback-watchlist", "hls-fallback-lateprofile"]
+    /// A fail-closed HTTP denial on one stage of the YouTube path. `deny` covers an HTTP status;
+    /// `denyPlayability` covers an explicit playability status with usable streaming data.
+    nonisolated(unsafe) private static var deniedStage = ""
+    nonisolated(unsafe) private static var deniedStatus = 0
+    nonisolated(unsafe) private static var forcedStage = ""
+    nonisolated(unsafe) private static var forcedPlayability: String?
+    nonisolated(unsafe) private static var retryRequests = 0
 
     static func requests() -> [SeenRequest] { lock.withLock { seen } }
     static func beginDownload() { lock.withLock { downloadPhase = true } }
+    static func endDownload() { lock.withLock { downloadPhase = false } }
     static func setTitle(_ value: String) { lock.withLock { title = value } }
     static func playerRequests() -> [SeenRequest] { requests().filter { $0.url.path.hasSuffix("/player") } }
+    static func playerCount() -> Int { playerRequests().count }
+
+    static func deny(stage: String, status: Int) {
+        lock.withLock {
+            deniedStage = stage
+            deniedStatus = status
+            forcedStage = ""
+            forcedPlayability = nil
+        }
+    }
+
+    static func denyPlayability(stage: String, status: String) {
+        lock.withLock {
+            forcedStage = stage
+            forcedPlayability = status
+            deniedStage = ""
+            deniedStatus = 0
+        }
+    }
 
     /// Every session configuration that an HTTPClient built, read after the client set it up.
     nonisolated(unsafe) private static var configs: [URLSessionConfiguration] = []
@@ -79,8 +100,9 @@ final class FixtureProtocol: URLProtocol {
             (Self.seen.filter { $0.url.path.hasSuffix("/player") }.count + (url.path.hasSuffix("/player") ? 1 : 0),
              Self.downloadPhase, Self.title)
         }
-        let mediaNumber = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-            .queryItems?.first { $0.name == "n" }?.value.flatMap(Int.init) ?? 0
+        let (deniedStage, deniedStatus, forcedStage, forcedPlayability) = Self.lock.withLock {
+            (Self.deniedStage, Self.deniedStatus, Self.forcedStage, Self.forcedPlayability)
+        }
         let mode = Self.mode
         var status = 200
         var data = Data()
@@ -88,96 +110,123 @@ final class FixtureProtocol: URLProtocol {
         var failure: URLError?
 
         switch (url.host ?? "", url.path) {
+        case ("media.invalid", "/parallel.bin"):
+            guard let bounds = range?.dropFirst(6).split(separator: "-"), bounds.count == 2,
+                  let low = Int(bounds[0]), let requested = Int(bounds[1]) else { status = 400; break }
+            if mode == "parallel-cancel" && requested > 0 { failure = URLError(.cancelled); break }
+            let high = mode == "parallel-short" ? min(low + 65_535, requested) : requested
+            status = 206
+            headers["Content-Range"] = "bytes \(low)-\(high)/\(Self.parallelBytes.count)"
+            data = Self.parallelBytes.subdata(in: low..<(high + 1))
+        case ("segments.invalid", let path) where path.hasSuffix(".mpd"):
+            data = Data(#"<MPD mediaPresentationDuration="PT3S"><Period><AdaptationSet mimeType="video/mp4"><Representation id="v"><SegmentTemplate duration="1" timescale="1" media="piece-$Number$.m4s"/></Representation></AdaptationSet></Period></MPD>"#.utf8)
+        case ("segments.invalid", "/denied/piece-2.m4s"):
+            status = 403
+        case ("segments.invalid", let path) where path.hasSuffix(".m4s"):
+            data = Data(path.utf8)
         case ("fixture.invalid", "/sanity"):
             data = Data("intercepted".utf8)
-        case ("embed.invalid", "/page"):
-            data = Data("<html><title>Embed</title><iframe src=\"https://www.youtube.com/embed/Fixture0001\"></iframe></html>".utf8)
-            headers["Content-Type"] = "text/html"
-        case (_, "/watch"):
-            let visitor = mode == "visitor-reuse" ? Self.secondVisitor : Self.firstVisitor
-            var player: [String: Any] = ["watch-gate", "wall-unusable-cookie"].contains(mode)
-                ? ["playabilityStatus": ["status": "LOGIN_REQUIRED", "reason": "Sign in to confirm you're not a bot"]]
-                : ["playabilityStatus": ["status": "OK"]]
-            if mode == "hls-fallback-watchlist" { player["streamingData"] = ["hlsManifestUrl": "https://media.invalid/clip.m3u8"] }
-            let json = String(data: try! JSONSerialization.data(withJSONObject: player), encoding: .utf8)!
-            data = ["hls-fallback-nowatch", "hls-fallback-lateprofile"].contains(mode)
-                ? Data("<script>var ytcfg = {\"VISITOR_DATA\":\"\(visitor)\"};</script>".utf8)
-                : Data("<script>var ytcfg = {\"VISITOR_DATA\":\"\(visitor)\"};</script><script>var ytInitialPlayerResponse = \(json);</script>".utf8)
-            if mode == "cancel-watch" { failure = URLError(.cancelled) }
-        case (_, let path) where path.hasSuffix("/player"):
-            if mode == "auth-header" && playerNumber % 2 == 1 {
-                // Not the bot wall, so extraction goes on to the next client profile.
-                data = Self.json(["playabilityStatus": ["status": "UNPLAYABLE", "reason": "fixture refusal"]])
-            } else if mode == "pace-retry" && playerNumber == 1 {
-                status = 429
-            } else if ["player-gate", "pace-concurrent", "pace-retry"].contains(mode)
-                        || (mode == "signed-in-wall" && request.value(forHTTPHeaderField: "Authorization") == nil) {
-                data = Self.json(["playabilityStatus": ["status": "LOGIN_REQUIRED", "reason": "Sign in to confirm you're not a bot"]])
+        case ("fixture.invalid", "/retry-status"):
+            let n = Self.lock.withLock { Self.retryRequests += 1; return Self.retryRequests }
+            if mode == "retry-5xx" {
+                if n == 1 { status = 500 }
+                else if n == 2 { status = 503 }
+                else { data = Data("retried".utf8) }
             } else {
-                let mime = mode == "section" ? "audio/mp4; codecs=\"mp4a.40.2\"" : "audio/webm; codecs=\"opus\""
-                var format: [String: Any] = [
-                    "itag": 251,
-                    "url": "https://media.invalid/media?n=\(playerNumber)&lsig=fixture",
-                    "mimeType": mime,
-                    "audioSampleRate": "48000",
-                ]
+                status = 429
+            }
+        case (_, "/watch"):
+            if deniedStage == "watch" {
+                status = deniedStatus
+            } else {
+                var player: [String: Any]? = Self.playerPayload(status: "OK", streaming: nil, title: title)
                 switch mode {
-                case "ump-cut": format["contentLength"] = String(Bytes.cutStream.count + 36)   // longer than what UMP returns
-                case "ump-complete": format["contentLength"] = String(Bytes.cutStream.count)
-                case "ump-unknown-length": break
-                default: format["contentLength"] = String(Self.mediaBytes.count)
+                case "watch-gate", "wall-unusable-cookie", "watch-challenge-cookie":
+                    player = Self.challengePlayer(1, title: title)
+                case "hls-fallback-watchlist":
+                    player = Self.hlsOnlyPlayer(title: title)
+                case "hls-fallback-nowatch", "hls-fallback-lateprofile":
+                    player = nil
+                default:
+                    break
                 }
-                var streaming: [String: Any] = ["adaptiveFormats": [format]]
-                switch mode {
-                case "hls-fallback", "hls-fallback-nowatch":
-                    streaming["hlsManifestUrl"] = "https://media.invalid/clip.m3u8"
-                case "hls-fallback-lateprofile" where playerNumber > 1:
-                    streaming = ["hlsManifestUrl": "https://media.invalid/clip.m3u8"]
-                default: break
+                if forcedStage == "watch", let forcedPlayability {
+                    player = Self.playerPayload(
+                        status: forcedPlayability,
+                        reason: "fixture denial",
+                        streaming: Self.directStreaming(1, hls: true),
+                        title: title
+                    )
                 }
-                data = Self.json([
-                    "playabilityStatus": ["status": "OK"],
-                    "videoDetails": ["title": "\(title)-\(playerNumber)", "lengthSeconds": "8"],
-                    "streamingData": streaming,
-                ])
+                let omitVisitor = forcedStage == "watch"
+                    || ["watch-gate", "wall-unusable-cookie", "watch-challenge-cookie"].contains(mode)
+                let visitor = omitVisitor ? nil : (mode == "visitor-reuse" ? Self.secondVisitor : Self.firstVisitor)
+                data = Self.watchPage(player: player, visitor: visitor)
+                if mode == "cancel-watch" { failure = URLError(.cancelled) }
+            }
+        case (_, let path) where path.hasSuffix("/player"):
+            if mode == "watch-flags" {
+                var body = request.httpBody ?? Data()
+                if body.isEmpty, let stream = request.httpBodyStream {
+                    stream.open(); defer { stream.close() }
+                    var buffer = [UInt8](repeating: 0, count: 1024)
+                    while body.count < 32_768 {
+                        let n = stream.read(&buffer, maxLength: buffer.count)
+                        if n <= 0 { break }
+                        body.append(contentsOf: buffer.prefix(n))
+                    }
+                }
+                let payload = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any]
+                guard payload?["videoId"] != nil, payload?["contentCheckOk"] == nil, payload?["racyCheckOk"] == nil else {
+                    status = 403; break
+                }
+            }
+            if deniedStage == "player" {
+                status = deniedStatus
+            } else if forcedStage == "player", let forcedPlayability {
+                data = Self.json(Self.playerPayload(
+                    status: forcedPlayability,
+                    reason: "fixture denial",
+                    streaming: Self.directStreaming(playerNumber, hls: true),
+                    title: "\(title)-\(playerNumber)"
+                ))
+            } else if mode == "pace-retry" && playerNumber == 1 {
+                status = 503
+            } else if ["watch-gate", "player-gate", "pace-concurrent", "wall-unusable-cookie", "watch-challenge-cookie", "player-challenge-cookie", "pace-retry"].contains(mode) {
+                data = Self.json(Self.challengePlayer(playerNumber, title: "\(title)-\(playerNumber)"))
+            } else if mode == "auth-header" && playerNumber % 2 == 1 {
+                // An ordinary empty response, not a denial: extraction goes on to the next profile.
+                data = Self.json(Self.emptyPlayer(title: title))
+            } else if mode == "hls-fallback" {
+                data = Self.json(Self.hlsOnlyPlayer(title: title))
+            } else if mode == "hls-fallback-lateprofile" && playerNumber > 1 {
+                data = Self.json(Self.hlsOnlyPlayer(title: title))
+            } else if mode == "hls-fallback-lateprofile" {
+                data = Self.json(Self.missingFormatPlayer(playerNumber, title: title))
+            } else if ["hls-fallback-nowatch", "hls-fallback-watchlist"].contains(mode) {
+                data = Self.json(Self.emptyPlayer(title: title))
+            } else {
+                data = Self.json(Self.normalPlayer(playerNumber, title: title))
             }
             if mode == "cancel-player" { failure = URLError(.cancelled) }
         case ("media.invalid", "/media"):
-            if mode == "cancel-probe" { failure = URLError(.cancelled); break }
-            // The first URL breaks only in the download phase; extraction's tail probe still works.
-            // ump-cold refuses every ranged GET from the start.
-            let broken = (phase && mediaNumber == 1) || mode == "ump-cold"
-            if mode == "cancel-in-fallback" && phase {
-                if method == "POST" { failure = URLError(.cancelled) } else { status = 403 }
-            } else if broken && ["stale", "section", "stale-embed"].contains(mode) {
-                status = 403
-            } else if Self.hlsFallbackModes.contains(mode) {
-                status = 403   // every range test fails from the start
-            } else if broken && ["ump-cut", "ump-complete", "ump-unknown-length", "ump-cold"].contains(mode) {
-                // Ranged GETs are refused; the UMP start request answers with a redirect part.
-                // In ump-complete the 1-byte probe works, so the HTTP downloader opens its
-                // resume files before the refusal and UMP must remove them.
-                if method == "POST" {
-                    data = Bytes.redirectPart("https://media.invalid/ump-stream")
-                } else if mode == "ump-complete" && range == "bytes=0-0" {
-                    status = 206
-                    data = Data(Bytes.cutStream.prefix(1))
-                    headers["Content-Range"] = "bytes 0-0/\(Bytes.cutStream.count)"
-                } else {
-                    status = 403
-                }
-            } else if broken && mode == "non-http-error" {
+            if mode == "cancel-probe" {
+                failure = URLError(.cancelled)
+            } else if deniedStage == "probe" {
+                status = deniedStatus
+            } else if deniedStage == "download" && phase {
+                status = deniedStatus
+            } else if mode == "cancel-download" && phase {
                 failure = URLError(.cancelled)
             } else if range == "bytes=0-0" {
                 status = 206
                 data = Self.mediaBytes.prefix(1)
                 headers["Content-Range"] = "bytes 0-0/\(Self.mediaBytes.count)"
+            } else if deniedStage == "stream" && phase {
+                status = deniedStatus
             } else {
                 data = Self.mediaBytes
             }
-        case ("media.invalid", "/ump-stream"):
-            // A stream cut between two complete fragments: every box fits, but bytes are missing.
-            data = Bytes.umpPart(21, [0] + Bytes.cutStream)
         case ("media.invalid", "/hls.m3u8"):
             // A VOD playlist of 15 segments, 4 s each.
             let segments = (0..<15).map { "#EXTINF:4.0,\nseg-\($0).ts" }.joined(separator: "\n")
@@ -245,6 +294,84 @@ final class FixtureProtocol: URLProtocol {
         client!.urlProtocolDidFinishLoading(self)
     }
 
+    static func directStreaming(_ n: Int, hls: Bool = false) -> [String: Any] {
+        var streaming: [String: Any] = ["adaptiveFormats": [[
+            "itag": 251,
+            "url": "https://media.invalid/media?n=\(n)&lsig=fixture",
+            "mimeType": "audio/webm; codecs=\"opus\"",
+            "audioSampleRate": "48000",
+            "contentLength": String(mediaBytes.count),
+        ]]]
+        if hls { streaming["hlsManifestUrl"] = "https://media.invalid/clip.m3u8" }
+        return streaming
+    }
+
+    static func hlsStreaming() -> [String: Any] {
+        ["hlsManifestUrl": "https://media.invalid/clip.m3u8"]
+    }
+
+    static func playerPayload(
+        status: String,
+        reason: String? = nil,
+        streaming: [String: Any]?,
+        title: String
+    ) -> [String: Any] {
+        var playability: [String: Any] = ["status": status]
+        if let reason { playability["reason"] = reason }
+        var payload: [String: Any] = [
+            "playabilityStatus": playability,
+            "videoDetails": ["title": title, "lengthSeconds": "8"],
+        ]
+        if let streaming { payload["streamingData"] = streaming }
+        return payload
+    }
+
+    static func normalPlayer(_ n: Int, title: String) -> [String: Any] {
+        playerPayload(status: "OK", streaming: directStreaming(n), title: "\(title)-\(n)")
+    }
+
+    static func emptyPlayer(title: String) -> [String: Any] {
+        playerPayload(status: "OK", streaming: ["adaptiveFormats": [Any]()], title: title)
+    }
+
+    static func hlsOnlyPlayer(title: String) -> [String: Any] {
+        playerPayload(status: "OK", streaming: hlsStreaming(), title: title)
+    }
+
+    static func missingFormatPlayer(_ n: Int, title: String) -> [String: Any] {
+        let streaming: [String: Any] = ["adaptiveFormats": [[
+            "itag": 251,
+            "url": "https://media.invalid/missing",
+            "mimeType": "audio/webm; codecs=\"opus\"",
+            "audioSampleRate": "48000",
+            "contentLength": String(mediaBytes.count),
+        ]]]
+        return playerPayload(status: "OK", streaming: streaming, title: "\(title)-\(n)")
+    }
+
+    /// A bot challenge that also carries usable streaming data, so an extractor that trusts the
+    /// data instead of the playability status would continue.
+    static func challengePlayer(_ n: Int, title: String) -> [String: Any] {
+        playerPayload(
+            status: "LOGIN_REQUIRED",
+            reason: "Sign in to confirm you're not a bot",
+            streaming: directStreaming(n, hls: true),
+            title: title
+        )
+    }
+
+    static func watchPage(player: [String: Any]?, visitor: String?) -> Data {
+        var html = ""
+        if let visitor {
+            html += "<script>var ytcfg = {\"VISITOR_DATA\":\"\(visitor)\"};</script>"
+        }
+        if let player {
+            let json = String(data: try! JSONSerialization.data(withJSONObject: player), encoding: .utf8)!
+            html += "<script>var ytInitialPlayerResponse = \(json);</script>"
+        }
+        return Data(html.utf8)
+    }
+
     private static func json(_ object: [String: Any]) -> Data {
         try! JSONSerialization.data(withJSONObject: object)
     }
@@ -266,34 +393,6 @@ enum Bytes {
     static func le32(_ n: UInt32) -> [UInt8] { (0..<4).map { UInt8(truncatingIfNeeded: n >> ($0 * 8)) } }
     static func be32(_ n: UInt32) -> [UInt8] { (0..<4).reversed().map { UInt8(truncatingIfNeeded: n >> ($0 * 8)) } }
 
-    /// UMP framing integer (not protobuf).
-    static func umpInt(_ n: Int) -> [UInt8] {
-        if n < 128 { return [UInt8(n)] }
-        if n < 16_384 { return [0x80 | UInt8(n & 0x3f), UInt8(n >> 6)] }
-        return [0xf0] + le32(UInt32(n))
-    }
-
-    static func protobufInt(_ value: Int) -> [UInt8] {
-        var n = value
-        var out: [UInt8] = []
-        repeat {
-            let low = UInt8(n & 0x7f)
-            n >>= 7
-            out.append(n == 0 ? low : low | 0x80)
-        } while n != 0
-        return out
-    }
-
-    static func umpPart(_ type: Int, _ payload: [UInt8]) -> Data {
-        Data(umpInt(type) + umpInt(payload.count) + payload)
-    }
-
-    /// A UMP redirect part (type 43) whose protobuf payload is `prefix` then field 1 = `url`.
-    static func redirectPart(_ url: String, prefix: [UInt8] = []) -> Data {
-        let body = Array(url.utf8)
-        return umpPart(43, prefix + [0x0a] + protobufInt(body.count) + body)
-    }
-
     /// A one-cookie Safari `Cookies.binarycookies` file.
     static func safariCookies(value: String, expiry: Double) -> Data {
         var record = [UInt8](repeating: 0, count: 56)
@@ -309,10 +408,6 @@ enum Bytes {
     }
 
     static let ftyp = be32(16) + Array("ftypisom".utf8) + be32(0)
-
-    /// `ftyp` + one `moof`/`mdat` fragment: a valid box chain that stops before the next fragment.
-    static let cutStream = ftyp + be32(16) + Array("moof".utf8) + [UInt8](repeating: 0, count: 8)
-        + be32(20) + Array("mdat".utf8) + [UInt8](repeating: 7, count: 12)
 
     static func box(_ type: String, _ payload: [UInt8]) -> [UInt8] { be32(UInt32(8 + payload.count)) + Array(type.utf8) + payload }
 
@@ -376,6 +471,42 @@ struct RegressionChecks {
         catch { print("unexpected error: \(error)"); return false }
     }
 
+    static func extractError(_ client: HTTPClient = HTTPClient()) async -> Error? {
+        do { _ = try await extract(client: client); return nil } catch { return error }
+    }
+
+    static func httpStatus(_ error: Error?) -> Int? {
+        guard let error, let http = error as? HTTPError, case .status(let code, _) = http else { return nil }
+        return code
+    }
+
+    static func closedByBotGate(_ error: Error?) -> Bool {
+        guard let error, let extractor = error as? ExtractorError, case .botGate = extractor else { return false }
+        return true
+    }
+
+    static func isExtractorError(_ error: Error?) -> Bool {
+        guard let error else { return false }
+        return error is ExtractorError
+    }
+
+    /// Every file in the download directory. A denial must save none, visible or hidden.
+    static func savedOutputs() -> [String] {
+        let out = AppPaths.appSupportDir.appendingPathComponent("out")
+        return (try? FileManager.default.contentsOfDirectory(atPath: out.path)) ?? []
+    }
+
+    /// Final files in the download directory; a cancelled download may keep a hidden resume file.
+    static func finalOutputs() -> [String] {
+        savedOutputs().filter { !$0.hasPrefix(".") }
+    }
+
+    static func watchQueryNames() -> [String] {
+        FixtureProtocol.requests()
+            .filter { $0.url.path == "/watch" }
+            .flatMap { (URLComponents(url: $0.url, resolvingAgainstBaseURL: false)?.queryItems ?? []).map(\.name) }
+    }
+
     static func now() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
 
     /// Runs `body` with this process's standard error sent to a file, and returns what it wrote.
@@ -412,10 +543,10 @@ struct RegressionChecks {
         offsets.enumerated().allSatisfy { $0.element >= 3.0 * Double($0.offset) - clockSlack }
     }
 
-    /// Extracts, then downloads through `DownloadEngine` with the first media URL broken.
-    static func download(audioExt: String, url: String = videoURL) async -> (file: URL?, error: Error?) {
+    /// Extracts, then downloads through `DownloadEngine`.
+    static func download(audioExt: String) async -> (file: URL?, error: Error?) {
         do {
-            let info = url == videoURL ? try await extract() : try await ExtractorRegistry.extract(url: url, client: HTTPClient())
+            let info = try await extract()
             var settings = Settings()
             settings.embedMetadata = false
             settings.saveThumbnail = false
@@ -425,17 +556,13 @@ struct RegressionChecks {
             options.connections = 1
             options.targetFormat = audioExt
             options.outputDir = AppPaths.appSupportDir.appendingPathComponent("out").path
-            if FixtureProtocol.mode == "section" { options.section = SectionRange(start: 0, end: 4) }
             FixtureProtocol.beginDownload()
-            let file = try await DownloadEngine().downloadSingle(url: url, preExtracted: info, settings: settings, options: options)
+            defer { FixtureProtocol.endDownload() }
+            let file = try await DownloadEngine().downloadSingle(url: videoURL, preExtracted: info, settings: settings, options: options)
             return (file, nil)
         } catch {
             return (nil, error)
         }
-    }
-
-    static func umpPosts() -> [SeenRequest] {
-        FixtureProtocol.requests().filter { $0.url.host == "media.invalid" && $0.method == "POST" }
     }
 
     static func run(_ mode: String) async throws {
@@ -451,11 +578,107 @@ struct RegressionChecks {
             check(paths == Array(steps.prefix(limit)), "the cancelled request was the last request: \(paths)")
         // Bot-gate fail-fast and visitor persistence (controls for the carried feature).
         case "watch-gate":
-            let gated = await isBotGate("Fixture0001")
-            check(gated && FixtureProtocol.playerRequests().isEmpty, "watch-page bot gate stops before any /player request")
+            let error = await extractError()
+            let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
+            check(closedByBotGate(error) && paths == ["/watch"],
+                  "a watch-page bot gate with streaming data stops before visitor and /player; error=\(String(describing: error)), paths=\(paths)")
         case "player-gate":
-            let gated = await isBotGate("Fixture0001")
-            check(gated && FixtureProtocol.playerRequests().count == 1, "first /player bot gate stops further client profiles")
+            let error = await extractError()
+            let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
+            check(closedByBotGate(error) && paths == ["/watch", "/youtubei/v1/player"],
+                  "the first /player bot gate with streaming data stops further profiles, media and HLS; error=\(String(describing: error)), paths=\(paths)")
+
+        // Every listed HTTP status fails closed on each stage, with no later request.
+        case "watch-status":
+            for code in [401, 403, 410, 429, 451] {
+                FixtureProtocol.deny(stage: "watch", status: code)
+                let before = FixtureProtocol.requests().count
+                let error = await extractError()
+                let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
+                check(httpStatus(error) == code && paths == ["/watch"],
+                      "HTTP \(code) on the watch page stops before visitor or player requests; error=\(String(describing: error)), paths=\(paths)")
+            }
+            check(savedOutputs().isEmpty, "watch denials save no output; saved=\(savedOutputs())")
+        case "player-status":
+            for code in [401, 403, 410, 429, 451] {
+                FixtureProtocol.deny(stage: "player", status: code)
+                let before = FixtureProtocol.requests().count
+                let error = await extractError()
+                let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
+                check(httpStatus(error) == code && paths == ["/watch", "/youtubei/v1/player"],
+                      "HTTP \(code) on the first /player stops before another profile, media or HLS; error=\(String(describing: error)), paths=\(paths)")
+            }
+            check(savedOutputs().isEmpty, "player denials save no output; saved=\(savedOutputs())")
+        case "probe-status":
+            for code in [401, 403, 410, 429, 451] {
+                FixtureProtocol.deny(stage: "probe", status: code)
+                let before = FixtureProtocol.requests().count
+                let error = await extractError()
+                let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
+                check(httpStatus(error) == code && paths == ["/watch", "/youtubei/v1/player", "/media"],
+                      "HTTP \(code) on the range probe stops before HLS or download; error=\(String(describing: error)), paths=\(paths)")
+            }
+            check(savedOutputs().isEmpty, "probe denials save no output; saved=\(savedOutputs())")
+        case "download-status":
+            for code in [401, 403, 410, 429, 451] {
+                FixtureProtocol.deny(stage: "download", status: code)
+                await YouTubeExtractor.invalidateCache(for: videoURL)
+                let before = FixtureProtocol.requests().count
+                let beforePlayers = FixtureProtocol.playerCount()
+                let (file, error) = await download(audioExt: "webm")
+                let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
+                let players = FixtureProtocol.playerCount() - beforePlayers
+                check(file == nil && httpStatus(error) == code
+                        && paths == ["/watch", "/youtubei/v1/player", "/media", "/media"] && players == 1,
+                      "HTTP \(code) on the download probe stops without a new player request; error=\(String(describing: error)), paths=\(paths), players=\(players)")
+            }
+            check(savedOutputs().isEmpty, "download denials save no output; saved=\(savedOutputs())")
+        case "download-stream-status":
+            // The probe succeeds and the single-stream GET is refused, so the streaming read must
+            // throw the status too, not re-extract.
+            for code in [401, 403, 410, 429, 451] {
+                FixtureProtocol.deny(stage: "stream", status: code)
+                await YouTubeExtractor.invalidateCache(for: videoURL)
+                let before = FixtureProtocol.requests().count
+                let beforePlayers = FixtureProtocol.playerCount()
+                let (file, error) = await download(audioExt: "webm")
+                let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
+                let players = FixtureProtocol.playerCount() - beforePlayers
+                check(file == nil && httpStatus(error) == code
+                        && paths == ["/watch", "/youtubei/v1/player", "/media", "/media", "/media"] && players == 1,
+                      "HTTP \(code) on the download stream stops without a new player request; error=\(String(describing: error)), paths=\(paths), players=\(players)")
+            }
+            check(savedOutputs().isEmpty, "download stream denials leave no files; saved=\(savedOutputs())")
+
+        // Any explicit non-OK playability status fails closed even with usable streaming data.
+        case "playability-status":
+            for stage in ["watch", "player"] {
+                for code in ["LOGIN_REQUIRED", "UNPLAYABLE", "ERROR"] {
+                    FixtureProtocol.denyPlayability(stage: stage, status: code)
+                    let before = FixtureProtocol.requests().count
+                    let error = await extractError()
+                    let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
+                    let expected = stage == "watch" ? ["/watch"] : ["/watch", "/youtubei/v1/player"]
+                    check(isExtractorError(error) && paths == expected,
+                          "\(code) with streaming data on the \(stage) fails closed; error=\(String(describing: error)), paths=\(paths)")
+                }
+            }
+            check(savedOutputs().isEmpty, "playability denials save no output; saved=\(savedOutputs())")
+
+        // A bot challenge is not recoverable with cookies or streaming data.
+        case "watch-challenge-cookie":
+            let signedIn = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", name: "SAPISID", value: "fixture-only")]))
+            let error = await extractError(signedIn)
+            let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
+            check(closedByBotGate(error) && paths == ["/watch"] && savedOutputs().isEmpty,
+                  "a watch-page bot challenge with a sign-in cookie and streaming data stops before visitor or player requests; error=\(String(describing: error)), paths=\(paths), saved=\(savedOutputs())")
+        case "player-challenge-cookie":
+            let signedIn = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", name: "SAPISID", value: "fixture-only")]))
+            let error = await extractError(signedIn)
+            let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
+            check(closedByBotGate(error) && paths == ["/watch", "/youtubei/v1/player"] && savedOutputs().isEmpty,
+                  "a /player bot challenge with a sign-in cookie and streaming data stops before media or HLS; error=\(String(describing: error)), paths=\(paths), saved=\(savedOutputs())")
+
         case "visitor-first", "visitor-reuse":
             // run.sh runs these two in order with one shared config directory.
             _ = try await extract()
@@ -477,9 +700,27 @@ struct RegressionChecks {
                   "concurrent /player requests keep slots 3 s apart; offsets from the start=\(offsets)")
         case "pace-retry":
             let start = now()
-            let gated = await isBotGate("Fixture0001")
+            let error = await extractError()
             let offsets = playerOffsets(from: start)
-            check(gated && offsets.count == 2 && keepsSlots(offsets), "the retry after HTTP 429 waits for the next 3 s slot; offsets from the start=\(offsets)")
+            check(closedByBotGate(error) && offsets.count == 2 && keepsSlots(offsets),
+                  "the retry after HTTP 503 waits for the next 3 s slot; error=\(String(describing: error)), offsets from the start=\(offsets)")
+        case "retry-5xx":
+            let before = FixtureProtocol.requests().count
+            let (data, _) = try await HTTPClient().fetchData(url: "https://fixture.invalid/retry-status", retries: 3)
+            let attempts = FixtureProtocol.requests().count - before
+            check(data == Data("retried".utf8) && attempts == 3,
+                  "HTTP 500 and then 503 are retried; attempts=\(attempts), data=\(String(decoding: data, as: UTF8.self))")
+        case "retry-429":
+            let before = FixtureProtocol.requests().count
+            var status = 0
+            do {
+                _ = try await HTTPClient().fetchData(url: "https://fixture.invalid/retry-status", retries: 3)
+            } catch HTTPError.status(let code, _) {
+                status = code
+            }
+            let attempts = FixtureProtocol.requests().count - before
+            check(status == 429 && attempts == 1,
+                  "HTTP 429 is not retried; status=\(status), attempts=\(attempts)")
         case "cancel-slots":
             // A waiter that is cancelled gives its slot back when nobody queued behind it.
             let pacer = YouTubeExtractor.YTGuard()
@@ -540,9 +781,8 @@ struct RegressionChecks {
             check(offsets.count == 4 && offsets[1] > 6 && gaps.allSatisfy { $0 >= 2.5 },
                   "late waiters observe separate pacing permits; return offsets=\(offsets), gaps=\(gaps)")
         case "wall-unusable-cookie":
-            // An expired or empty SAPISID is never sent, so it must not keep extraction going. Nor
-            // must a nonempty root SAPISID that an empty /youtubei SAPISID shadows: the request
-            // sends the cookie with the longer path.
+            // The bot wall is terminal for every cookie form: an expired or empty SAPISID, or a
+            // nonempty root SAPISID that an empty /youtubei SAPISID shadows.
             let expired = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", expires: 1, name: "SAPISID", value: "fixture-only")]))
             let empty = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", name: "SAPISID", value: "")]))
             let shadowed = HTTPClient(cookies: CookieVault(entries: [
@@ -551,20 +791,14 @@ struct RegressionChecks {
             ]))
             var stopped = 0
             for client in [expired, empty, shadowed] {
-                do { _ = try await extract(client: client) } catch ExtractorError.botGate { stopped += 1 }
+                let error = await extractError(client)
+                if closedByBotGate(error) { stopped += 1 }
             }
             let players = FixtureProtocol.playerRequests().count
-            check(stopped == 3 && players == 0, "an expired, empty or shadowed sign-in cookie stops at the watch-page wall; stopped=\(stopped), player requests=\(players)")
-        case "signed-in-wall":
-            // Review of PR #1: a bot wall for the anonymous profiles must not stop the profile
-            // that sends the user's sign-in cookies.
-            let signedIn = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", name: "SAPISID", value: "fixture-only")]))
-            let info = try await extract(client: signedIn)
-            let players = FixtureProtocol.playerRequests().count
-            check(!info.formats.isEmpty && players == 2,
-                  "after the wall only the cookie profile is tried, and it succeeds; player requests=\(players)")
+            check(stopped == 3 && players == 0,
+                  "an expired, empty or shadowed sign-in cookie still stops at the watch-page wall; stopped=\(stopped), player requests=\(players)")
         case "auth-header":
-            // The fixture refuses every odd /player request without the bot wall, so each
+            // The fixture answers every odd /player request with an ordinary empty result, so each
             // extraction asks two client profiles. Only a usable SAPISID may be sent as SAPISIDHASH.
             let expired = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", expires: 1, name: "SAPISID", value: "fixture-only")]))
             let valid = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", name: "SAPISID", value: "fixture-only")]))
@@ -639,29 +873,23 @@ struct RegressionChecks {
                 check(error is CancellationError, "a cancelled extraction throws CancellationError; got \(error)")
             }
 
-        // Report 1 #2, #3, #6: which download errors reach UMP, and stale-link refresh.
+        // A valid direct download still works, and the watch request makes no verification claim.
         case "normal":
             let (file, error) = await download(audioExt: "webm")
             let bytes = file.flatMap { try? Data(contentsOf: $0) }
-            check(error == nil && bytes == FixtureProtocol.mediaBytes && umpPosts().isEmpty,
-                  "a working lsig URL downloads over plain HTTP without UMP; error=\(String(describing: error))")
-        case "stale":
+            check(error == nil && bytes == FixtureProtocol.mediaBytes,
+                  "a working direct URL downloads over plain HTTP; error=\(String(describing: error))")
+        case "watch-flags":
+            _ = try await extract()
+            let names = watchQueryNames()
+            check(!names.contains("has_verified"),
+                  "the watch request sends no unconfirmed verification flag; query flags=\(names)")
+        case "cancel-download":
             let (file, error) = await download(audioExt: "webm")
-            let bytes = file.flatMap { try? Data(contentsOf: $0) }
-            let players = FixtureProtocol.playerRequests().count
-            check(error == nil && bytes == FixtureProtocol.mediaBytes && players == 2 && umpPosts().count == 1,
-                  "403 on HTTP and UMP re-extracts and downloads the fresh URL; players=\(players), umpPosts=\(umpPosts().count), error=\(String(describing: error))")
-        case "stale-embed":
-            // The user entered a page that embeds the video, so its URL holds no video ID.
-            let (file, error) = await download(audioExt: "webm", url: "https://embed.invalid/page")
-            let bytes = file.flatMap { try? Data(contentsOf: $0) }
-            let players = FixtureProtocol.playerRequests().count
-            check(error == nil && bytes == FixtureProtocol.mediaBytes && players == 2,
-                  "a stale URL from an embedded video is refreshed; players=\(players), error=\(String(describing: error))")
-        case "section":
-            _ = await download(audioExt: "m4a")
-            let sidxRefused = FixtureProtocol.requests().contains { $0.url.host == "media.invalid" && $0.method == "GET" && $0.status == 403 }
-            check(sidxRefused && !umpPosts().isEmpty, "a refused sidx section request reaches the UMP fallback; umpPosts=\(umpPosts().count)")
+            let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
+            check((error as? URLError)?.code == .cancelled && file == nil && finalOutputs().isEmpty
+                    && paths == ["/watch", "/youtubei/v1/player", "/media", "/media"],
+                  "transport cancellation stops the download, makes no later request and saves no final output; error=\(String(describing: error)), paths=\(paths), saved=\(finalOutputs())")
         case "hls-section-base":
             // The saved HLS timeline starts at 0, so the engine must know where the first kept
             // segment starts in the stream, or the trim cuts the wrong seconds.
@@ -769,10 +997,9 @@ struct RegressionChecks {
             let expected = overHLS ? "/seg-4.ts/seg-5.ts/seg-6.ts" : "/seg-whole.mp3"
             check(saved == expected, "raw MP3 is not trimmed: HTTP saves the file and HLS saves the selected segments, including preroll; saved=\(saved), expected=\(expected)")
         case "hls-fallback", "hls-fallback-nowatch", "hls-fallback-watchlist", "hls-fallback-lateprofile":
-            // Every range test fails. The HLS fallback needs player data (from the watch page, or from
-            // a /player response that names a playlist and has no direct format) and a playlist (from
-            // any /player response or from the watch page). Only hls-fallback-nowatch lacks player
-            // data, so only it fails. No mode tries UMP.
+            // The fallback uses an ordinary empty format list or a not-found direct format, never a
+            // denial. Player data and a playlist can come from the watch page or a /player response.
+            // Only hls-fallback-nowatch has neither, so only it fails.
             var formats: [String] = []
             var failure = ""
             do {
@@ -780,11 +1007,16 @@ struct RegressionChecks {
             } catch ExtractorError.notFound(let message) {
                 failure = message
             }
-            let ok = FixtureProtocol.mode == "hls-fallback-nowatch"
-                ? formats.isEmpty && failure.contains("player request failed")
+            let missing = FixtureProtocol.requests().filter { $0.url.path == "/missing" }
+            let denied = FixtureProtocol.requests().filter {
+                $0.url.path == "/media" && [401, 403, 410, 429, 451].contains($0.status)
+            }
+            let ok = mode == "hls-fallback-nowatch"
+                ? formats.isEmpty && !failure.isEmpty && missing.isEmpty && denied.isEmpty
                 : !formats.isEmpty && formats.allSatisfy { $0.hasSuffix(":hls") } && failure.isEmpty
-            check(ok && umpPosts().isEmpty,
-                  "after every range test fails, the HLS playlist is used when there is player data and a playlist; formats=\(formats), failure=\(failure), umpPosts=\(umpPosts().count)")
+                    && denied.isEmpty && (mode != "hls-fallback-lateprofile" || missing.count == 1)
+            check(ok,
+                  "the HLS playlist is used after an ordinary empty or not-found miss, never a denial; formats=\(formats), failure=\(failure), missing=\(missing.count), denied=\(denied.map(\.status))")
         case "hls-ntsc":
             let url = "https://media.invalid/clip.m3u8"
             let dest = AppPaths.appSupportDir.appendingPathComponent("unexpected.mp4")
@@ -853,6 +1085,33 @@ struct RegressionChecks {
                 let fetched = FixtureProtocol.requests().dropFirst(before).map(\.url.path).filter { $0.hasSuffix(".m4s") }
                 check(samples == expected && fetched == parts, "section \(start)-\(end): samples=\(samples), parts=\(fetched)")
             }
+        case "parallel-cancel", "parallel-short", "parallel-intact":
+            let file = AppPaths.appSupportDir.appendingPathComponent("result.bin")
+            var failure: Error?
+            do {
+                try await HTTPClient().downloadFile(url: "https://media.invalid/parallel.bin", destination: file, connections: 2)
+            } catch { failure = error }
+            let ranges = FixtureProtocol.requests().filter { $0.url.path == "/parallel.bin" && $0.range != "bytes=0-0" }.compactMap(\.range)
+            let saved = try? Data(contentsOf: file)
+            switch mode {
+            case "parallel-intact": check(failure == nil && saved == FixtureProtocol.parallelBytes, "all source bytes are present")
+            case "parallel-cancel": check((failure as? URLError)?.code == .cancelled && saved == nil && !ranges.isEmpty && Set(ranges).count == ranges.count, "a cancelled range is not retried: \(ranges)")
+            default: check(failure != nil && saved == nil && !ranges.isEmpty, "a short range cannot publish a preallocated file")
+            }
+        case "dash-refusal":
+            let dir = AppPaths.appSupportDir.appendingPathComponent("out")
+            let file = dir.appendingPathComponent("video.mp4")
+            func transfer(_ folder: String) async throws {
+                try await DASHEngine.downloadRepresentation(client: HTTPClient(), mpdURL: "https://segments.invalid/\(folder)/clip.mpd", formatID: "dash-v", destination: file, connections: 1)
+            }
+            do { try await transfer("denied"); check(false, "DASH accepted a denied segment") }
+            catch HTTPError.status(403, _) {}
+            let afterFailure = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            let requests = FixtureProtocol.requests().filter { $0.url.host == "segments.invalid" }.map(\.url.path)
+            check(afterFailure.isEmpty && requests == ["/denied/clip.mpd", "/denied/piece-1.m4s", "/denied/piece-2.m4s"], "DASH stops at the denied segment without leaving output: \(requests), \(afterFailure)")
+            try await transfer("allowed")
+            let bytes = try Data(contentsOf: file)
+            check(String(decoding: bytes, as: UTF8.self) == "/allowed/piece-1.m4s/allowed/piece-2.m4s/allowed/piece-3.m4s", "a later operation assembles only its own three segments")
         case "sidx-cut":
             var settings = Settings()
             settings.embedMetadata = false
@@ -873,69 +1132,6 @@ struct RegressionChecks {
             }
             let files = (try? FileManager.default.contentsOfDirectory(atPath: out.path)) ?? []
             check(files.isEmpty, "a short indexed file is not saved, including after a full download with an unknown initial size")
-        case "cancel-in-fallback":
-            let (file, error) = await download(audioExt: "webm")
-            let players = FixtureProtocol.playerRequests().count
-            let posts = umpPosts().count
-            check((error as? URLError)?.code == .cancelled && file == nil && players == 1 && posts == 1,
-                  "transport cancellation stops the download; players=\(players), attempts=\(posts), error=\(String(describing: error))")
-        case "non-http-error":
-            let (_, error) = await download(audioExt: "webm")
-            check((error as? URLError)?.code == .cancelled && umpPosts().isEmpty,
-                  "a non-HTTP error propagates without UMP; error=\(String(describing: error)), umpPosts=\(umpPosts().count)")
-        case "ump-cut":
-            // Review of PR #1: a UMP stream cut between complete fragments is not a finished file.
-            let (file, error) = await download(audioExt: "webm")
-            let bytes = file.flatMap { try? Data(contentsOf: $0) }
-            let players = FixtureProtocol.playerRequests().count
-            check(error == nil && bytes == FixtureProtocol.mediaBytes && players == 2,
-                  "a short UMP stream is refused and the fresh URL is downloaded; players=\(players), savedBytes=\(bytes?.count ?? -1), error=\(String(describing: error))")
-        case "ump-unknown-length":
-            // Without an advertised length, nothing shows that a UMP stream is complete.
-            let (file, error) = await download(audioExt: "webm")
-            let bytes = file.flatMap { try? Data(contentsOf: $0) }
-            let players = FixtureProtocol.playerRequests().count
-            check(error == nil && bytes == FixtureProtocol.mediaBytes && players == 2 && umpPosts().isEmpty,
-                  "UMP is not tried without a content length and the fresh URL is downloaded; players=\(players), umpPosts=\(umpPosts().count), savedBytes=\(bytes?.count ?? -1)")
-        case "ump-complete":
-            let (file, error) = await download(audioExt: "webm")
-            let bytes = file.flatMap { try? Data(contentsOf: $0) }
-            let outDir = AppPaths.appSupportDir.appendingPathComponent("out")
-            let leftovers = ((try? FileManager.default.contentsOfDirectory(atPath: outDir.path)) ?? []).filter { $0.hasSuffix(".part") || $0.hasSuffix(".part.json") }
-            check(error == nil && bytes == Data(Bytes.cutStream) && leftovers.isEmpty,
-                  "a complete UMP stream is saved and no resume file is left; leftovers=\(leftovers), error=\(String(describing: error))")
-        case "ump-cold":
-            // Documented boundary: extraction tests byte ranges on one format of each client profile.
-            // When every range request is refused from the start and no profile gives an HLS
-            // playlist, extraction fails without UMP.
-            let info = try? await extract()
-            check((info?.formats.isEmpty ?? true) && umpPosts().isEmpty,
-                  "refused range probes end extraction without UMP; formats=\(info?.formats.count ?? 0), umpPosts=\(umpPosts().count)")
-
-        // Report 1 #4 / report 2 #2, #1, #3: UMP parsing.
-        case "ump-redirect":
-            let short = "https://redirect.invalid/media?token=" + String(repeating: "s", count: 10)
-            let long = "https://redirect.invalid/media?token=" + String(repeating: "x", count: 250)
-            let shortOK = UMP.redirectURL(in: Bytes.redirectPart(short)) == short
-            let longGot = UMP.redirectURL(in: Bytes.redirectPart(long))
-            let afterScalar = UMP.redirectURL(in: Bytes.redirectPart(short, prefix: [0x10, 0x01]))
-            check(shortOK && longGot == long && afterScalar == short,
-                  "redirect URLs decode with protobuf lengths; long=\(longGot?.utf8.count ?? 0)/\(long.utf8.count), afterScalar=\(afterScalar != nil)")
-        case "ump-oversized-box":
-            let media = Bytes.be32(1) + Array("ftyp".utf8) + [UInt8](repeating: 0xff, count: 8)
-            check(UMP.assembleMP4(from: Bytes.umpPart(21, [0] + media)) == nil, "a 64-bit box size past the data is rejected without a trap")
-        case "ump-truncated":
-            let complete = Bytes.ftyp + Bytes.be32(12) + Array("mdat".utf8) + [1, 2, 3, 4]
-            let truncated = Bytes.ftyp + Bytes.be32(100) + Array("mdat".utf8) + [1, 2, 3, 4]
-            let whole = UMP.assembleMP4(from: Bytes.umpPart(21, [0] + complete))
-            let partial = UMP.assembleMP4(from: Bytes.umpPart(21, [0] + truncated))
-            check(whole == Data(complete) && partial == nil,
-                  "a complete MP4 is returned and a truncated one is rejected; partialBytes=\(partial?.count ?? 0)")
-        case "ump-mixed-streams":
-            let complete = Bytes.ftyp + Bytes.be32(12) + Array("mdat".utf8) + [1, 2, 3, 4]
-            let mixed = Bytes.umpPart(21, [0] + complete) + Bytes.umpPart(21, [1] + Bytes.be32(12) + Array("mdat".utf8) + [5, 6, 7, 8])
-            check(UMP.assembleMP4(from: mixed) == nil, "media parts with two header IDs are not merged into one file")
-
         // Review of PR #1: CLI arguments must not turn into a different target.
         case "cli-flags":
             let unknown = await CLIRunner.run(arguments: ["ubit", "info", "--bogus", "value", "https://fixture.invalid/video"])

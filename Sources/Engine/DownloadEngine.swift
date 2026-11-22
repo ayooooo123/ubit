@@ -231,7 +231,7 @@ public final class DownloadEngine: @unchecked Sendable {
             info.title = customTitle
         }
 
-        var selected = try FormatSelector.select(from: info.formats, options: options)
+        let selected = try FormatSelector.select(from: info.formats, options: options)
         let isAudioOut = options.audioOnly || (selected.video == nil)
         let targetExt: String
         if let tf = options.targetFormat, !tf.isEmpty {
@@ -276,16 +276,11 @@ public final class DownloadEngine: @unchecked Sendable {
             duration: info.duration
         ))
 
-        // Work files inside ~/Library/Application Support/uBit/work/<hash>
-        let workID = String(UUID().uuidString.prefix(12)).lowercased()
+        // Resumable HTTP transfers live beside the destination, not in this private directory.
+        let workID = UUID().uuidString
         let itemWorkDir = AppPaths.workDir.appendingPathComponent(workID, isDirectory: true)
         try FileManager.default.createDirectory(at: itemWorkDir, withIntermediateDirectories: true)
-        defer {
-            // Clean up temp work dir on success (keep .part in destination parent when interrupted for HTTP resume!)
-            if FileManager.default.fileExists(atPath: finalURL.path) {
-                try? FileManager.default.removeItem(at: itemWorkDir)
-            }
-        }
+        defer { try? FileManager.default.removeItem(at: itemWorkDir) }
 
         let vTemp = finalURL.deletingLastPathComponent().appendingPathComponent(".\(finalURL.deletingPathExtension().lastPathComponent).v.\(selected.video?.ext ?? "mp4")")
         let aTemp = finalURL.deletingLastPathComponent().appendingPathComponent(".\(finalURL.deletingPathExtension().lastPathComponent).a.\(selected.audio?.ext ?? "m4a")")
@@ -295,42 +290,12 @@ public final class DownloadEngine: @unchecked Sendable {
         let aEstSize = selected.audio?.filesize ?? 0
         let combinedEst = vEstSize + aEstSize
 
-        // Helper that downloads one MediaFormat (with stale-URL refresh on 403/410!)
         var videoSectionBaseSec: Double = 0
         var audioSectionBaseSec: Double = 0
         var videoIsTS = false
         var audioIsTS = false
 
-        func fetchStream(_ fmt: MediaFormat, to dest: URL, priorBytes: Int64, isVideoRole: Bool) async throws -> (baseSec: Double, isTS: Bool) {
-            var currentFmt = fmt
-            var blockedFormatIDs = Set<String>()
-            for refreshAttempt in 0..<3 {
-                do {
-                    return try await fetchStreamOnce(currentFmt, to: dest, priorBytes: priorBytes, isVideoRole: isVideoRole)
-                } catch HTTPError.staleLink {
-                    guard refreshAttempt < 2 else { throw HTTPError.staleLink(403) }
-                    if refreshAttempt == 1 {
-                        blockedFormatIDs.insert(currentFmt.id)
-                        try? FileManager.default.removeItem(at: dest.appendingPathExtension("part"))
-                        try? FileManager.default.removeItem(at: dest.appendingPathExtension("part.json"))
-                    }
-                    await YouTubeExtractor.invalidateCache(for: info.webpageURL)
-                    let freshInfo = try await ExtractorRegistry.extract(url: url, client: client)
-                    let remaining = freshInfo.formats.filter { !blockedFormatIDs.contains($0.id) }
-                    let candidatePool = remaining.isEmpty ? freshInfo.formats : remaining
-                    let freshSel = try FormatSelector.select(from: candidatePool, options: options)
-                    if let updated = isVideoRole ? freshSel.video : (freshSel.audio ?? freshSel.video) {
-                        currentFmt = updated
-                        selected = freshSel
-                        continue
-                    }
-                    throw HTTPError.staleLink(403)
-                }
-            }
-            return (0, false)
-        }
-
-        func fetchStreamOnce(_ fmt: MediaFormat, to dest: URL, priorBytes: Int64, isVideoRole: Bool) async throws -> (baseSec: Double, isTS: Bool) {
+        func fetchStream(_ fmt: MediaFormat, to dest: URL, priorBytes: Int64) async throws -> (baseSec: Double, isTS: Bool) {
             var mergedHeaders = fmt.headers ?? [:]
             if let ref = options.referer, mergedHeaders["Referer"] == nil { mergedHeaders["Referer"] = ref }
 
@@ -382,67 +347,40 @@ public final class DownloadEngine: @unchecked Sendable {
                 return (0, false)
 
             case .http:
-                do {
-                    var lastIndexedByte: Int64?
-                    let isMP4Section = options.section != nil && (fmt.ext == "mp4" || fmt.ext == "m4a")
-                    if isMP4Section, let sec = options.section {
-                        switch try await tryDownloadSectionViaSidx(client: client, fmt: fmt, headers: mergedHeaders, section: sec, destination: dest) {
-                        case .downloaded(let start): return (start, false)
-                        case .wholeFile(let last): lastIndexedByte = last
-                        }
+                var lastIndexedByte: Int64?
+                let isMP4Section = options.section != nil && (fmt.ext == "mp4" || fmt.ext == "m4a")
+                if isMP4Section, let sec = options.section {
+                    switch try await tryDownloadSectionViaSidx(client: client, fmt: fmt, headers: mergedHeaders, section: sec, destination: dest) {
+                    case .downloaded(let start): return (start, false)
+                    case .wholeFile(let last): lastIndexedByte = last
                     }
-                    try await client.downloadFile(
-                        url: fmt.url,
-                        destination: dest,
-                        headers: mergedHeaders,
-                        knownSize: fmt.filesize,
-                        connections: options.connections
-                    ) { done, streamTotal in
-                        Task {
-                            let grandDone = priorBytes + done
-                            let grandTotal = combinedEst > 0 ? combinedEst : (priorBytes + streamTotal)
-                            let frac = grandTotal > 0 ? min(1.0, Double(grandDone) / Double(grandTotal)) : 0
-                            let upd = await meter.update(downloaded: grandDone, total: grandTotal)
-                            if upd.shouldEmit {
-                                onEvent?(.progress(fraction: frac, downloaded: grandDone, total: grandTotal, speed: upd.speed, eta: upd.eta, recordedSeconds: nil))
-                            }
-                        }
-                    }
-                    if isMP4Section {
-                        do {
-                            try MP4Muxer.checkFullFileIndexes(at: dest, lastProbedByte: lastIndexedByte)
-                        } catch {
-                            try? FileManager.default.removeItem(at: dest)
-                            throw error
-                        }
-                    }
-                    return (0, false)
-                } catch {
-                    // Only an HTTP 403/410 refusal (from the sidx probe or the full download) is
-                    // handled here; cancellation and every other error propagate unchanged.
-                    guard let refusal = Self.refusalStatus(of: error) else { throw error }
-                    // SABR-only (`lsig`) URLs refuse ranged GETs but may still stream over UMP. If UMP
-                    // fails too, or the URL is not SABR-only, report a stale link so fetchStream
-                    // invalidates the metadata cache and extracts a fresh URL.
-                    guard fmt.url.contains("lsig=") else { throw HTTPError.staleLink(refusal) }
-                    // UMP always fetches the whole stream; with --section, the mux step trims it.
-                    let ua = mergedHeaders["User-Agent"] ?? HTTPClient.defaultBrowserUA
-                    let mp4: Data
-                    do {
-                        mp4 = try await UMP.pull(mediaURL: fmt.url, userAgent: ua, expectedSize: fmt.filesize, client: client)
-                    } catch is CancellationError {
-                        throw CancellationError()
-                    } catch let error as URLError where error.code == .cancelled {
-                        throw error
-                    } catch {
-                        throw HTTPError.staleLink(refusal)
-                    }
-                    try mp4.write(to: dest)
-                    // A refused ranged download can leave its resume files behind.
-                    try? FileManager.default.removeItem(at: dest.appendingPathExtension("part"))
-                    try? FileManager.default.removeItem(at: dest.appendingPathExtension("part.json"))
-                    return (0, false)
                 }
+                try await client.downloadFile(
+                    url: fmt.url,
+                    destination: dest,
+                    headers: mergedHeaders,
+                    knownSize: fmt.filesize,
+                    connections: options.connections
+                ) { done, streamTotal in
+                    Task {
+                        let grandDone = priorBytes + done
+                        let grandTotal = combinedEst > 0 ? combinedEst : (priorBytes + streamTotal)
+                        let frac = grandTotal > 0 ? min(1.0, Double(grandDone) / Double(grandTotal)) : 0
+                        let upd = await meter.update(downloaded: grandDone, total: grandTotal)
+                        if upd.shouldEmit {
+                            onEvent?(.progress(fraction: frac, downloaded: grandDone, total: grandTotal, speed: upd.speed, eta: upd.eta, recordedSeconds: nil))
+                        }
+                    }
+                }
+                if isMP4Section {
+                    do {
+                        try MP4Muxer.checkFullFileIndexes(at: dest, lastProbedByte: lastIndexedByte)
+                    } catch {
+                        try? FileManager.default.removeItem(at: dest)
+                        throw error
+                    }
+                }
+                return (0, false)
             }
         }
 
@@ -455,7 +393,7 @@ public final class DownloadEngine: @unchecked Sendable {
         }
         var vActualBytes: Int64 = 0
         if let vFmt = selected.video {
-            let res = try await fetchStream(vFmt, to: vTemp, priorBytes: 0, isVideoRole: true)
+            let res = try await fetchStream(vFmt, to: vTemp, priorBytes: 0)
             hasVFile = true
             videoSectionBaseSec = res.baseSec
             videoIsTS = res.isTS
@@ -464,14 +402,14 @@ public final class DownloadEngine: @unchecked Sendable {
             // If HLS stream had a separate #EXT-X-MEDIA audio rendition URL and no separate audio format was picked:
             if selected.audio == nil, let hlsAudioURL = vFmt.audioTrackURL {
                 let synthAudio = MediaFormat(id: "hls-audio", url: hlsAudioURL, ext: "m4a", proto: .hls, vcodec: "none", acodec: "mp4a", headers: vFmt.headers)
-                let aRes = try await fetchStream(synthAudio, to: aTemp, priorBytes: vActualBytes, isVideoRole: false)
+                let aRes = try await fetchStream(synthAudio, to: aTemp, priorBytes: vActualBytes)
                 hasAFile = true
                 audioSectionBaseSec = aRes.baseSec
                 audioIsTS = aRes.isTS
             }
         }
         if let aFmt = selected.audio {
-            let res = try await fetchStream(aFmt, to: aTemp, priorBytes: vActualBytes, isVideoRole: false)
+            let res = try await fetchStream(aFmt, to: aTemp, priorBytes: vActualBytes)
             hasAFile = true
             audioSectionBaseSec = res.baseSec
             audioIsTS = res.isTS
@@ -649,19 +587,6 @@ public final class DownloadEngine: @unchecked Sendable {
         let elapsed = ProcessInfo.processInfo.systemUptime - startedTime
         onEvent?(.done(path: finalURL.path, size: finalSize, seconds: elapsed))
         return finalURL
-    }
-
-    /// The HTTP status when `error` is a server refusal of the media URL (403 or 410), else nil.
-    /// `fetchData` reports these as `.status`; the probe and ranged workers report `.staleLink`.
-    private static func refusalStatus(of error: Error) -> Int? {
-        switch error {
-        case HTTPError.staleLink(let code):
-            return code
-        case HTTPError.status(let code, _) where code == 403 || code == 410:
-            return code
-        default:
-            return nil
-        }
     }
 
     private enum IndexedSection {

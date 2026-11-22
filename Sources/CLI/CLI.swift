@@ -847,7 +847,7 @@ public enum CLIRunner {
           -i, --input FILE              Read URLs one per line (- reads stdin)
               --playlist / --no-playlist
               --items 1,3,5-7           Select specific playlist items
-              --section 1:00-2:30       Clip on keyframes (MP4/M4A output; raw audio, WebM untrimmed)
+              --section 1:00-2:30       Trim native MP4 tracks before conversion; raw audio and WebM bypass trimming
               --sponsors-remove CATS    Excise SponsorBlock segments (default, all, or list)
               --sponsors-mark CATS      Mark SponsorBlock segments as MP4 chapters
               --keep-sponsors           Keep sponsors regardless of settings
@@ -897,7 +897,7 @@ public enum CLIRunner {
           - `{"event":"stopped","url":"..."}`
         - `--quiet` — Suppress progress bars; print ONLY saved absolute file paths to stdout (ideal for command substitution `FILE=$(ubit get --quiet ...)`).
         - `--no-library` — Ephemeral run; do not append agent scratch downloads to the user's GUI library.
-        - `--section START-END` — Trim MP4/M4A output on the preceding sync keyframe (e.g. `0:30-1:15` or `90-135`). For indexed MP4/M4A, uBit reads the start of the file, including the initialization data and index (64 KiB if the index position is unknown), then requests the overlapping media bytes. Servers that ignore ranges can send the whole file each time. Without a usable index, for DASH, or after a YouTube UMP fallback, the transfer can include the whole stream.
+        - `--section START-END` — Trim tracks on the native MP4 path before output conversion (e.g. `0:30-1:15` or `90-135`). Video starts on the preceding sync keyframe. For indexed MP4/M4A, uBit reads the initialization data and index (64 KiB if the index position is unknown), then requests overlapping media bytes. A server that ignores ranges can send the whole file each time. Without a usable index, for DASH, or after a YouTube UMP fallback, the transfer can include the whole stream.
         - HLS sections need positive overlap with at least one segment. At an exact start boundary, uBit also keeps the previous segment for preroll, if present. A section starting at or beyond the playlist end fails. WebM and raw MP3, Opus, FLAC or WAV are not trimmed: uBit saves the entire file over plain HTTP or the selected segments over HLS.
         - YouTube extraction tests one direct format per tried profile and keeps the first profile that passes. Without a direct format, HLS requires player data from the watch page or from a profile that named a playlist without direct formats. The first playlist URL named by a tried profile takes precedence. The watch-page URL is used only if no profile named one, not when the profile URL is unreadable. YouTube video extraction rejects raw Cookie headers before the first request, even with an empty cookie vault.
         - `-a --to wav` — Extract 16-bit 44.1 kHz stereo PCM `.wav` natively via macOS AudioToolbox (zero FFmpeg) for ASR/transcription pipelines.

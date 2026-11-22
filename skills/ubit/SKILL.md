@@ -48,7 +48,7 @@ ubit get -q 720 --no-library --json -o /tmp/ubit-out "<url>"
 
 A short clip does not guarantee a small transfer. For indexed MP4/M4A, `ubit` requests the start of the file to read the index (64 KiB if its position is unknown), then requests the overlapping media bytes. A server that ignores byte ranges can send the whole file each time. Without a usable index, for DASH, or after a YouTube UMP fallback, the transfer can include the whole stream.
 
-For HLS, `ubit` fetches segments with media inside the section. If the section starts on a segment boundary, it also keeps the previous segment for preroll, if present. A section starting at or after the end of the playlist fails. MP4/M4A output is trimmed on the preceding sync keyframe. WebM and raw MP3, Opus, FLAC or WAV are not trimmed: `ubit` saves the whole file over plain HTTP or the selected segments over HLS.
+For HLS, `ubit` fetches segments with media inside the section. If the section starts on a segment boundary, it also keeps the previous segment for preroll, if present. A section starting at or after the end of the playlist fails. On the native MP4 path, `ubit` trims tracks before output conversion; video starts on the preceding sync keyframe. WebM and raw MP3, Opus, FLAC or WAV input bypass the trimmer, regardless of the output extension. Over plain HTTP the converter receives the whole file; over HLS it receives the selected segments.
 
 ```sh
 ubit get -q 720 --section 1:30-2:00 --no-library --quiet -o /tmp/ubit-out "<url>"

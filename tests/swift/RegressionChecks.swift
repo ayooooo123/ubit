@@ -201,7 +201,7 @@ final class FixtureProtocol: URLProtocol {
             data = Data(Bytes.clipInit(sampleTicks: mode == "hls-decimal" ? 200 : 1000))
         case ("media.invalid", let path) where path.hasPrefix("/clip-"):
             data = Data(Bytes.clipSegment(Int(path.dropFirst(6).dropLast(4)) ?? 0))
-        case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4"].contains(path):
+        case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4", "/cut-unknown.mp4"].contains(path):
             var bytes = mode == "sidx-fragments" ? Bytes.fragmentIndexedClip : Bytes.indexedClip
             if path.hasPrefix("/cut-") { bytes.removeLast(13 * Bytes.clipSegment(0).count) }
             if path != "/cut-200.mp4", let range, let dash = range.firstIndex(of: "-"),
@@ -209,7 +209,8 @@ final class FixtureProtocol: URLProtocol {
                let end = Int(range[range.index(after: dash)...]), start < bytes.count {
                 let last = min(end, bytes.count - 1)
                 status = 206
-                headers["Content-Range"] = "bytes \(start)-\(last)/\(bytes.count)"
+                let total = path == "/cut-unknown.mp4" && range == "bytes=0-65535" ? "*" : String(bytes.count)
+                headers["Content-Range"] = "bytes \(start)-\(last)/\(total)"
                 data = Data(bytes[start...last])
             } else { data = Data(bytes) }
         default:
@@ -326,9 +327,11 @@ enum Bytes {
 
     static let indexedClip: [UInt8] = {
         let segments = (0..<15).map(clipSegment)
-        var index = be32(0) + be32(1) + be32(1000) + be32(0) + be32(0) + be32(UInt32(segments.count))
+        // Place the media after the initial 64 KiB probe, as in a larger real file.
+        let padding = box("free", [UInt8](repeating: 0, count: 65_536))
+        var index = be32(0) + be32(1) + be32(1000) + be32(0) + be32(UInt32(padding.count)) + be32(UInt32(segments.count))
         for segment in segments { index += be32(UInt32(segment.count)) + be32(4000) + be32(0) }
-        return clipInit(sampleTicks: 1000) + box("sidx", index) + segments.flatMap { $0 }
+        return clipInit(sampleTicks: 1000) + box("sidx", index) + padding + segments.flatMap { $0 }
     }()
 
     static let fragmentIndexedClip: [UInt8] = {
@@ -808,19 +811,20 @@ struct RegressionChecks {
             settings.embedMetadata = false
             settings.saveThumbnail = false
             var options = DownloadRequestOptions()
-            options.section = SectionRange(start: 4, end: 10)
+            let start = 4.0
             options.connections = 1
             options.cookieSource = "none"
             let out = AppPaths.appSupportDir.appendingPathComponent("out")
             options.outputDir = out.path
-            for status in [200, 206] {
+            for (status, end) in [("200", 10.0), ("206", 10.0), ("unknown", 61.0)] {
+                options.section = SectionRange(start: start, end: end)
                 do {
                     _ = try await DownloadEngine().downloadSingle(url: "https://media.invalid/cut-\(status).mp4", settings: settings, options: options)
                     check(false, "a file cut between indexed fragments produced a clip")
                 } catch HTTPError.rangeUnsupported {}
             }
-            let files = ((try? FileManager.default.contentsOfDirectory(atPath: out.path)) ?? []).filter { !$0.hasPrefix(".") }
-            check(files.isEmpty, "a short indexed media interval from a 200 or 206 response produces no clip")
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: out.path)) ?? []
+            check(files.isEmpty, "a short indexed file is not saved, including after a full download with an unknown initial size")
         case "cancel-in-fallback":
             let (file, error) = await download(audioExt: "webm")
             let players = FixtureProtocol.playerRequests().count

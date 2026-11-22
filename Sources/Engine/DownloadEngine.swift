@@ -383,10 +383,12 @@ public final class DownloadEngine: @unchecked Sendable {
 
             case .http:
                 do {
-                    // Fast sidx byte-range section download when --section is requested!
-                    if let sec = options.section, fmt.ext == "mp4" || fmt.ext == "m4a",
-                       let baseStart = try await tryDownloadSectionViaSidx(client: client, fmt: fmt, headers: mergedHeaders, section: sec, destination: dest) {
-                        return (baseStart, false)
+                    var lastIndexedByte: Int64?
+                    if let sec = options.section, fmt.ext == "mp4" || fmt.ext == "m4a" {
+                        switch try await tryDownloadSectionViaSidx(client: client, fmt: fmt, headers: mergedHeaders, section: sec, destination: dest) {
+                        case .downloaded(let start): return (start, false)
+                        case .wholeFile(let last): lastIndexedByte = last
+                        }
                     }
                     try await client.downloadFile(
                         url: fmt.url,
@@ -403,6 +405,13 @@ public final class DownloadEngine: @unchecked Sendable {
                             if upd.shouldEmit {
                                 onEvent?(.progress(fraction: frac, downloaded: grandDone, total: grandTotal, speed: upd.speed, eta: upd.eta, recordedSeconds: nil))
                             }
+                        }
+                    }
+                    if let lastIndexedByte {
+                        let attrs = try FileManager.default.attributesOfItem(atPath: dest.path)
+                        guard let size = attrs[.size] as? NSNumber, size.int64Value > lastIndexedByte else {
+                            try FileManager.default.removeItem(at: dest)
+                            throw HTTPError.rangeUnsupported
                         }
                     }
                     return (0, false)
@@ -653,28 +662,36 @@ public final class DownloadEngine: @unchecked Sendable {
         }
     }
 
+    private enum IndexedSection {
+        case downloaded(start: Double)
+        case wholeFile(lastIndexedByte: Int64?)
+    }
+
     private func tryDownloadSectionViaSidx(
         client: HTTPClient,
         fmt: MediaFormat,
         headers: [String: String],
         section: SectionRange,
         destination: URL
-    ) async throws -> Double? {
+    ) async throws -> IndexedSection {
         let probeEnd = fmt.indexRange?.end ?? 65_535
         let (head, fileSize) = try await client.fetchRange(url: fmt.url, range: ByteRange(start: 0, end: max(32_767, probeEnd)), headers: headers)
-        guard let parsed = MP4Muxer.parseSidx(in: head), let last = parsed.segments.last else { return nil }
+        guard let parsed = MP4Muxer.parseSidx(in: head), let last = parsed.segments.last else {
+            return .wholeFile(lastIndexedByte: nil)
+        }
 
         let reqStart = section.start ?? 0
         let reqEnd = section.end ?? .infinity
         if reqEnd > last.endTimeSec {
             // An sidx can describe just one fragment. If there could be more media
             // after its references, use the full-file path rather than truncate or reject a clip.
-            guard let size = fileSize else { return nil }
+            let fallback = IndexedSection.wholeFile(lastIndexedByte: last.byteRange.end)
+            guard let size = fileSize else { return fallback }
             guard last.byteRange.end < size else { throw HTTPError.rangeUnsupported }
             let next = last.byteRange.end + 1
             if next < size {
                 let remaining = size - next
-                guard remaining >= 8 else { return nil }
+                guard remaining >= 8 else { return fallback }
                 let trailer: Data
                 if next + 7 < Int64(head.count) {
                     trailer = head[Int(next)..<Int(next + 8)]
@@ -682,7 +699,7 @@ public final class DownloadEngine: @unchecked Sendable {
                     trailer = try await client.fetchRangeBytes(url: fmt.url, range: ByteRange(start: next, end: next + 7), headers: headers)
                 }
                 // FFmpeg can put a movie fragment random access box after the last media.
-                guard trailer.fourCC(4) == "mfra", Int64(trailer.beU32(0)) == remaining else { return nil }
+                guard trailer.fourCC(4) == "mfra", Int64(trailer.beU32(0)) == remaining else { return fallback }
             }
         }
         let overlaps: (SidxSegment) -> Bool = { $0.endTimeSec > reqStart && $0.startTimeSec < reqEnd }
@@ -703,7 +720,7 @@ public final class DownloadEngine: @unchecked Sendable {
         combined.append(initBytes)
         combined.append(bodyBytes)
         try combined.write(to: destination, options: .atomic)
-        return firstSeg.startTimeSec
+        return .downloaded(start: firstSeg.startTimeSec)
     }
 
     private func chooseSubtitles(available: [SubtitleTrack], langSpec: String) -> [SubtitleTrack] {

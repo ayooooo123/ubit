@@ -521,12 +521,14 @@ struct RegressionChecks {
             // extraction asks two client profiles. Only a usable SAPISID may be sent as SAPISIDHASH.
             let expired = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", expires: 1, name: "SAPISID", value: "fixture-only")]))
             let valid = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", name: "SAPISID", value: "fixture-only")]))
-            let override = HTTPClient(cookies: valid.cookies, extraHeaders: ["cOoKiE": "theme=light"])
-            let before = FixtureProtocol.requests().count
-            var conflict = false
-            do { _ = try await extract(client: override) } catch ExtractorError.unsupported { conflict = true }
-            check(conflict && FixtureProtocol.requests().count == before,
-                  "conflicting cookie sources are refused before the first request")
+            for vault in [CookieVault(), valid.cookies] {
+                let override = HTTPClient(cookies: vault, extraHeaders: ["cOoKiE": "theme=light"])
+                let before = FixtureProtocol.requests().count
+                var refused = false
+                do { _ = try await extract(client: override) } catch ExtractorError.unsupported { refused = true }
+                check(refused && FixtureProtocol.requests().count == before,
+                      "an explicit Cookie header makes no request, with or without stored cookies")
+            }
             _ = try await extract(client: expired)
             _ = try await extract(client: valid)
             let sent = FixtureProtocol.playerRequests().map(\.authorization)

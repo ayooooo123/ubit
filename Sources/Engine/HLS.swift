@@ -254,13 +254,14 @@ public enum HLSEngine {
         )
     }
 
-    /// Multiple playlist entries for one URI must read one edition of the object.
+    /// Multiple playlist entries for one URI must read one edition of the object: the same
+    /// strong ETag from the same answering URL, or one complete copy.
     private enum RangeSource: Sendable {
-        case tagged(String)
+        case tagged(HTTPClient.Edition)
         case snapshot(Data)
 
         static func open(_ url: String, client: HTTPClient, headers: [String: String]?) async throws -> Self {
-            if let tag = try await client.probeRemote(url: url, headers: headers).etag { return .tagged(tag) }
+            if let edition = try await client.probeRemote(url: url, headers: headers).edition { return .tagged(edition) }
             return .snapshot(try await snapshotOf(url, client: client, headers: headers))
         }
 
@@ -276,24 +277,24 @@ public enum HLSEngine {
     }
 
     private static func fetchPart(_ url: String, range: ByteRange?, client: HTTPClient, headers: [String: String]?, source: RangeSource? = nil) async throws -> Data {
-        var tag: String?
+        var edition: HTTPClient.Edition?
         switch source {
         case .snapshot(let data):
             guard let range else { return data }
             guard range.start >= 0, range.end >= range.start, range.end < Int64(data.count) else { throw HTTPError.rangeUnsupported }
             return data.subdata(in: Int(range.start)..<(Int(range.end) + 1))
-        case .tagged(let value): tag = value
+        case .tagged(let value): edition = value
         case nil: break
         }
         if let range {
-            let bytes = try await client.fetchRange(url: url, range: range, headers: headers, matchingTag: tag).data
+            let bytes = try await client.fetchRange(url: url, range: range, headers: headers, edition: edition).data
             guard !bytes.isEmpty, Int64(bytes.count - 1) == range.end - range.start else { throw HTTPError.rangeUnsupported }
             return bytes
         }
         var fields = headers ?? [:]
-        if let tag { fields["If-Match"] = tag }
-        let (data, response) = try await client.fetchData(url: url, headers: fields)
-        if let tag, response.value(forHTTPHeaderField: "ETag") != tag { throw HTTPError.rangeUnsupported }
+        if let edition { fields["If-Match"] = edition.tag }
+        let (data, response) = try await client.fetchData(url: edition?.location ?? url, headers: fields)
+        if let edition, HTTPClient.edition(response) != edition { throw HTTPError.rangeUnsupported }
         return data
     }
 
@@ -602,7 +603,7 @@ public enum HLSEngine {
             } else if liveSources[url] == nil {
                 guard range != nil else {
                     let (data, response) = try await client.fetchData(url: url, headers: headers)
-                    if let tag = HTTPClient.strongTag(response) { liveSources[url] = .tagged(tag) } else { digests[url] = SHA256.hash(data: data) }
+                    if let edition = HTTPClient.edition(response) { liveSources[url] = .tagged(edition) } else { digests[url] = SHA256.hash(data: data) }
                     return data
                 }
                 keep(url, try await RangeSource.open(url, client: client, headers: headers))

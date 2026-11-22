@@ -607,7 +607,8 @@ public final class DownloadEngine: @unchecked Sendable {
         destination: URL
     ) async throws -> IndexedSection {
         let probeEnd = fmt.indexRange?.end ?? 65_535
-        let (head, fileSize) = try await client.fetchRange(url: fmt.url, range: ByteRange(start: 0, end: max(32_767, probeEnd)), headers: headers)
+        // Later reads must come from the edition that gave the index, when the server names one.
+        let (head, fileSize, edition) = try await client.fetchRange(url: fmt.url, range: ByteRange(start: 0, end: max(32_767, probeEnd)), headers: headers)
         guard let parsed = MP4Muxer.parseSidx(in: head), let last = parsed.segments.last else {
             return .wholeFile(lastIndexedByte: nil)
         }
@@ -628,8 +629,8 @@ public final class DownloadEngine: @unchecked Sendable {
                     guard start >= 0, start <= Int64(head.count) - Int64(length) else {
                         let end = start + Int64(length - 1)
                         guard end < size else { return nil }
-                        let data = try await client.fetchRangeBytes(
-                            url: fmt.url, range: ByteRange(start: start, end: end), headers: headers)
+                        let data = try await client.fetchRange(
+                            url: fmt.url, range: ByteRange(start: start, end: end), headers: headers, edition: edition).data
                         return data.count == length ? data : nil
                     }
                     return head[Int(start)..<(Int(start) + length)]
@@ -664,7 +665,7 @@ public final class DownloadEngine: @unchecked Sendable {
 
         let initBytes = head.prefix(Int(parsed.initEndOffset + 1))
         let bodyRange = ByteRange(start: firstSeg.byteRange.start, end: lastSeg.byteRange.end)
-        let bodyBytes = try await client.fetchRangeBytes(url: fmt.url, range: bodyRange, headers: headers)
+        let bodyBytes = try await client.fetchRange(url: fmt.url, range: bodyRange, headers: headers, edition: edition).data
         guard Int64(bodyBytes.count) - 1 == bodyRange.end - bodyRange.start else {
             throw HTTPError.rangeUnsupported
         }

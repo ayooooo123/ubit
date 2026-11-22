@@ -108,6 +108,7 @@ final class FixtureProtocol: URLProtocol {
         var data = Data()
         var headers: [String: String] = [:]
         var failure: URLError?
+        var redirect: URL?
 
         switch (url.host ?? "", url.path) {
         case ("cdn.syndication.twimg.com", "/tweet-result"), ("instance.invalid", "/api/v1/videos/fixture"), ("i.imgur.com", "/abc123.mp4"):
@@ -121,6 +122,32 @@ final class FixtureProtocol: URLProtocol {
                 : (seq == 0 ? "#EXT-X-BYTERANGE:2@0\npack.ts" : (seq == 1 ? "other.ts" : "#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST"))
             data = Data("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:\(seq)\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n\(segment)\n".utf8)
         case ("media.invalid", "/other.ts"): data = Data("xx".utf8)
+        case ("media.invalid", "/hop.m3u8"):
+            data = Data("#EXTM3U\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@0\nhop.ts\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@2\nhop.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/hop-live.m3u8"):
+            // The first poll lists the whole object; the second lists a range of it and ends.
+            let seq = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            let segment = seq == 0 ? "hop.ts" : "#EXT-X-BYTERANGE:2@2\nhop.ts\n#EXT-X-ENDLIST"
+            data = Data("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:\(seq)\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n\(segment)\n".utf8)
+        case ("media.invalid", "/hop.ts"), ("media.invalid", "/hop.bin"):
+            // A redirector that alternates between two mirrors. Both mirrors name their copy
+            // with the same ETag text, but the copies hold different bytes.
+            let n = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            redirect = URL(string: "https://media.invalid/mirror-\(n % 2 == 0 ? "a" : "b").\(url.pathExtension)")
+        case ("media.invalid", let path) where path.hasPrefix("/mirror-"):
+            let second = path.hasPrefix("/mirror-b")
+            let body = path.hasSuffix(".ts")
+                ? Data((second ? "BBBB" : "AAAA").utf8)
+                : (second ? Data(Self.parallelBytes.map { ~$0 }) : Self.parallelBytes)
+            headers["ETag"] = "\"same\""
+            if let range {
+                let bounds = range.dropFirst(6).split(separator: "-").compactMap { Int($0) }
+                guard bounds.count == 2 else { status = 400; break }
+                let high = min(bounds[1], body.count - 1)
+                status = 206
+                headers["Content-Range"] = "bytes \(bounds[0])-\(high)/\(body.count)"
+                data = body.subdata(in: bounds[0]..<(high + 1))
+            } else { data = body }
         case ("media.invalid", "/event.m3u8"):
             // An EVENT playlist keeps every past entry. The first poll lists three
             // entries; the second lists all of them and ends the recording.
@@ -198,9 +225,9 @@ final class FixtureProtocol: URLProtocol {
                 switch mode {
                 case "watch-gate", "wall-unusable-cookie", "watch-challenge-cookie":
                     player = Self.challengePlayer(1, title: title)
-                case "watch-wall-text":
+                case "watch-wall-text", "watch-blocked-text":
                     player = nil
-                case "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age":
+                case "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age", "watch-blocked-notice", "watch-header-age":
                     player = Self.playerPayload(status: "OK", streaming: Self.directStreaming(1, hls: true), title: title)
                 case "hls-fallback-watchlist":
                     player = Self.hlsOnlyPlayer(title: title)
@@ -222,10 +249,12 @@ final class FixtureProtocol: URLProtocol {
                         "watch-wall-text", "watch-wall-metadata"].contains(mode)
                 let visitor = omitVisitor ? nil : (mode == "visitor-reuse" ? Self.secondVisitor : Self.firstVisitor)
                 switch mode {
-                case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age":
+                case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age",
+                     "watch-blocked-text", "watch-blocked-notice", "watch-header-age":
                     data = Self.wallPage(player: player, mode: mode)
-                case "watch-inert-text", "watch-lesson-no-state":
-                    data = Self.inertTextPage(player: mode == "watch-lesson-no-state" ? nil : player, visitor: visitor)
+                case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice":
+                    data = Self.inertTextPage(player: mode == "watch-lesson-no-state" ? nil : player, visitor: visitor,
+                                              hiddenNotices: mode == "watch-hidden-notice")
                 default:
                     data = Self.watchPage(player: player, visitor: visitor)
                 }
@@ -371,6 +400,13 @@ final class FixtureProtocol: URLProtocol {
                 authorization: request.value(forHTTPHeaderField: "Authorization") != nil
             ))
         }
+        if let redirect {
+            var next = request
+            next.url = redirect
+            let response = HTTPURLResponse(url: url, statusCode: 302, httpVersion: "HTTP/1.1", headerFields: ["Location": redirect.absoluteString])!
+            client!.urlProtocol(self, wasRedirectedTo: next, redirectResponse: response)
+            return
+        }
         if let failure {
             client!.urlProtocol(self, didFailWithError: failure)
             return
@@ -468,6 +504,8 @@ final class FixtureProtocol: URLProtocol {
         case "watch-human-notice": html += "<h1>Confirm you're not a bot</h1>"
         case "watch-inline-age": html += "<p>Please verify <span>your</span> age to play this video.</p>"
         case "watch-age-notice": html += "<p>Please verify your age to play this video.</p>"
+        case "watch-blocked-text", "watch-blocked-notice": html += "<div>Playback is blocked until verification is complete.</div>"
+        case "watch-header-age": html += "<header>Music lessons</header><main><div>Please verify your age to play this video.</div></main>"
         default: html += "<main>Verify your identity before playback can continue. Playback is blocked.</main>"
         }
         if let player {
@@ -478,8 +516,9 @@ final class FixtureProtocol: URLProtocol {
     }
 
     /// An ordinary page: challenge words appear only where a reader cannot see them, that is in
-    /// the title, the meta description, the video description, page code and a comment.
-    static func inertTextPage(player: [String: Any]?, visitor: String?) -> Data {
+    /// the title, the meta description, the video description, page code and a comment. With
+    /// `hiddenNotices`, the body also holds notices and a widget under hidden elements.
+    static func inertTextPage(player: [String: Any]?, visitor: String?, hiddenNotices: Bool = false) -> Data {
         var html = "<html><head>"
         html += "<title>How to verify your account - YouTube</title>"
         html += "<meta name=\"description\" content=\"Verify your account: unusual traffic and not a bot, explained.\">"
@@ -495,6 +534,12 @@ final class FixtureProtocol: URLProtocol {
         }
         html += "</head><body>"
         html += "<!-- Confirm your age appears only in this comment. -->"
+        if hiddenNotices {
+            html += "<!-- Optional g-recaptcha component not loaded. -->"
+            html += "<div hidden><p>Please verify your age to play this video.</p></div>"
+            html += "<dialog><p>Confirm you're not a bot</p></dialog>"
+            html += "<div style=\"display: none\"><div class=\"g-recaptcha\"></div></div>"
+        }
         html += "<script>var notice = \"Verify your identity before playback can continue\";</script>"
         html += "<h1>Verify your audio settings</h1></body></html>"
         return Data(html.utf8)
@@ -763,13 +808,14 @@ struct RegressionChecks {
             check(closedByBotGate(error) && paths == ["/watch"],
                   "a watch-page bot gate with streaming data stops before visitor and /player; error=\(String(describing: error)), paths=\(paths)")
         // Finding 2: a visible notice outranks embedded metadata; inert text is not a notice.
-        case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age":
+        case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age",
+             "watch-blocked-text", "watch-blocked-notice", "watch-header-age":
             let before = FixtureProtocol.requests().count
             let error = await extractError()
             let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
             check(closedByBotGate(error) && paths == ["/watch"] && savedOutputs().isEmpty,
                   "a visible verification notice stops after the first response, even when the page embeds ordinary player metadata; error=\(String(describing: error)), paths=\(paths), saved=\(savedOutputs())")
-        case "watch-inert-text", "watch-lesson-no-state":
+        case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice":
             let (file, error) = await download(audioExt: "webm")
             let bytes = file.flatMap { try? Data(contentsOf: $0) }
             let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
@@ -1220,6 +1266,20 @@ struct RegressionChecks {
             } catch where error.localizedDescription.contains("outside the stream") {}
             let parts = FixtureProtocol.requests().filter { $0.url.path.hasPrefix("/clip-") }
             check(parts.isEmpty && !FileManager.default.fileExists(atPath: dest.path), "decimal EOF needs neither init nor media")
+        case "trim-display-end":
+            // Decode order: a sync picture shown at 0, a reference picture shown at 0.3, and a
+            // picture shown at 0.1 whose decode duration (0.3) reaches past 0.3.
+            let track = MP4Track(trackID: 1, kind: .video, timescale: 10, stsdPayload: Data(), samples: [
+                MP4Sample(offset: 0, size: 1, duration: 1, isSync: true),
+                MP4Sample(offset: 1, size: 1, duration: 1, ctsOffset: 2, isSync: false),
+                MP4Sample(offset: 2, size: 1, duration: 3, ctsOffset: -1, isSync: false),
+            ])
+            let exact = MP4Muxer.trimTracks([track], section: SectionRange(start: 0, end: 0.3)).first
+            check(exact?.samples.count == 3 && exact?.editSegmentTicks == 3,
+                  "an end at 0.3 keeps the reference picture for decoding but shows pictures until 0.3 only: edit=\(String(describing: exact?.editSegmentTicks))")
+            let after = MP4Muxer.trimTracks([track], section: SectionRange(start: 0, end: 0.300001)).first
+            check(after?.samples.count == 3 && after?.editSegmentTicks == nil,
+                  "an end just after 0.3 shows the picture at 0.3: edit=\(String(describing: after?.editSegmentTicks))")
         case "trim-boundaries", "trim-keyframe":
             func samples(scale: UInt32, ticks: UInt32, count: Int, group: Int, base: Double, start: Double, end: Double) -> [UInt64] {
                 let track = MP4Track(trackID: 1, kind: .video, timescale: scale, stsdPayload: Data(),
@@ -1308,6 +1368,35 @@ struct RegressionChecks {
                 let fetched = FixtureProtocol.requests().dropFirst(before).map(\.url.path).filter { $0.hasSuffix(".m4s") }
                 check(samples == expected && fetched == parts, "section \(start)-\(end): samples=\(samples), parts=\(fetched)")
             }
+        case "parallel-redirect":
+            // Two connections and a redirector that alternates between mirrors whose different
+            // copies carry the same ETag text: every range must come from the probed mirror.
+            let file = AppPaths.appSupportDir.appendingPathComponent("hop.bin")
+            var failure: Error?
+            do {
+                try await HTTPClient().downloadFile(url: "https://media.invalid/hop.bin", destination: file, connections: 2)
+            } catch { failure = error }
+            let saved = try? Data(contentsOf: file)
+            let sources = Set(FixtureProtocol.requests().filter { $0.url.path.hasPrefix("/mirror-") }.map(\.url.path))
+            check(failure == nil && saved == FixtureProtocol.parallelBytes && sources == ["/mirror-a.bin"],
+                  "a parallel download reads one mirror: failure=\(String(describing: failure)), sources=\(sources.sorted()), intact=\(saved == FixtureProtocol.parallelBytes)")
+        case "hls-redirect-vod", "hls-redirect-live":
+            // The same redirector for one playlist URI: two ranges (VOD), or a whole read and
+            // then a range (live), must come from the mirror that answered first.
+            let file = AppPaths.appSupportDir.appendingPathComponent("hop.ts")
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            let live = mode == "hls-redirect-live"
+            var failure: Error?
+            do {
+                if live {
+                    _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/hop-live.m3u8", destination: file)
+                } else {
+                    _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/hop.m3u8", destination: file, connections: 2)
+                }
+            } catch { failure = error }
+            let saved = try? Data(contentsOf: file)
+            check(failure == nil && saved == Data((live ? "AAAAAA" : "AAAA").utf8),
+                  "every read of a redirected URI uses the first mirror: failure=\(String(describing: failure)), saved=\(String(decoding: saved ?? Data(), as: UTF8.self))")
         case "parallel-cancel", "parallel-short", "parallel-intact", "parallel-unvalidated":
             let file = AppPaths.appSupportDir.appendingPathComponent("result.bin")
             var failure: Error?

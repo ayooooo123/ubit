@@ -951,11 +951,26 @@ public enum MP4Muxer {
             let visibleEnd = track.editSegmentTicks.map { Int64(clamping: $0) } ?? Int64.max
             let end = min(visibleEnd, endBoundary.map { boundaryTicks($0, track.timescale, .up) } ?? Int64.max)
             guard end > start else { return nil }
+            // A video picture is displayed until the next presentation time. In a variable-rate
+            // track its decode duration can reach past the next picture, so it does not set
+            // the visible end; the last picture keeps its own duration.
+            var times: [Int64] = []
+            times.reserveCapacity(track.samples.count)
+            var decode: Int64 = 0
+            for sample in track.samples {
+                times.append(presentedTime(decode + Int64(sample.ctsOffset), on: track))
+                decode += Int64(sample.duration)
+            }
+            var following: [Int64: Int64] = [:]
+            if track.kind == .video {
+                let order = Set(times).sorted()
+                for (time, next) in zip(order, order.dropFirst()) { following[time] = next }
+            }
             var dts: Int64 = 0, syncDTS: Int64 = 0, mediaOrigin: Int64 = 0
             var syncIndex = 0, first: Int?, last = 0
             var shownStart = Int64.max, shownEnd = Int64.min, hiddenEnd = Int64.min
             for (i, sample) in track.samples.enumerated() {
-                let pts = presentedTime(dts + Int64(sample.ctsOffset), on: track), next = pts + Int64(sample.duration)
+                let pts = times[i], next = following[pts] ?? pts + Int64(sample.duration)
                 if sample.isSync { syncIndex = i; syncDTS = dts }
                 // At a video sync boundary choose pictures by presentation timestamp.
                 // A decode duration can overlap the next displayed picture in a variable-rate track.

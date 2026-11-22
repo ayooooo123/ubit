@@ -932,7 +932,7 @@ public enum CLIRunner {
         - `0` — All requested URLs completed
         - `1` — Extraction, network, DRM, or muxing failure
         - `2` — Invalid CLI flags/arguments
-        - `130` — Interrupted (`SIGINT`); run the command again; HTTP resume requires the same URL and strong ETag
+        - `130` — Interrupted (`SIGINT`); run the command again; HTTP resume requires the same URL, the same answering URL after redirects, and the same strong ETag
         """)
     }
 }

@@ -145,6 +145,123 @@ public enum ExtractorUtils {
         return nil
     }
 
+    private static let inlineElements: Set<String> = [
+        "a", "abbr", "b", "bdi", "bdo", "br", "cite", "code", "data", "dfn", "em", "font", "i", "kbd", "label",
+        "mark", "q", "s", "samp", "small", "span", "strong", "sub", "sup", "time", "u", "var", "wbr",
+    ]
+    private static let voidElements: Set<String> = [
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr",
+    ]
+    private static let rawTextElements: Set<String> = ["script", "style", "title", "textarea", "xmp", "iframe"]
+
+    /// The text that a reader can see on an HTML page: one lowercased entry per block, with
+    /// whitespace collapsed. Inline markup such as `<strong>`, `<span>` or a link does not split
+    /// a block. Comments, script, style, title and template content are left out, and so is
+    /// everything under a hidden ancestor: `hidden`, `aria-hidden="true"`, `display:none`,
+    /// `visibility:hidden`, a closed `<dialog>` or `<noscript>`. `onElement` receives the name
+    /// and the attributes of each visible element.
+    static func visibleTextBlocks(in html: String, onElement: (String, [String: String]) -> Void = { _, _ in }) -> [String] {
+        let bytes = Array(html.utf8), n = bytes.count
+        var blocks: [String] = [], run: [UInt8] = []
+        var open: [(name: String, hidden: Bool)] = []
+        let commentOpen = Array("<!--".utf8), commentClose = Array("-->".utf8)
+        func lower(_ b: UInt8) -> UInt8 { (0x41...0x5A).contains(b) ? b + 0x20 : b }
+        func isSpace(_ b: UInt8) -> Bool { b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0C || b == 0x0D }
+        func matches(_ needle: [UInt8], at k: Int) -> Bool {
+            guard k + needle.count <= n else { return false }
+            for m in 0..<needle.count where lower(bytes[k + m]) != needle[m] { return false }
+            return true
+        }
+        func find(_ needle: [UInt8], from start: Int) -> Int? {
+            var k = start
+            while k + needle.count <= n { if matches(needle, at: k) { return k }; k += 1 }
+            return nil
+        }
+        func flush() {
+            guard !run.isEmpty else { return }
+            let text = SponsorAndSubtitles.decodeHTMLEntities(String(decoding: run, as: UTF8.self)).lowercased()
+                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            if !text.isEmpty { blocks.append(text) }
+            run.removeAll(keepingCapacity: true)
+        }
+        var i = 0
+        while i < n {
+            let hidden = open.last?.hidden ?? false
+            guard bytes[i] == 0x3C else {
+                let start = i
+                while i < n, bytes[i] != 0x3C { i += 1 }
+                if !hidden { run.append(contentsOf: bytes[start..<i]) }
+                continue
+            }
+            if matches(commentOpen, at: i) {
+                i = find(commentClose, from: i + 4).map { $0 + 3 } ?? n
+                continue
+            }
+            if i + 1 < n, bytes[i + 1] == 0x21 || bytes[i + 1] == 0x3F {
+                i = find([0x3E], from: i).map { $0 + 1 } ?? n
+                continue
+            }
+            let closing = i + 1 < n && bytes[i + 1] == 0x2F
+            let nameStart = i + (closing ? 2 : 1)
+            var k = nameStart
+            while k < n, (0x61...0x7A).contains(lower(bytes[k])) || (0x30...0x39).contains(bytes[k]) || bytes[k] == 0x2D || bytes[k] == 0x3A { k += 1 }
+            guard k > nameStart, (0x61...0x7A).contains(lower(bytes[nameStart])) else {
+                // A "<" that does not start a tag is text.
+                if !hidden { run.append(bytes[i]) }
+                i += 1
+                continue
+            }
+            let name = String(decoding: bytes[nameStart..<k].map(lower), as: UTF8.self)
+            var attributes: [String: String] = [:], selfClosing = false
+            while k < n, bytes[k] != 0x3E {
+                if isSpace(bytes[k]) { k += 1; continue }
+                if bytes[k] == 0x2F { selfClosing = true; k += 1; continue }
+                selfClosing = false
+                let attrStart = k
+                while k < n, !isSpace(bytes[k]), bytes[k] != 0x3D, bytes[k] != 0x3E, bytes[k] != 0x2F { k += 1 }
+                let attr = String(decoding: bytes[attrStart..<k].map(lower), as: UTF8.self)
+                while k < n, isSpace(bytes[k]) { k += 1 }
+                var value = ""
+                if k < n, bytes[k] == 0x3D {
+                    k += 1
+                    while k < n, isSpace(bytes[k]) { k += 1 }
+                    if k < n, bytes[k] == 0x22 || bytes[k] == 0x27 {
+                        let quote = bytes[k], valueStart = k + 1
+                        k = valueStart
+                        while k < n, bytes[k] != quote { k += 1 }
+                        value = String(decoding: bytes[valueStart..<min(k, n)], as: UTF8.self)
+                        k += 1
+                    } else {
+                        let valueStart = k
+                        while k < n, !isSpace(bytes[k]), bytes[k] != 0x3E { k += 1 }
+                        value = String(decoding: bytes[valueStart..<k], as: UTF8.self)
+                    }
+                }
+                if !attr.isEmpty { attributes[attr] = value }
+            }
+            i = min(k + 1, n)
+            let inline = inlineElements.contains(name)
+            if !inline { flush() } else if name == "br" && !hidden { run.append(0x20) }
+            if closing {
+                if let index = open.lastIndex(where: { $0.name == name }) { open.removeSubrange(index...) }
+                continue
+            }
+            let style = (attributes["style"] ?? "").lowercased().filter { !$0.isWhitespace }
+            let isHidden = hidden || attributes["hidden"] != nil || attributes["aria-hidden"]?.lowercased() == "true"
+                || style.contains("display:none") || style.contains("visibility:hidden")
+                || (name == "dialog" && attributes["open"] == nil) || name == "template" || name == "noscript"
+            if !isHidden { onElement(name, attributes) }
+            if rawTextElements.contains(name) {
+                let end = find(Array("</\(name)".utf8), from: i)
+                i = end.flatMap { find([0x3E], from: $0) }.map { $0 + 1 } ?? n
+                continue
+            }
+            if !voidElements.contains(name) && !selfClosing { open.append((name, isHidden)) }
+        }
+        flush()
+        return blocks
+    }
+
     public static func unescapeJSString(_ raw: String) -> String {
         var s = raw
             .replacingOccurrences(of: "\\/", with: "/")

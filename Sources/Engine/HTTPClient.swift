@@ -384,13 +384,28 @@ public final class HTTPClient: @unchecked Sendable {
         try await fetchRange(url: url, range: range, headers: headers).data
     }
 
-    func fetchRange(url: String, range: ByteRange, headers: [String: String]?, matchingTag: String? = nil) async throws -> (data: Data, fileSize: Int64?) {
+    /// One edition of one resource. A strong ETag names an edition only of the resource that
+    /// sent it, so the URL that answered (after redirects) is part of the identity.
+    struct Edition: Sendable, Equatable {
+        let location: String
+        let tag: String
+    }
+
+    static func edition(_ response: HTTPURLResponse) -> Edition? {
+        guard let tag = strongTag(response), let location = response.url?.absoluteString else { return nil }
+        return Edition(location: location, tag: tag)
+    }
+
+    /// With `edition`, the read goes to that edition's URL with `If-Match` and must come back
+    /// from the same URL with the same strong ETag. The result names the edition that answered.
+    func fetchRange(url: String, range: ByteRange, headers: [String: String]?, edition: Edition? = nil) async throws -> (data: Data, fileSize: Int64?, edition: Edition?) {
         guard range.start >= 0, range.end >= range.start else { throw HTTPError.rangeUnsupported }
         var hdrs = headers ?? [:]
         hdrs["Range"] = "bytes=\(range.start)-\(range.end)"
-        if let matchingTag { hdrs["If-Match"] = matchingTag }
-        let (data, http) = try await fetchData(url: url, headers: hdrs)
-        if let matchingTag, Self.strongTag(http) != matchingTag { throw HTTPError.rangeUnsupported }
+        if let edition { hdrs["If-Match"] = edition.tag }
+        let (data, http) = try await fetchData(url: edition?.location ?? url, headers: hdrs)
+        let answered = Self.edition(http)
+        if let edition, answered != edition { throw HTTPError.rangeUnsupported }
         if http.statusCode == 206 {
             guard let value = http.value(forHTTPHeaderField: "Content-Range"),
                   let content = Self.parseContentRange(value),
@@ -403,10 +418,10 @@ public final class HTTPClient: @unchecked Sendable {
                 guard size > content.last, content.last == min(range.end, size - 1) else {
                     throw HTTPError.rangeUnsupported
                 }
-                return (data, size)
+                return (data, size, answered)
             }
             guard content.last == range.end else { throw HTTPError.rangeUnsupported }
-            return (data, nil)
+            return (data, nil, answered)
         }
         // A server that ignores Range answers 200 with the whole file. A body shorter than its
         // Content-Length was cut in transit; it is not a smaller file.
@@ -417,7 +432,7 @@ public final class HTTPClient: @unchecked Sendable {
         }
         guard Int64(data.count) > range.start else { throw HTTPError.rangeUnsupported }
         let last = min(range.end, Int64(data.count - 1))
-        return (data.subdata(in: Int(range.start)..<(Int(last) + 1)), Int64(data.count))
+        return (data.subdata(in: Int(range.start)..<(Int(last) + 1)), Int64(data.count), answered)
     }
 
     private struct ContentRange {
@@ -452,7 +467,7 @@ public final class HTTPClient: @unchecked Sendable {
     }
 
     /// Probes total file size and range support using a tiny `Range: bytes=0-0` request.
-    func probeRemote(url: String, headers: [String: String]?) async throws -> (totalSize: Int64?, acceptsRanges: Bool, etag: String?) {
+    func probeRemote(url: String, headers: [String: String]?) async throws -> (totalSize: Int64?, acceptsRanges: Bool, edition: Edition?) {
         var hdrs = headers ?? [:]
         hdrs["Range"] = "bytes=0-0"
         let req = try makeRequest(url: url, headers: hdrs)
@@ -461,17 +476,17 @@ public final class HTTPClient: @unchecked Sendable {
         guard (200..<300).contains(http.statusCode) else {
             throw HTTPError.status(http.statusCode, url)
         }
-        let etag = Self.strongTag(http)
+        let edition = Self.edition(http)
         if http.statusCode == 206 {
             // A 206 with `*` gives no file size, and this body's length is not the file length.
             guard let value = http.value(forHTTPHeaderField: "Content-Range"),
                   let range = Self.parseContentRange(value), range.first == 0, range.last == 0 else {
                 throw HTTPError.rangeUnsupported
             }
-            return (range.total, true, etag)
+            return (range.total, true, edition)
         }
         let clen = http.expectedContentLength > 0 ? http.expectedContentLength : nil
-        return (clen, false, etag)
+        return (clen, false, edition)
     }
 
     /// High-throughput multi-connection work-stealing downloader with `.part` + `.part.json` atomic resume.
@@ -487,7 +502,7 @@ public final class HTTPClient: @unchecked Sendable {
         let partURL = destination.appendingPathExtension("part")
         let stateURL = destination.appendingPathExtension("part.json")
 
-        let probe: (totalSize: Int64?, acceptsRanges: Bool, etag: String?)
+        let probe: (totalSize: Int64?, acceptsRanges: Bool, edition: Edition?)
         do {
             probe = try await probeRemote(url: url, headers: headers)
         } catch {
@@ -496,19 +511,19 @@ public final class HTTPClient: @unchecked Sendable {
         }
         let totalSize = probe.totalSize ?? knownSize
 
-        // Hash the URL: a signed query string must not be stored in a resume file.
-        let resource = Data(SHA256.hash(data: Data(url.utf8)))
-        // Separate range replies can describe different bytes at the same URL and length.
+        // Separate range replies can describe different bytes at the same URL and length, and a
+        // redirect can send them to different resources with the same ETag text. Every range
+        // therefore goes to the URL that answered the probe and must carry the probed edition.
         guard let total = totalSize, total > 512 * 1024, probe.acceptsRanges, connections > 1,
-              let tag = probe.etag else {
+              let edition = probe.edition else {
             do {
                 try await singleStreamDownload(
                     url: url,
                     partURL: partURL,
                     destination: destination,
                     headers: headers,
-                    resumeTag: probe.acceptsRanges ? probe.etag : nil,
-                    resource: resource, stateURL: stateURL,
+                    resumeEdition: probe.acceptsRanges ? probe.edition : nil,
+                    stateURL: stateURL,
                     totalSize: totalSize,
                     onProgress: onProgress
                 )
@@ -519,6 +534,7 @@ public final class HTTPClient: @unchecked Sendable {
             try? FileManager.default.removeItem(at: stateURL)
             return
         }
+        let resource = Self.resourceDigest(url, edition.location)
 
         // Load or create chunk state. A state file is trusted only when the part file has the
         // advertised length and every completed range is sorted, disjoint and inside the file.
@@ -527,7 +543,7 @@ public final class HTTPClient: @unchecked Sendable {
            let stateData = try? Data(contentsOf: stateURL),
            let saved = try? JSONDecoder().decode(ChunkStateFile.self, from: stateData),
            Self.isValidResumeState(saved, total: total),
-           saved.resourceDigest == resource, saved.etag == tag {
+           saved.resourceDigest == resource, saved.etag == edition.tag {
             chunkState = saved
         } else {
             try? FileManager.default.removeItem(at: stateURL)
@@ -535,7 +551,7 @@ public final class HTTPClient: @unchecked Sendable {
             let fh = try FileHandle(forWritingTo: partURL)
             try fh.truncate(atOffset: UInt64(total))
             try fh.close()
-            chunkState = ChunkStateFile(totalSize: total, resourceDigest: resource, etag: probe.etag, completed: [])
+            chunkState = ChunkStateFile(totalSize: total, resourceDigest: resource, etag: edition.tag, completed: [])
         }
 
         onProgress?(chunkState.downloadedBytes, total)
@@ -555,7 +571,7 @@ public final class HTTPClient: @unchecked Sendable {
         defer { close(fd) }
 
         var rangeHeaders = headers ?? [:]
-        rangeHeaders["If-Range"] = tag
+        rangeHeaders["If-Range"] = edition.tag
         let workerHeaders = rangeHeaders
         let numWorkers = max(1, min(32, connections))
         let workQueue = WorkStealingQueue(state: chunkState, stateURL: stateURL, initialSplits: numWorkers * 2)
@@ -570,7 +586,7 @@ public final class HTTPClient: @unchecked Sendable {
                             try await self.runRangeWorker(
                                 workerID: claim.workerID,
                                 initialRange: claim.range,
-                                url: url,
+                                edition: edition,
                                 headers: workerHeaders,
                                 fd: fd,
                                 totalSize: total,
@@ -633,7 +649,7 @@ public final class HTTPClient: @unchecked Sendable {
     private func runRangeWorker(
         workerID: Int,
         initialRange: ByteRange,
-        url: String,
+        edition: Edition,
         headers: [String: String]?,
         fd: Int32,
         totalSize: Int64,
@@ -643,6 +659,7 @@ public final class HTTPClient: @unchecked Sendable {
         var curStart = initialRange.start
         let origEnd = initialRange.end
         var attempts = 0
+        let url = edition.location
         let isGoogleVideo = url.contains("googlevideo.com")
         let maxWindowBytes: Int64 = isGoogleVideo ? 8 * 1024 * 1024 : Int64.max
 
@@ -663,8 +680,8 @@ public final class HTTPClient: @unchecked Sendable {
                 if Self.isRefusal(http.statusCode) {
                     throw HTTPError.status(http.statusCode, url)
                 }
-                guard http.statusCode == 206,
-                      http.value(forHTTPHeaderField: "ETag") == nil || Self.strongTag(http) == hdrs["If-Range"],
+                guard http.statusCode == 206, http.url?.absoluteString == url,
+                      http.value(forHTTPHeaderField: "ETag") == nil || Self.strongTag(http) == edition.tag,
                       let value = http.value(forHTTPHeaderField: "Content-Range"),
                       let content = Self.parseContentRange(value),
                       content.first == curStart,
@@ -734,13 +751,19 @@ public final class HTTPClient: @unchecked Sendable {
         return (decision.keepGoing, decision.allowedLength)
     }
 
+    /// Names the resource of a resume file: the requested URL and the URL that answered.
+    /// Hashed so that a signed query string is not stored in the file.
+    private static func resourceDigest(_ url: String, _ location: String) -> Data {
+        Data(SHA256.hash(data: Data((url + "\n" + location).utf8)))
+    }
+
     private func singleStreamDownload(
         url: String,
         partURL: URL,
         destination: URL,
         headers: [String: String]?,
-        resumeTag: String?,
-        resource: Data, stateURL: URL,
+        resumeEdition: Edition?,
+        stateURL: URL,
         totalSize: Int64?,
         onProgress: (@Sendable (Int64, Int64) -> Void)?
     ) async throws {
@@ -748,9 +771,10 @@ public final class HTTPClient: @unchecked Sendable {
         // bytes: a parallel preallocation has the full length and may have no state file. Both
         // cases start from zero.
         var existingOffset: Int64 = 0
-        if let resumeTag, let record = try? Data(contentsOf: stateURL),
+        if let resumeEdition, let record = try? Data(contentsOf: stateURL),
            let saved = try? JSONDecoder().decode(ChunkStateFile.self, from: record),
-           saved.resourceDigest == resource, saved.etag == resumeTag, saved.completed.isEmpty,
+           saved.resourceDigest == Self.resourceDigest(url, resumeEdition.location),
+           saved.etag == resumeEdition.tag, saved.completed.isEmpty,
            let sz = Self.fileSize(partURL), sz > 0,
            totalSize.map({ sz < $0 }) ?? true {
             existingOffset = sz
@@ -759,12 +783,14 @@ public final class HTTPClient: @unchecked Sendable {
             FileManager.default.createFile(atPath: partURL.path, contents: nil)
         }
 
+        // A resume reads the rest from the edition that wrote the start of the file.
+        let source = existingOffset > 0 ? resumeEdition?.location ?? url : url
         var hdrs = headers ?? [:]
         if existingOffset > 0 {
             hdrs["Range"] = "bytes=\(existingOffset)-"
-            hdrs["If-Range"] = resumeTag
+            hdrs["If-Range"] = resumeEdition?.tag
         }
-        let req = try makeRequest(url: url, headers: hdrs)
+        let req = try makeRequest(url: source, headers: hdrs)
         let (bytes, resp) = try await session.bytes(for: req)
         guard let http = resp as? HTTPURLResponse else { throw HTTPError.badURL(url) }
         guard (200..<300).contains(http.statusCode) else {
@@ -781,7 +807,8 @@ public final class HTTPClient: @unchecked Sendable {
             }
             guard let total = content.total ?? totalSize, total > 0, content.last == total - 1,
                   totalSize == nil || totalSize == total else { throw HTTPError.rangeUnsupported }
-            if existingOffset > 0, http.value(forHTTPHeaderField: "ETag") != nil, Self.strongTag(http) != resumeTag {
+            if existingOffset > 0, http.url?.absoluteString != source
+                || (http.value(forHTTPHeaderField: "ETag") != nil && Self.strongTag(http) != resumeEdition?.tag) {
                 throw HTTPError.rangeUnsupported
             }
             expectedTotal = total
@@ -807,6 +834,7 @@ public final class HTTPClient: @unchecked Sendable {
 
         if existingOffset == 0 {
             let tag = http.value(forHTTPHeaderField: "Content-Encoding") == nil ? Self.strongTag(http) : nil
+            let resource = Self.resourceDigest(url, http.url?.absoluteString ?? url)
             let record = ChunkStateFile(totalSize: expectedTotal, resourceDigest: resource, etag: tag, completed: [])
             try JSONEncoder().encode(record).write(to: stateURL, options: .atomic)
         }

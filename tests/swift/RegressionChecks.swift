@@ -153,7 +153,7 @@ final class FixtureProtocol: URLProtocol {
                     player = Self.challengePlayer(1, title: title)
                 case "watch-wall-text":
                     player = nil
-                case "watch-wall-metadata", "watch-human-notice", "watch-age-notice":
+                case "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age":
                     player = Self.playerPayload(status: "OK", streaming: Self.directStreaming(1, hls: true), title: title)
                 case "hls-fallback-watchlist":
                     player = Self.hlsOnlyPlayer(title: title)
@@ -175,7 +175,7 @@ final class FixtureProtocol: URLProtocol {
                         "watch-wall-text", "watch-wall-metadata"].contains(mode)
                 let visitor = omitVisitor ? nil : (mode == "visitor-reuse" ? Self.secondVisitor : Self.firstVisitor)
                 switch mode {
-                case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice":
+                case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age":
                     data = Self.wallPage(player: player, mode: mode)
                 case "watch-inert-text":
                     data = Self.inertTextPage(player: player, visitor: visitor)
@@ -419,6 +419,7 @@ final class FixtureProtocol: URLProtocol {
         var html = "<html><head><title>Verification required</title></head><body>"
         switch mode {
         case "watch-human-notice": html += "<h1>Confirm you're not a bot</h1>"
+        case "watch-inline-age": html += "<p>Please verify <span>your</span> age to play this video.</p>"
         case "watch-age-notice": html += "<p>Please verify your age to play this video.</p>"
         default: html += "<main>Verify your identity before playback can continue. Playback is blocked.</main>"
         }
@@ -705,7 +706,7 @@ struct RegressionChecks {
             check(closedByBotGate(error) && paths == ["/watch"],
                   "a watch-page bot gate with streaming data stops before visitor and /player; error=\(String(describing: error)), paths=\(paths)")
         // Finding 2: a visible notice outranks embedded metadata; inert text is not a notice.
-        case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice":
+        case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age":
             let before = FixtureProtocol.requests().count
             let error = await extractError()
             let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)

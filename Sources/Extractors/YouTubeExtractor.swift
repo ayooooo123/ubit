@@ -270,22 +270,21 @@ public struct YouTubeExtractor: SiteExtractor {
         }
         // Embedded player metadata can outlive a page-level verification notice.
         // Use the HTML tree so that a script, attribute or video title is not a notice.
-        if isChallenge(html) {
-            guard let document = try? XMLDocument(xmlString: html, options: [.documentTidyHTML, .nodeLoadExternalEntitiesNever]),
-                  let blocks = try? document.nodes(forXPath: "//*[local-name()='body' or local-name()='h1' or local-name()='p' or @role='alert']") else {
+        // Inline markup can split a notice across text nodes. Check their visible text first.
+        guard let document = try? XMLDocument(xmlString: html, options: [.documentTidyHTML, .nodeLoadExternalEntitiesNever]),
+              let blocks = try? document.nodes(forXPath: "//*[local-name()='body' or local-name()='h1' or local-name()='p' or @role='alert']") else {
+            throw ExtractorError.botGate("YouTube")
+        }
+        for block in blocks {
+            let nodes = try block.nodes(forXPath: ".//text()[not(ancestor::*[local-name()='script' or local-name()='style' or local-name()='template'])]")
+            let text = nodes.compactMap(\.stringValue).joined(separator: " ").lowercased()
+                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            let instruction = text.hasPrefix("please ") ? String(text.dropFirst(7)) : text
+            if isChallenge(text) && (instruction.hasPrefix("verify your age") || instruction.hasPrefix("verify your identity")
+                || instruction.hasPrefix("confirm your age") || (instruction.hasPrefix("confirm ") && instruction.contains("not a bot"))
+                || text.contains("playback is blocked") || text.contains("until verification is complete")
+                || text.contains("sign in to confirm") || text.contains("detected unusual traffic")) {
                 throw ExtractorError.botGate("YouTube")
-            }
-            for block in blocks {
-                let nodes = try block.nodes(forXPath: ".//text()[not(ancestor::*[local-name()='script' or local-name()='style' or local-name()='template'])]")
-                let text = nodes.compactMap(\.stringValue).joined(separator: " ").lowercased()
-                    .split(whereSeparator: \.isWhitespace).joined(separator: " ")
-                let instruction = text.hasPrefix("please ") ? String(text.dropFirst(7)) : text
-                if isChallenge(text) && (instruction.hasPrefix("verify your age") || instruction.hasPrefix("verify your identity")
-                    || instruction.hasPrefix("confirm your age") || (instruction.hasPrefix("confirm ") && instruction.contains("not a bot"))
-                    || text.contains("playback is blocked") || text.contains("until verification is complete")
-                    || text.contains("sign in to confirm") || text.contains("detected unusual traffic")) {
-                    throw ExtractorError.botGate("YouTube")
-                }
             }
         }
         if let response = ExtractorUtils.extractJSONAfter("ytInitialPlayerResponse =", in: html) as? [String: Any] {

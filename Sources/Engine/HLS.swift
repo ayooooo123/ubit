@@ -570,8 +570,8 @@ public enum HLSEngine {
 
         // Every URI keeps its edition: a strong ETag, a complete copy, or a digest of the
         // complete body. An EVENT playlist can list every past URI, so copies are kept only
-        // for byte ranges and only up to `snapshotBudget` bytes; an evicted copy and a whole
-        // read leave a digest, and a later range of that URI compares a new complete copy.
+        // for byte ranges and only up to `snapshotBudget` bytes in total. An evicted copy and a
+        // whole read leave a digest, and a later range of that URI compares a new complete copy.
         var liveSources: [String: RangeSource] = [:]
         var digests: [String: SHA256.Digest] = [:]
         var snapshotOrder: [String] = []
@@ -589,7 +589,7 @@ public enum HLSEngine {
             guard case .snapshot(let bytes) = source else { return }
             snapshotOrder.append(url)
             snapshotBytes += bytes.count
-            // The newest copy stays even when it alone exceeds the budget: its ranges need it.
+            // Older copies go first. The newest copy stays until it has served its range.
             while snapshotBytes > snapshotBudget, snapshotOrder.count > 1 { evict(snapshotOrder[0]) }
         }
         func livePart(_ url: String, range: ByteRange?) async throws -> Data {
@@ -608,7 +608,10 @@ public enum HLSEngine {
                 }
                 keep(url, try await RangeSource.open(url, client: client, headers: headers))
             }
-            return try await fetchPart(url, range: range, client: client, headers: headers, source: liveSources[url])
+            let part = try await fetchPart(url, range: range, client: client, headers: headers, source: liveSources[url])
+            // A copy that alone exceeds the budget is not kept after it has served its range.
+            if snapshotBytes > snapshotBudget { evict(url) }
+            return part
         }
         var currentPL = initialPlaylist
         var firstIteration = true

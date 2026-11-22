@@ -264,11 +264,13 @@ public struct YouTubeExtractor: SiteExtractor {
     }
 
     /// Text that a reader sees as a verification instruction, read from one visible block.
+    /// Prose that only explains verification is not a notice.
     private static func isNotice(_ text: String) -> Bool {
         let instruction = text.hasPrefix("please ") ? String(text.dropFirst(7)) : text
+        let human = ["you are human", "you're human", "you’re human", "you are a human", "you're a human", "you’re a human", "not a bot", "not a robot"]
         return instruction.hasPrefix("verify your age") || instruction.hasPrefix("verify your identity")
-            || instruction.hasPrefix("confirm your age") || (instruction.hasPrefix("confirm ") && instruction.contains("not a bot"))
-            || text.contains("until verification is complete")
+            || instruction.hasPrefix("confirm your age")
+            || ((instruction.hasPrefix("verify ") || instruction.hasPrefix("confirm ")) && human.contains(where: instruction.contains))
             || (text.contains("playback is blocked") && text.contains("verif"))
             || (text.contains("sign in to confirm") && (text.contains("not a bot") || text.contains("your age")))
             || text.contains("detected unusual traffic")

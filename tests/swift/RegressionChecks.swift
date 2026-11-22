@@ -42,6 +42,14 @@ final class FixtureProtocol: URLProtocol {
     static let secondVisitor = "CgtFixtureVisitorSecond0000000000000"
     static let parallelBytes = Data((0..<614_400).map { UInt8(truncatingIfNeeded: ($0 / 1021) ^ $0) })
     static let mediaBytes = Data("fixture-media-payload-for-the-http-path".utf8)
+    /// An untagged object 1 MiB larger than the live recorder's 64 MiB copy budget. Its first
+    /// KiB holds "A" and its last KiB holds "Z".
+    static let oversized: Data = {
+        var bytes = Data(count: 65 << 20)
+        bytes.replaceSubrange(0..<1024, with: Data(repeating: 0x41, count: 1024))
+        bytes.replaceSubrange((bytes.count - 1024)..<bytes.count, with: Data(repeating: 0x5A, count: 1024))
+        return bytes
+    }()
     /// A fail-closed HTTP denial on one stage of the YouTube path. `deny` covers an HTTP status;
     /// `denyPlayability` covers an explicit playability status with usable streaming data.
     nonisolated(unsafe) private static var deniedStage = ""
@@ -88,7 +96,8 @@ final class FixtureProtocol: URLProtocol {
         }
     }
 
-    override class func canInit(with request: URLRequest) -> Bool { true }
+    // Loopback requests go to a real socket (`WireOrigin`): some faults need a real connection.
+    override class func canInit(with request: URLRequest) -> Bool { request.url?.host != "127.0.0.1" }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func stopLoading() {}
 
@@ -152,6 +161,13 @@ final class FixtureProtocol: URLProtocol {
             // An EVENT playlist keeps every past entry. The first poll lists three
             // entries; the second lists all of them and ends the recording.
             let poll = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            if mode == "hls-event-oversized" {
+                // One untagged object larger than the copy budget, read in two ranges at its ends.
+                let tail = "#EXTINF:1,\n#EXT-X-BYTERANGE:1024@\(Self.oversized.count - 1024)\nbig.bin\n#EXT-X-ENDLIST\n"
+                data = Data(("#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n"
+                    + "#EXTINF:1,\n#EXT-X-BYTERANGE:1024@0\nbig.bin\n" + (poll == 0 ? "" : tail)).utf8)
+                break
+            }
             let ranged = mode == "hls-event-ranged"
             let count = poll == 0 ? 3 : (ranged ? 70 : 64)
             var text = "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n"
@@ -161,6 +177,14 @@ final class FixtureProtocol: URLProtocol {
                 text += "#EXT-X-ENDLIST\n"
             }
             data = Data(text.utf8)
+        case ("media.invalid", "/big.bin"):
+            if let range {
+                let bounds = range.dropFirst(6).split(separator: "-").compactMap { Int($0) }
+                guard bounds.count == 2 else { status = 400; break }
+                status = 206
+                headers["Content-Range"] = "bytes \(bounds[0])-\(bounds[1])/\(Self.oversized.count)"
+                data = Self.oversized.subdata(in: bounds[0]..<(bounds[1] + 1))
+            } else { data = Self.oversized }
         case ("media.invalid", let path) where path.hasPrefix("/ev-"):
             // 1 MiB untagged objects; object N holds only the byte N.
             let body = Data(repeating: UInt8(Int(path.dropFirst(4).dropLast(4)) ?? 255), count: 1 << 20)
@@ -227,7 +251,8 @@ final class FixtureProtocol: URLProtocol {
                     player = Self.challengePlayer(1, title: title)
                 case "watch-wall-text", "watch-blocked-text":
                     player = nil
-                case "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age", "watch-blocked-notice", "watch-header-age":
+                case "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age", "watch-blocked-notice", "watch-header-age",
+                     "watch-verify-human", "watch-open-details", "watch-details-summary":
                     player = Self.playerPayload(status: "OK", streaming: Self.directStreaming(1, hls: true), title: title)
                 case "hls-fallback-watchlist":
                     player = Self.hlsOnlyPlayer(title: title)
@@ -250,11 +275,11 @@ final class FixtureProtocol: URLProtocol {
                 let visitor = omitVisitor ? nil : (mode == "visitor-reuse" ? Self.secondVisitor : Self.firstVisitor)
                 switch mode {
                 case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age",
-                     "watch-blocked-text", "watch-blocked-notice", "watch-header-age":
+                     "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
+                     "watch-details-summary":
                     data = Self.wallPage(player: player, mode: mode)
-                case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice":
-                    data = Self.inertTextPage(player: mode == "watch-lesson-no-state" ? nil : player, visitor: visitor,
-                                              hiddenNotices: mode == "watch-hidden-notice")
+                case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson":
+                    data = Self.inertTextPage(player: mode == "watch-lesson-no-state" ? nil : player, visitor: visitor, mode: mode)
                 default:
                     data = Self.watchPage(player: player, visitor: visitor)
                 }
@@ -357,7 +382,10 @@ final class FixtureProtocol: URLProtocol {
         case ("media.invalid", let path) where path.hasPrefix("/clip-"):
             data = Data(Bytes.clipSegment(Int(path.dropFirst(6).dropLast(4)) ?? 0))
         case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4", "/cut-unknown.mp4", "/cut-later.mp4", "/cut-padding.mp4", "/cut-empty.mp4", "/cut-stale.mp4", "/cut-duration.mp4"].contains(path):
-            var bytes = mode == "sidx-fragments" || path == "/cut-later.mp4" || path == "/cut-padding.mp4" ? Bytes.fragmentIndexedClip : Bytes.indexedClip
+            // sidx-untagged-change: every read after the first comes from a second edition.
+            let changed = mode == "sidx-untagged-change" && Self.lock.withLock { Self.seen.contains { $0.url.path == path } }
+            var bytes = mode == "sidx-fragments" || path == "/cut-later.mp4" || path == "/cut-padding.mp4" ? Bytes.fragmentIndexedClip
+                : (changed ? Bytes.changedIndexedClip : Bytes.indexedClip)
             if mode == "sidx-padding" { bytes += Bytes.box("free", Array(repeating: 0, count: 24)) }
             if ["/cut-empty.mp4", "/cut-stale.mp4", "/cut-duration.mp4"].contains(path) {
                 let table = MP4Muxer.parseSidx(in: Data(bytes))!.segments
@@ -506,6 +534,9 @@ final class FixtureProtocol: URLProtocol {
         case "watch-age-notice": html += "<p>Please verify your age to play this video.</p>"
         case "watch-blocked-text", "watch-blocked-notice": html += "<div>Playback is blocked until verification is complete.</div>"
         case "watch-header-age": html += "<header>Music lessons</header><main><div>Please verify your age to play this video.</div></main>"
+        case "watch-verify-human": html += "<main role=\"alert\"><p>Please verify that you are human to continue.</p></main>"
+        case "watch-open-details": html += "<h1>Music lesson</h1><details open><summary>Help</summary><p>Please verify your age to play this video.</p></details>"
+        case "watch-details-summary": html += "<details><summary>Verify your age to play this video.</summary><p>Help</p></details>"
         default: html += "<main>Verify your identity before playback can continue. Playback is blocked.</main>"
         }
         if let player {
@@ -516,9 +547,10 @@ final class FixtureProtocol: URLProtocol {
     }
 
     /// An ordinary page: challenge words appear only where a reader cannot see them, that is in
-    /// the title, the meta description, the video description, page code and a comment. With
-    /// `hiddenNotices`, the body also holds notices and a widget under hidden elements.
-    static func inertTextPage(player: [String: Any]?, visitor: String?, hiddenNotices: Bool = false) -> Data {
+    /// the title, the meta description, the video description, page code and a comment. Some
+    /// modes add body content: notices and a widget under hidden elements, a notice in the body
+    /// of a closed `<details>`, or a lesson that explains verification without asking for it.
+    static func inertTextPage(player: [String: Any]?, visitor: String?, mode: String) -> Data {
         var html = "<html><head>"
         html += "<title>How to verify your account - YouTube</title>"
         html += "<meta name=\"description\" content=\"Verify your account: unusual traffic and not a bot, explained.\">"
@@ -534,7 +566,14 @@ final class FixtureProtocol: URLProtocol {
         }
         html += "</head><body>"
         html += "<!-- Confirm your age appears only in this comment. -->"
-        if hiddenNotices {
+        switch mode {
+        case "watch-closed-details":
+            html += "<h1>Music lesson</h1><details><summary>Help</summary><p>Please verify your age to play this video.</p></details>"
+        case "watch-verification-lesson":
+            html += "<article><h1>Uploading a video</h1><p>This lesson explains why an upload remains private until verification is complete.</p></article>"
+        default: break
+        }
+        if mode == "watch-hidden-notice" {
             html += "<!-- Optional g-recaptcha component not loaded. -->"
             html += "<div hidden><p>Please verify your age to play this video.</p></div>"
             html += "<dialog><p>Confirm you're not a bot</p></dialog>"
@@ -557,6 +596,68 @@ extension URLSessionConfiguration {
         config.protocolClasses = [FixtureProtocol.self]
         FixtureProtocol.recordConfig(config)
         return config
+    }
+}
+
+// MARK: - Loopback origin
+
+/// A real HTTP/1.1 origin on 127.0.0.1, for faults that a URLProtocol cannot model: a response
+/// body that breaks off or stalls after the headers. `reply` receives the connection and the
+/// number of the request (from 1), after the request head has arrived.
+final class WireOrigin: @unchecked Sendable {
+    let port: UInt16
+    private let lock = NSLock()
+    private var count = 0
+    var requests: Int { lock.withLock { count } }
+
+    init(reply: @escaping @Sendable (Int32, Int) -> Void) {
+        let listener = socket(AF_INET, SOCK_STREAM, 0)
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        withUnsafeMutablePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                _ = bind(listener, $0, length)
+                _ = getsockname(listener, $0, &length)
+            }
+        }
+        listen(listener, 16)
+        port = UInt16(bigEndian: address.sin_port)
+        Thread.detachNewThread { [self] in
+            while true {
+                let connection = accept(listener, nil, nil)
+                guard connection >= 0 else { return }
+                var on: Int32 = 1
+                setsockopt(connection, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
+                var head: [UInt8] = [], buffer = [UInt8](repeating: 0, count: 4096)
+                while !head.suffix(4).elementsEqual([13, 10, 13, 10]) {
+                    let got = read(connection, &buffer, buffer.count)
+                    if got <= 0 { break }
+                    head += buffer[0..<got]
+                }
+                let number = lock.withLock { count += 1; return count }
+                Thread.detachNewThread { reply(connection, number) }
+            }
+        }
+    }
+
+    static func transmit(_ connection: Int32, _ text: String) {
+        let bytes = Array(text.utf8)
+        var sent = 0
+        while sent < bytes.count {
+            let wrote = bytes[sent...].withUnsafeBytes { write(connection, $0.baseAddress, $0.count) }
+            if wrote <= 0 { return }
+            sent += wrote
+        }
+    }
+
+    /// Closes with a TCP reset instead of an orderly close.
+    static func reset(_ connection: Int32) {
+        var abort = linger(l_onoff: 1, l_linger: 0)
+        setsockopt(connection, SOL_SOCKET, SO_LINGER, &abort, socklen_t(MemoryLayout<linger>.size))
+        close(connection)
     }
 }
 
@@ -585,8 +686,8 @@ enum Bytes {
     static func box(_ type: String, _ payload: [UInt8]) -> [UInt8] { be32(UInt32(8 + payload.count)) + Array(type.utf8) + payload }
 
     /// The track uses 1000 ticks per second and one byte per sample.
-    static func clipInit(sampleTicks: UInt32) -> [UInt8] {
-        let mdhd = box("mdhd", be32(0) + be32(0) + be32(0) + be32(1000) + be32(0) + be32(0))
+    static func clipInit(sampleTicks: UInt32, timescale: UInt32 = 1000) -> [UInt8] {
+        let mdhd = box("mdhd", be32(0) + be32(0) + be32(0) + be32(timescale) + be32(0) + be32(0))
         let hdlr = box("hdlr", be32(0) + be32(0) + Array("soun".utf8) + [UInt8](repeating: 0, count: 13))
         let stbl = box("stbl", box("stsd", be32(0) + be32(0)))
         let trak = box("trak", box("mdia", mdhd + hdlr + box("minf", stbl)))
@@ -596,21 +697,26 @@ enum Bytes {
 
     /// Media segment `n`: one `moof` with four samples, and an `mdat` whose four bytes are the
     /// stream seconds 4n to 4n+3. The data offset includes the fragment and the media header.
-    static func clipSegment(_ n: Int) -> [UInt8] {
+    static func clipSegment(_ n: Int, sampleBase: Int = 0) -> [UInt8] {
         let tfhd = box("tfhd", be32(0x020000) + be32(1))
         let tfdt = box("tfdt", be32(0) + be32(UInt32(n * 4000)))
         let trun = box("trun", be32(0x000001) + be32(4) + be32(76))
-        return box("moof", box("traf", tfhd + tfdt + trun)) + box("mdat", (0..<4).map { UInt8(4 * n + $0) })
+        return box("moof", box("traf", tfhd + tfdt + trun)) + box("mdat", (0..<4).map { UInt8(sampleBase + 4 * n + $0) })
     }
 
-    static let indexedClip: [UInt8] = {
-        let segments = (0..<15).map(clipSegment)
+    static let indexedClip: [UInt8] = makeIndexedClip(timescale: 1000, sampleBase: 0)
+    /// A second edition of `indexedClip` with the same size and box offsets, but a different
+    /// track timescale and different sample bytes.
+    static let changedIndexedClip: [UInt8] = makeIndexedClip(timescale: 2000, sampleBase: 100)
+
+    static func makeIndexedClip(timescale: UInt32, sampleBase: Int) -> [UInt8] {
+        let segments = (0..<15).map { clipSegment($0, sampleBase: sampleBase) }
         // Place the media after the initial 64 KiB probe, as in a larger real file.
         let padding = box("free", [UInt8](repeating: 0, count: 65_536))
         var index = be32(0) + be32(1) + be32(1000) + be32(0) + be32(UInt32(padding.count)) + be32(UInt32(segments.count))
         for segment in segments { index += be32(UInt32(segment.count)) + be32(4000) + be32(0) }
-        return clipInit(sampleTicks: 1000) + box("sidx", index) + padding + segments.flatMap { $0 }
-    }()
+        return clipInit(sampleTicks: 1000, timescale: timescale) + box("sidx", index) + padding + segments.flatMap { $0 }
+    }
 
     static let fragmentIndexedClip: [UInt8] = {
         var bytes = clipInit(sampleTicks: 1000)
@@ -809,13 +915,14 @@ struct RegressionChecks {
                   "a watch-page bot gate with streaming data stops before visitor and /player; error=\(String(describing: error)), paths=\(paths)")
         // Finding 2: a visible notice outranks embedded metadata; inert text is not a notice.
         case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age",
-             "watch-blocked-text", "watch-blocked-notice", "watch-header-age":
+             "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
+             "watch-details-summary":
             let before = FixtureProtocol.requests().count
             let error = await extractError()
             let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
             check(closedByBotGate(error) && paths == ["/watch"] && savedOutputs().isEmpty,
                   "a visible verification notice stops after the first response, even when the page embeds ordinary player metadata; error=\(String(describing: error)), paths=\(paths), saved=\(savedOutputs())")
-        case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice":
+        case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson":
             let (file, error) = await download(audioExt: "webm")
             let bytes = file.flatMap { try? Data(contentsOf: $0) }
             let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
@@ -960,6 +1067,42 @@ struct RegressionChecks {
             let attempts = FixtureProtocol.requests().count - before
             check(status == 429 && attempts == 1,
                   "HTTP 429 is not retried; status=\(status), attempts=\(attempts)")
+        // A refusal whose explanation breaks off or stalls after the headers is still the refusal:
+        // one request and its status. A connection lost before any response stays a transport
+        // failure and is retried.
+        case "refusal-body-reset", "refusal-body-stall", "lost-before-response":
+            let explanation = String(repeating: "Not available. ", count: 200)
+            let origin = WireOrigin { connection, number in
+                switch mode {
+                case "refusal-body-reset":
+                    WireOrigin.transmit(connection, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nbb8\r\n" + explanation + "\r\n")
+                    usleep(100_000)
+                    WireOrigin.reset(connection)
+                case "refusal-body-stall" where number == 1:
+                    WireOrigin.transmit(connection, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 50000\r\nConnection: close\r\n\r\n" + explanation)
+                    sleep(45)
+                    close(connection)
+                case "refusal-body-stall":
+                    WireOrigin.transmit(connection, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 3000\r\nConnection: close\r\n\r\n" + explanation)
+                    close(connection)
+                default:
+                    WireOrigin.reset(connection)
+                }
+            }
+            var status = 0
+            var failure: Error?
+            do {
+                _ = try await HTTPClient().fetchData(url: "http://127.0.0.1:\(origin.port)/unavailable", retries: 3)
+            } catch HTTPError.status(let code, _) {
+                status = code
+            } catch { failure = error }
+            if mode == "lost-before-response" {
+                check(status == 0 && failure is URLError && origin.requests > 1,
+                      "a connection lost before any response is retried as a transport failure; requests=\(origin.requests), error=\(String(describing: failure))")
+            } else {
+                check(status == 403 && origin.requests == 1,
+                      "a 403 ends the request at its headers, whatever happens to its body; status=\(status), requests=\(origin.requests), error=\(String(describing: failure))")
+            }
         case "cancel-slots":
             // A waiter that is cancelled gives its slot back when nobody queued behind it.
             let pacer = YouTubeExtractor.YTGuard()
@@ -1368,6 +1511,33 @@ struct RegressionChecks {
                 let fetched = FixtureProtocol.requests().dropFirst(before).map(\.url.path).filter { $0.hasSuffix(".m4s") }
                 check(samples == expected && fetched == parts, "section \(start)-\(end): samples=\(samples), parts=\(fetched)")
             }
+        case "sidx-untagged-change":
+            // The server names no edition and changes the file after the first read. The saved
+            // clip must come from one edition (timescale and samples agree), or no file is saved.
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.cookieSource = "none"
+            options.connections = 1
+            let out = AppPaths.appSupportDir.appendingPathComponent("out")
+            options.outputDir = out.path
+            options.section = SectionRange(start: 8, end: 12)
+            var file: URL?
+            var failure: Error?
+            do {
+                file = try await DownloadEngine().downloadSingle(url: "https://media.invalid/indexed.mp4", settings: settings, options: options)
+            } catch { failure = error }
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: out.path)) ?? []
+            if let file {
+                let data = try Data(contentsOf: file)
+                let samples = data.range(of: Data("mdat".utf8)).map { data[$0.upperBound...].map(Int.init) } ?? []
+                let timescale = try MP4Muxer.readTracks(from: file).first?.timescale
+                let oneEdition = (timescale == 1000 && samples == Array(8..<12)) || (timescale == 2000 && samples.allSatisfy { $0 >= 100 })
+                check(oneEdition, "a saved clip comes from one edition: timescale=\(String(describing: timescale)), samples=\(samples)")
+            } else {
+                check(files.isEmpty, "a changed edition fails without a file: error=\(String(describing: failure)), files=\(files)")
+            }
         case "parallel-redirect":
             // Two connections and a redirector that alternates between mirrors whose different
             // copies carry the same ETag text: every range must come from the probed mirror.
@@ -1460,6 +1630,16 @@ struct RegressionChecks {
                 let expected = (0..<70).reduce(into: Data()) { $0.append(Data(repeating: UInt8($1), count: 1024)) } + Data(repeating: 0, count: 1024)
                 check(saved == expected && full == 2, "an evicted copy is replaced by a matching complete read: \(saved.count) bytes, \(full) complete reads of the first object")
             }
+        case "hls-event-oversized":
+            // One untagged object larger than the 64 MiB copy budget: after its first range the
+            // copy is released, and the later range comes from a new complete read that matches.
+            let file = AppPaths.appSupportDir.appendingPathComponent("event.ts")
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/event.m3u8", destination: file)
+            let saved = try Data(contentsOf: file)
+            let full = FixtureProtocol.requests().filter { $0.url.path == "/big.bin" && $0.range == nil }.count
+            check(saved == Data(repeating: 0x41, count: 1024) + Data(repeating: 0x5A, count: 1024) && full == 2,
+                  "a copy over the budget is not kept between playlist updates: \(saved.count) bytes, \(full) complete reads")
         case "hls-changed-edition", "hls-untagged-edition":
             let file = AppPaths.appSupportDir.appendingPathComponent("clip.ts")
             var rejected = false

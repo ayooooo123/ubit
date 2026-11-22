@@ -615,6 +615,8 @@ public final class DownloadEngine: @unchecked Sendable {
 
         let reqStart = section.start ?? 0
         let reqEnd = section.end ?? .infinity
+        // Reads outside `head` that decided this clip; without an edition they are checked again.
+        var probed: [(start: Int64, bytes: Data)] = []
         if reqEnd > last.endTimeSec {
             // An sidx can describe just one fragment. If there could be more media
             // after its references, use the full-file path rather than truncate or reject a clip.
@@ -631,7 +633,9 @@ public final class DownloadEngine: @unchecked Sendable {
                         guard end < size else { return nil }
                         let data = try await client.fetchRange(
                             url: fmt.url, range: ByteRange(start: start, end: end), headers: headers, edition: edition).data
-                        return data.count == length ? data : nil
+                        guard data.count == length else { return nil }
+                        probed.append((start, data))
+                        return data
                     }
                     return head[Int(start)..<(Int(start) + length)]
                 }
@@ -663,9 +667,30 @@ public final class DownloadEngine: @unchecked Sendable {
                 "The --section range is outside the stream"])
         }
 
-        let initBytes = head.prefix(Int(parsed.initEndOffset + 1))
         let bodyRange = ByteRange(start: firstSeg.byteRange.start, end: lastSeg.byteRange.end)
-        let bodyBytes = try await client.fetchRange(url: fmt.url, range: bodyRange, headers: headers, edition: edition).data
+        let initBytes: Data, bodyBytes: Data
+        if edition != nil {
+            initBytes = head.prefix(Int(parsed.initEndOffset + 1))
+            bodyBytes = try await client.fetchRange(url: fmt.url, range: bodyRange, headers: headers, edition: edition).data
+        } else {
+            // Without an edition, two reads can come from two different files. The index, the
+            // initialization data, the media and the trailing box that ended the index must then
+            // come from one response: the bytes already read when they reach far enough, else one
+            // read from byte 0 that must repeat those bytes.
+            let end = probed.map { $0.start + Int64($0.bytes.count) - 1 }.reduce(bodyRange.end, max)
+            let whole: Data
+            if Int64(head.count) > end {
+                whole = head
+            } else {
+                whole = try await client.fetchRange(url: fmt.url, range: ByteRange(start: 0, end: end), headers: headers).data
+                guard Int64(whole.count) > end, whole.prefix(head.count) == head,
+                      probed.allSatisfy({ whole.subdata(in: Int($0.start)..<Int($0.start) + $0.bytes.count) == $0.bytes }) else {
+                    throw HTTPError.rangeUnsupported
+                }
+            }
+            initBytes = whole.prefix(Int(parsed.initEndOffset + 1))
+            bodyBytes = whole.subdata(in: Int(bodyRange.start)..<Int(bodyRange.end + 1))
+        }
         guard Int64(bodyBytes.count) - 1 == bodyRange.end - bodyRange.start else {
             throw HTTPError.rangeUnsupported
         }

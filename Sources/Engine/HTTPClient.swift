@@ -318,11 +318,25 @@ public final class HTTPClient: @unchecked Sendable {
             try Task.checkCancellation()
             do {
                 let req = try makeRequest(url: url, method: method, headers: headers, body: body, includeCookies: includeCookies)
-                let (data, resp) = try await session.data(for: req)
-                try await limiter.consume(data.count)
+                // The status decides as soon as the headers arrive. A refusal ends here even when
+                // its explanation stalls or breaks off, so a body error cannot cause another request.
+                let (bytes, resp) = try await session.bytes(for: req)
                 guard let http = resp as? HTTPURLResponse else {
+                    bytes.task.cancel()
                     throw HTTPError.badURL(url)
                 }
+                guard (200..<300).contains(http.statusCode) else {
+                    bytes.task.cancel()
+                    if [500, 502, 503, 504].contains(http.statusCode) && attempt + 1 < retries {
+                        try await Task.sleep(nanoseconds: UInt64(400_000_000 * (1 << attempt)))
+                        continue
+                    }
+                    throw HTTPError.status(http.statusCode, url)
+                }
+                var data = Data()
+                if http.expectedContentLength > 0 { data.reserveCapacity(Int(min(http.expectedContentLength, 1 << 26))) }
+                for try await b in bytes { data.append(b) }
+                try await limiter.consume(data.count)
                 if http.statusCode == 206, method == "GET", req.value(forHTTPHeaderField: "Range") == nil {
                     guard let value = http.value(forHTTPHeaderField: "Content-Range"),
                           let range = Self.parseContentRange(value), range.first == 0,
@@ -330,14 +344,7 @@ public final class HTTPClient: @unchecked Sendable {
                         throw HTTPError.rangeUnsupported
                     }
                 }
-                if (200..<300).contains(http.statusCode) {
-                    return (data, http)
-                }
-                if [500, 502, 503, 504].contains(http.statusCode) && attempt + 1 < retries {
-                    try await Task.sleep(nanoseconds: UInt64(400_000_000 * (1 << attempt)))
-                    continue
-                }
-                throw HTTPError.status(http.statusCode, url)
+                return (data, http)
             } catch is CancellationError {
                 throw CancellationError()
             } catch let error as URLError where error.code == .cancelled {

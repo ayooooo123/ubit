@@ -315,7 +315,7 @@ final class FixtureProtocol: URLProtocol {
                 case "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age", "watch-blocked-notice", "watch-header-age",
                      "watch-verify-human", "watch-open-details", "watch-details-summary", "watch-confirm-identity",
                      "watch-identity-phone", "watch-age-device", "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online",
-                     "watch-identity-right-now", "watch-age-upon", "watch-age-footnote":
+                     "watch-identity-right-now", "watch-age-upon", "watch-age-footnote", "watch-purpose-clause":
                     player = Self.playerPayload(status: "OK", streaming: Self.directStreaming(1, hls: true), title: title)
                 case "hls-fallback-watchlist":
                     player = Self.hlsOnlyPlayer(title: title)
@@ -341,7 +341,7 @@ final class FixtureProtocol: URLProtocol {
                      "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
                      "watch-details-summary", "watch-confirm-identity", "watch-identity-phone", "watch-age-device",
                      "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online", "watch-identity-right-now",
-                     "watch-age-upon", "watch-age-footnote":
+                     "watch-age-upon", "watch-age-footnote", "watch-purpose-clause":
                     data = Self.wallPage(player: player, mode: mode)
                 case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson",
                      "watch-agent-settings", "watch-ordinary-objects":
@@ -619,6 +619,7 @@ final class FixtureProtocol: URLProtocol {
         case "watch-identity-right-now": html += "<main role=\"alert\"><p>Confirm your identity right now to continue watching.</p></main>"
         case "watch-age-upon": html += "<main role=\"alert\"><p>Please verify your age upon signing in to watch this video.</p></main>"
         case "watch-age-footnote": html += "<main role=\"alert\"><p>Verify your age<sup>1</sup> to continue watching.</p></main>"
+        case "watch-purpose-clause": html += "<main role=\"alert\"><p>To continue watching, please verify your age.</p></main>"
         default: html += "<main>Verify your identity before playback can continue. Playback is blocked.</main>"
         }
         if let player {
@@ -1008,7 +1009,7 @@ struct RegressionChecks {
              "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
              "watch-details-summary", "watch-confirm-identity", "watch-identity-phone", "watch-age-device",
              "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online", "watch-identity-right-now",
-             "watch-age-upon", "watch-age-footnote":
+             "watch-age-upon", "watch-age-footnote", "watch-purpose-clause":
             let before = FixtureProtocol.requests().count
             let error = await extractError()
             let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)

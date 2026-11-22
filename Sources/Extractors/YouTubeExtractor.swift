@@ -298,6 +298,10 @@ public struct YouTubeExtractor: SiteExtractor {
     /// bottleneck" are not instructions.
     private static func isInstruction(_ text: String) -> Bool {
         var rest = Substring(text)
+        // A purpose clause can precede the imperative: “To continue watching, please verify …”.
+        if rest.hasPrefix("to "), let comma = rest.firstIndex(of: ",") {
+            rest = rest[rest.index(after: comma)...].drop(while: \.isWhitespace)
+        }
         if rest.hasPrefix("please ") { rest = rest.dropFirst(7) }
         guard let verb = ["verify ", "confirm "].first(where: { rest.hasPrefix($0) }) else { return false }
         rest = rest.dropFirst(verb.count)

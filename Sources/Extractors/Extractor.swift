@@ -47,6 +47,7 @@ public enum ExtractorUtils {
              ExtractorError.playbackDenied, ExtractorError.drmProtected: return true
         case let transport as URLError: return !HTTPClient.canRetryTransport(transport)
         case HTTPError.status(let code, _): return (400..<500).contains(code) && code != 404
+        case HTTPError.noStatus: return true
         default: return false
         }
     }

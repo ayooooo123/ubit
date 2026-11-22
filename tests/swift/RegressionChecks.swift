@@ -252,7 +252,7 @@ final class FixtureProtocol: URLProtocol {
                 case "watch-wall-text", "watch-blocked-text":
                     player = nil
                 case "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age", "watch-blocked-notice", "watch-header-age",
-                     "watch-verify-human", "watch-open-details", "watch-details-summary":
+                     "watch-verify-human", "watch-open-details", "watch-details-summary", "watch-confirm-identity":
                     player = Self.playerPayload(status: "OK", streaming: Self.directStreaming(1, hls: true), title: title)
                 case "hls-fallback-watchlist":
                     player = Self.hlsOnlyPlayer(title: title)
@@ -276,9 +276,10 @@ final class FixtureProtocol: URLProtocol {
                 switch mode {
                 case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age",
                      "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
-                     "watch-details-summary":
+                     "watch-details-summary", "watch-confirm-identity":
                     data = Self.wallPage(player: player, mode: mode)
-                case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson":
+                case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson",
+                     "watch-agent-settings":
                     data = Self.inertTextPage(player: mode == "watch-lesson-no-state" ? nil : player, visitor: visitor, mode: mode)
                 default:
                     data = Self.watchPage(player: player, visitor: visitor)
@@ -540,6 +541,7 @@ final class FixtureProtocol: URLProtocol {
         case "watch-verify-human": html += "<main role=\"alert\"><p>Please verify that you are human to continue.</p></main>"
         case "watch-open-details": html += "<h1>Music lesson</h1><details open><summary>Help</summary><p>Please verify your age to play this video.</p></details>"
         case "watch-details-summary": html += "<details><summary>Verify your age to play this video.</summary><p>Help</p></details>"
+        case "watch-confirm-identity": html += "<main><p>Please confirm your identity to continue watching.</p></main>"
         default: html += "<main>Verify your identity before playback can continue. Playback is blocked.</main>"
         }
         if let player {
@@ -574,6 +576,8 @@ final class FixtureProtocol: URLProtocol {
             html += "<h1>Music lesson</h1><details><summary>Help</summary><p>Please verify your age to play this video.</p></details>"
         case "watch-verification-lesson":
             html += "<article><h1>Uploading a video</h1><p>This lesson explains why an upload remains private until verification is complete.</p></article>"
+        case "watch-agent-settings":
+            html += "<article><h1>Remote playback</h1><p>Verify your agent settings, then try again.</p><p>Verify your audio settings.</p></article>"
         default: break
         }
         if mode == "watch-hidden-notice" {
@@ -613,7 +617,7 @@ final class WireOrigin: @unchecked Sendable {
     private var count = 0
     var requests: Int { lock.withLock { count } }
 
-    init(reply: @escaping @Sendable (Int32, Int) -> Void) {
+    init(reply: @escaping @Sendable (Int32, Int, String) -> Void) {
         let listener = socket(AF_INET, SOCK_STREAM, 0)
         var address = sockaddr_in()
         address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
@@ -641,7 +645,8 @@ final class WireOrigin: @unchecked Sendable {
                     head += buffer[0..<got]
                 }
                 let number = lock.withLock { count += 1; return count }
-                Thread.detachNewThread { reply(connection, number) }
+                let request = String(decoding: head, as: UTF8.self)
+                Thread.detachNewThread { reply(connection, number, request) }
             }
         }
     }
@@ -922,13 +927,14 @@ struct RegressionChecks {
         // Finding 2: a visible notice outranks embedded metadata; inert text is not a notice.
         case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age",
              "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
-             "watch-details-summary":
+             "watch-details-summary", "watch-confirm-identity":
             let before = FixtureProtocol.requests().count
             let error = await extractError()
             let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
             check(closedByBotGate(error) && paths == ["/watch"] && savedOutputs().isEmpty,
                   "a visible verification notice stops after the first response, even when the page embeds ordinary player metadata; error=\(String(describing: error)), paths=\(paths), saved=\(savedOutputs())")
-        case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson":
+        case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson",
+             "watch-agent-settings":
             let (file, error) = await download(audioExt: "webm")
             let bytes = file.flatMap { try? Data(contentsOf: $0) }
             let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
@@ -1078,7 +1084,7 @@ struct RegressionChecks {
         // failure and is retried.
         case "refusal-body-reset", "refusal-body-stall", "lost-before-response":
             let explanation = String(repeating: "Not available. ", count: 200)
-            let origin = WireOrigin { connection, number in
+            let origin = WireOrigin { connection, number, _ in
                 switch mode {
                 case "refusal-body-reset":
                     WireOrigin.transmit(connection, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\nbb8\r\n" + explanation + "\r\n")
@@ -1109,6 +1115,58 @@ struct RegressionChecks {
                 check(status == 403 && origin.requests == 1,
                       "a 403 ends the request at its headers, whatever happens to its body; status=\(status), requests=\(origin.requests), error=\(String(describing: failure))")
             }
+        // URLSession hands over a response only with its first body byte. A 403 that sends its
+        // headers and then no body reaches uBit as a timeout, so its status is unknown; neither
+        // fetchData nor a parallel range worker sends that request again. A repeated request
+        // would get the whole refusal at once.
+        case "refusal-headers-only":
+            final class Counts: @unchecked Sendable {
+                private let lock = NSLock()
+                private var seen: [String: Int] = [:]
+                func add(_ key: String) -> Int { lock.withLock { seen[key, default: 0] += 1; return seen[key]! } }
+                var all: [String: Int] { lock.withLock { seen } }
+            }
+            let refusal = "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 16\r\nConnection: close\r\n\r\n"
+            let single = WireOrigin { connection, number, _ in
+                WireOrigin.transmit(connection, refusal)
+                if number == 1 { sleep(45) } else { WireOrigin.transmit(connection, "Not available.\r\n") }
+                close(connection)
+            }
+            let ranges = Counts()
+            let size = 1 << 20
+            let parallel = WireOrigin { connection, _, request in
+                let range = request.split(separator: "\r\n")
+                    .first { $0.lowercased().hasPrefix("range:") }
+                    .map { $0.dropFirst(6).trimmingCharacters(in: .whitespaces) } ?? ""
+                if range == "bytes=0-0" {
+                    WireOrigin.transmit(connection, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/\(size)\r\nETag: \"e1\"\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx")
+                } else if ranges.add(range) == 1 {
+                    WireOrigin.transmit(connection, refusal)
+                    sleep(45)
+                } else {
+                    WireOrigin.transmit(connection, refusal + "Not available.\r\n")
+                }
+                close(connection)
+            }
+            let file = AppPaths.appSupportDir.appendingPathComponent("headers-only.bin")
+            async let fetchFailure: Error? = {
+                do { _ = try await HTTPClient().fetchData(url: "http://127.0.0.1:\(single.port)/unavailable", retries: 3) } catch { return error }
+                return nil
+            }()
+            async let downloadFailure: Error? = {
+                do { try await HTTPClient().downloadFile(url: "http://127.0.0.1:\(parallel.port)/unavailable.bin", destination: file, connections: 2) } catch { return error }
+                return nil
+            }()
+            func unknownStatus(_ error: Error?) -> Bool {
+                if case HTTPError.noStatus? = error as? HTTPError { return true }
+                return false
+            }
+            let (first, second) = await (fetchFailure, downloadFailure)
+            check(unknownStatus(first) && single.requests == 1,
+                  "fetchData does not repeat a request whose headers arrived without a body; requests=\(single.requests), error=\(String(describing: first))")
+            let seen = ranges.all
+            check(unknownStatus(second) && !seen.isEmpty && seen.values.allSatisfy { $0 == 1 } && !FileManager.default.fileExists(atPath: file.path),
+                  "a range worker does not repeat a range whose headers arrived without a body; ranges=\(seen), error=\(String(describing: second))")
         case "cancel-slots":
             // A waiter that is cancelled gives its slot back when nobody queued behind it.
             let pacer = YouTubeExtractor.YTGuard()

@@ -7,6 +7,8 @@ public enum HTTPError: LocalizedError {
     case rangeUnsupported
     case incomplete(received: Int64, expected: Int64)
     case canceled
+    /// The response headers arrived, but the request failed before URLSession handed them over.
+    case noStatus(String)
 
     public var errorDescription: String? {
         switch self {
@@ -16,6 +18,8 @@ public enum HTTPError: LocalizedError {
         case .incomplete(let received, let expected):
             return "Incomplete download: received \(received) of \(expected) bytes"
         case .canceled: return "Canceled"
+        case .noStatus(let u):
+            return "No HTTP status from \(URL(string: u)?.host ?? u): the response headers arrived, but its body did not start before the request failed. uBit does not repeat the request."
         }
     }
 }
@@ -202,6 +206,20 @@ private actor WorkStealingQueue {
 
 }
 
+/// Records whether the response of a task's last transaction had started when the task ended.
+private final class ResponseStart: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var started: Bool?
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
+        let value = metrics.transactionMetrics.last?.responseStartDate != nil
+        lock.withLock { started = value }
+    }
+
+    /// True only when the metrics arrived and show that no response had started.
+    var noResponse: Bool { lock.withLock { started == false } }
+}
+
 public final class HTTPClient: @unchecked Sendable {
     public static let defaultBrowserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15"
 
@@ -305,6 +323,22 @@ public final class HTTPClient: @unchecked Sendable {
         return req
     }
 
+    /// Sends `req` and returns at the first body byte. URLSession hands over a response only
+    /// with its first body byte, so a refusal that sends headers and then stalls or fails reaches
+    /// this code as a transport error. When the task metrics show that the response of the last
+    /// transaction had started, or show nothing, the status is unknown and could be a refusal:
+    /// the error becomes `HTTPError.noStatus`, which no caller retries. A transport error is
+    /// therefore retried only when no response had started. URLSession delivers the metrics
+    /// before the task fails.
+    func responseBytes(for req: URLRequest, url: String) async throws -> (URLSession.AsyncBytes, URLResponse) {
+        let start = ResponseStart()
+        do {
+            return try await session.bytes(for: req, delegate: start)
+        } catch let error as URLError where error.code != .cancelled && !start.noResponse {
+            throw HTTPError.noStatus(url)
+        }
+    }
+
     public func fetchData(
         url: String,
         method: String = "GET",
@@ -318,9 +352,10 @@ public final class HTTPClient: @unchecked Sendable {
             try Task.checkCancellation()
             do {
                 let req = try makeRequest(url: url, method: method, headers: headers, body: body, includeCookies: includeCookies)
-                // The status decides as soon as the headers arrive. A refusal ends here even when
-                // its explanation stalls or breaks off, so a body error cannot cause another request.
-                let (bytes, resp) = try await session.bytes(for: req)
+                // The status decides as soon as URLSession hands over the response, at the first
+                // body byte. A refusal ends here even when its explanation then stalls or breaks
+                // off, so a body error cannot cause another request.
+                let (bytes, resp) = try await responseBytes(for: req, url: url)
                 guard let http = resp as? HTTPURLResponse else {
                     bytes.task.cancel()
                     throw HTTPError.badURL(url)
@@ -478,7 +513,7 @@ public final class HTTPClient: @unchecked Sendable {
         var hdrs = headers ?? [:]
         hdrs["Range"] = "bytes=0-0"
         let req = try makeRequest(url: url, headers: hdrs)
-        let (_, resp) = try await session.bytes(for: req)
+        let (_, resp) = try await responseBytes(for: req, url: url)
         guard let http = resp as? HTTPURLResponse else { return (nil, false, nil) }
         guard (200..<300).contains(http.statusCode) else {
             throw HTTPError.status(http.statusCode, url)
@@ -680,7 +715,7 @@ public final class HTTPClient: @unchecked Sendable {
                 var hdrs = headers ?? [:]
                 hdrs["Range"] = "bytes=\(curStart)-\(reqEnd)"
                 let req = try makeRequest(url: url, headers: hdrs)
-                let (bytes, resp) = try await session.bytes(for: req)
+                let (bytes, resp) = try await responseBytes(for: req, url: url)
                 guard let http = resp as? HTTPURLResponse else {
                     throw HTTPError.badURL(url)
                 }
@@ -798,7 +833,7 @@ public final class HTTPClient: @unchecked Sendable {
             hdrs["If-Range"] = resumeEdition?.tag
         }
         let req = try makeRequest(url: source, headers: hdrs)
-        let (bytes, resp) = try await session.bytes(for: req)
+        let (bytes, resp) = try await responseBytes(for: req, url: url)
         guard let http = resp as? HTTPURLResponse else { throw HTTPError.badURL(url) }
         guard (200..<300).contains(http.statusCode) else {
             throw HTTPError.status(http.statusCode, url)

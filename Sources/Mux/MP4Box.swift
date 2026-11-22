@@ -959,13 +959,13 @@ public enum MP4Muxer {
             if let syncStart {
                 var ticks = Decimal(syncStart.ticks) * Decimal(track.timescale) / Decimal(syncStart.scale)
                 var rounded = Decimal()
-                NSDecimalRound(&rounded, &ticks, 0, .down)
+                NSDecimalRound(&rounded, &ticks, 0, track.kind == .audio ? .up : .down)
                 start = NSDecimalNumber(decimal: rounded).int64Value
             } else if let startAt = clock?.start {
                 var ticks = ((startAt.ticks * baseScale - baseTicks * startAt.scale) * Decimal(track.timescale))
                     / (startAt.scale * baseScale)
                 var rounded = Decimal()
-                NSDecimalRound(&rounded, &ticks, 0, .down)
+                NSDecimalRound(&rounded, &ticks, 0, .up)
                 start = NSDecimalNumber(decimal: rounded).int64Value
             } else {
                 start = boundaryTicks(startBoundary, track.timescale, .down)
@@ -1009,6 +1009,11 @@ public enum MP4Muxer {
                 dts += Int64(sample.duration)
             }
             guard let first else { return nil }
+            if track.kind == .audio && (syncStart != nil || clock?.start != nil) {
+                // Keep the overlapping packet for decoding, but hide its prefix before
+                // the video sync picture. The edit is relative to that packet's DTS.
+                shownStart = max(shownStart, start)
+            }
             var copy = track
             copy.samples = Array(track.samples[first...last])
             var firstPTS = Int64.max

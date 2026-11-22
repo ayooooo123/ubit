@@ -1767,6 +1767,28 @@ struct RegressionChecks {
                 let got = samples(scale: 30000, ticks: 1001, count: 30, group: 30, base: 1.001, start: 1.2, end: end)
                 check(got == Array(0..<UInt64(frames)), "exclusive end \(end): \(got)")
             }
+            // At 2 s the video is at a sync picture, but the 48 kHz audio is 768 ticks
+            // into packet 93. Reopen the output to check both its packet and its edit.
+            let pictures = MP4Track(trackID: 1, kind: .video, timescale: 1, stsdPayload: Data(), samples:
+                (0..<4).map { MP4Sample(size: 1, duration: 1, isSync: $0 % 2 == 0, inlineData: Data([UInt8($0)])) })
+            let packets = MP4Track(trackID: 2, kind: .audio, timescale: 48000, stsdPayload: Data(), samples:
+                (0..<150).map { MP4Sample(size: 1, duration: 1024, inlineData: Data([UInt8($0)])) })
+            let section = SectionRange(start: 2.25, end: 2.56)
+            for separate in [false, true] {
+                let clock = MP4Muxer.SectionClock()
+                let tracks = separate
+                    ? MP4Muxer.trimTracks([pictures], section: section, clock: clock) + MP4Muxer.trimTracks([packets], section: section, clock: clock)
+                    : MP4Muxer.trimTracks([pictures, packets], section: section)
+                let url = AppPaths.appSupportDir.appendingPathComponent("packet-clock-\(separate).mp4")
+                try MP4Muxer.writeMP4(tracks: tracks, sourceFiles: [], destination: url)
+                let saved = try MP4Muxer.readTracks(from: url)
+                let data = try Data(contentsOf: url)
+                let audio = saved.first { $0.kind == .audio }
+                let packet = audio?.samples.first.map { data[Int($0.offset)] }
+                let picture = saved.first { $0.kind == .video }?.samples.first.map { data[Int($0.offset)] }
+                check(picture == 2 && packet == 93 && audio?.editMediaTimeTicks == 768 && audio?.editSegmentTicks == 26880,
+                      "separate=\(separate): picture 2 starts at tick 768 of audio packet 93; packet=\(String(describing: packet)), edit=\(String(describing: audio?.editMediaTimeTicks)), duration=\(String(describing: audio?.editSegmentTicks))")
+            }
             let video = MP4Track(trackID: 1, kind: .video, timescale: 30, stsdPayload: Data(), samples:
                 (0..<10).map { MP4Sample(offset: UInt64($0 + 10), size: 1, duration: 1, isSync: $0 == 0) })
             let fromThird = MP4Muxer.trimTracks([video], section: SectionRange(start: 0.4, end: 0.5),

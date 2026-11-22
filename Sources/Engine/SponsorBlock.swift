@@ -25,7 +25,7 @@ public enum SponsorAndSubtitles {
         client: HTTPClient,
         videoID: String,
         categories: [String]
-    ) async -> [SponsorSegment] {
+    ) async throws -> [SponsorSegment] {
         guard !videoID.isEmpty, !categories.isEmpty else { return [] }
         let digest = SHA256.hash(data: Data(videoID.utf8))
         let hex = digest.map { String(format: "%02x", $0) }.joined()
@@ -35,7 +35,7 @@ public enum SponsorAndSubtitles {
             return []
         }
         let url = "https://sponsor.ajay.app/api/skipSegments/\(prefix)?categories=\(catParam)"
-        guard let any = try? await client.fetchJSON(url: url, includeCookies: false) as? [[String: Any]] else {
+        guard let any = try await ExtractorUtils.optionalRequest({ try await client.fetchJSON(url: url, includeCookies: false) }) as? [[String: Any]] else {
             return []
         }
         var out: [SponsorSegment] = []

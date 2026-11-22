@@ -263,7 +263,7 @@ public struct RumbleExtractor: SiteExtractor {
                     for (resKey, infoAny) in kindDict {
                         guard let item = infoAny as? [String: Any], let surl = item["url"] as? String else { continue }
                         let isHLS = kind == "hls" || surl.contains(".m3u8")
-                        if isHLS, let hls = try? await HLSEngine.extractFormats(client: client, playlistURL: surl) {
+                        if isHLS, let hls = try await ExtractorUtils.optionalRequest({ try await HLSEngine.extractFormats(client: client, playlistURL: surl) }) {
                             formats.append(contentsOf: hls)
                         } else {
                             formats.append(MediaFormat(id: "\(kind)-\(resKey)", url: surl, ext: "mp4", proto: .http, vcodec: "avc1", acodec: "mp4a", height: Int(resKey)))
@@ -302,7 +302,7 @@ public struct OdyseeExtractor: SiteExtractor {
         let dur = ((val["video"] as? [String: Any])?["duration"] as? Double)
         let streamURL = "https://player.odycdn.com/api/v3/streams/free/\(name)/\(claimID)/stream.mp4"
         let hlsURL = "https://player.odycdn.com/v6/streams/\(claimID)/master.m3u8"
-        var formats = (try? await HLSEngine.extractFormats(client: client, playlistURL: hlsURL)) ?? []
+        var formats = (try await ExtractorUtils.optionalRequest({ try await HLSEngine.extractFormats(client: client, playlistURL: hlsURL) })) ?? []
         formats.append(MediaFormat(id: "direct-mp4", url: streamURL, ext: "mp4", proto: .http, vcodec: "avc1", acodec: "mp4a"))
         return MediaInfo(id: claimID, title: title, site: "Odysee", webpageURL: url.absoluteString, duration: dur, thumbnail: thumb, formats: formats)
     }
@@ -321,7 +321,7 @@ public struct PeerTubeExtractor: SiteExtractor {
             throw ExtractorError.notFound("Invalid PeerTube URL.")
         }
         let api = "\(url.scheme ?? "https")://\(host)/api/v1/videos/\(uuid)"
-        guard let obj = try? await client.fetchJSON(url: api) as? [String: Any] else {
+        guard let obj = try await ExtractorUtils.optionalRequest({ try await client.fetchJSON(url: api) }) as? [String: Any] else {
             return try await GenericExtractor.extract(url: url, client: client)
         }
         var formats: [MediaFormat] = []
@@ -332,7 +332,7 @@ public struct PeerTubeExtractor: SiteExtractor {
         }
         for sp in (obj["streamingPlaylists"] as? [[String: Any]]) ?? [] {
             if let m3u8 = sp["playlistUrl"] as? String,
-               let hls = try? await HLSEngine.extractFormats(client: client, playlistURL: m3u8) {
+               let hls = try await ExtractorUtils.optionalRequest({ try await HLSEngine.extractFormats(client: client, playlistURL: m3u8) }) {
                 formats.append(contentsOf: hls)
             }
         }
@@ -428,14 +428,14 @@ public struct LoomExtractor: SiteExtractor {
             "variables": ["videoId": vidID, "forceOriginal": false],
             "query": "query GetVideoTranscodedUrl($videoId: ID!, $forceOriginal: Boolean) { fetchTranscodedUrl(videoId: $videoId, forceOriginal: $forceOriginal) { url } }"
         ]
-        let resp = try? await client.fetchJSON(
+        let resp = try await ExtractorUtils.optionalRequest({ try await client.fetchJSON(
             url: "https://www.loom.com/graphql",
             method: "POST",
             headers: ["Content-Type": "application/json"],
             body: try JSONSerialization.data(withJSONObject: streamGQL)
-        ) as? [String: Any]
+        ) }) as? [String: Any]
         if let surl = ((resp?["data"] as? [String: Any])?["fetchTranscodedUrl"] as? [String: Any])?["url"] as? String {
-            let (html, _) = (try? await client.fetchText(url: url.absoluteString)) ?? ("", url)
+            let (html, _) = (try await ExtractorUtils.optionalRequest({ try await client.fetchText(url: url.absoluteString) })) ?? ("", url)
             let title = ExtractorUtils.pageTitle(in: html) ?? "Loom \(vidID.prefix(8))"
             let fmts = surl.contains(".m3u8")
                 ? (try await HLSEngine.extractFormats(client: client, playlistURL: surl))
@@ -459,7 +459,7 @@ public struct TEDExtractor: SiteExtractor {
             formats.append(MediaFormat(id: q, url: mp4, ext: "mp4", proto: .http, vcodec: "avc1", acodec: "mp4a", qualityLabel: q))
         }
         for m3u8 in Set(ExtractorUtils.allMatches("(https://hls\\.ted\\.com/[^\"'\\s]+\\.m3u8[^\"'\\s]*)", in: html)) {
-            if let hls = try? await HLSEngine.extractFormats(client: client, playlistURL: ExtractorUtils.unescapeJSString(m3u8)) {
+            if let hls = try await ExtractorUtils.optionalRequest({ try await HLSEngine.extractFormats(client: client, playlistURL: ExtractorUtils.unescapeJSString(m3u8)) }) {
                 formats.append(contentsOf: hls)
             }
         }
@@ -477,7 +477,7 @@ public struct ImgurExtractor: SiteExtractor {
     public func extract(url: URL, client: HTTPClient) async throws -> MediaInfo {
         if let id = ExtractorUtils.firstMatch("/(?:gallery/|a/|t/[^/]+/)?(?:[A-Za-z0-9-]+-)?([A-Za-z0-9]{5,8})(?:\\.[a-z0-9]+)?$", in: url.path) {
             let directMP4 = "https://i.imgur.com/\(id).mp4"
-            if let (_, resp) = try? await client.fetchData(url: directMP4, method: "HEAD"), resp.statusCode == 200 {
+            if let (_, resp) = try await ExtractorUtils.optionalRequest({ try await client.fetchData(url: directMP4, method: "HEAD") }), resp.statusCode == 200 {
                 return MediaInfo(id: id, title: "Imgur \(id)", site: "Imgur", webpageURL: url.absoluteString, formats: [MediaFormat(id: "mp4", url: directMP4, ext: "mp4", proto: .http, vcodec: "avc1", acodec: "mp4a")])
             }
         }
@@ -506,7 +506,7 @@ public struct PinterestExtractor: SiteExtractor {
         let (html, finalURL) = try await client.fetchText(url: url.absoluteString)
         var formats: [MediaFormat] = []
         for v in Set(ExtractorUtils.allMatches("(https://v1\\.pinimg\\.com/videos/[^\"'\\s]+\\.(?:mp4|m3u8))", in: html)) {
-            if v.hasSuffix(".m3u8"), let hls = try? await HLSEngine.extractFormats(client: client, playlistURL: v) {
+            if v.hasSuffix(".m3u8"), let hls = try await ExtractorUtils.optionalRequest({ try await HLSEngine.extractFormats(client: client, playlistURL: v) }) {
                 formats.append(contentsOf: hls)
             } else {
                 formats.append(MediaFormat(id: "mp4-\(formats.count)", url: v, ext: "mp4", proto: .http, vcodec: "avc1", acodec: "mp4a"))
@@ -623,7 +623,7 @@ public struct MastodonExtractor: SiteExtractor {
               let host = url.host else {
             return try await GenericExtractor.extract(url: url, client: client)
         }
-        guard let st = try? await client.fetchJSON(url: "\(url.scheme ?? "https")://\(host)/api/v1/statuses/\(statusID)") as? [String: Any],
+        guard let st = try await ExtractorUtils.optionalRequest({ try await client.fetchJSON(url: "\(url.scheme ?? "https")://\(host)/api/v1/statuses/\(statusID)") }) as? [String: Any],
               let atts = st["media_attachments"] as? [[String: Any]], !atts.isEmpty else {
             return try await GenericExtractor.extract(url: url, client: client)
         }
@@ -647,7 +647,7 @@ public struct CoubExtractor: SiteExtractor {
     public func matches(url: URL) -> Bool { ExtractorUtils.hostMatches(url, domains: ["coub.com"]) }
     public func extract(url: URL, client: HTTPClient) async throws -> MediaInfo {
         guard let cid = ExtractorUtils.firstMatch("/view/([A-Za-z0-9]+)", in: url.path),
-              let obj = try? await client.fetchJSON(url: "https://coub.com/api/v2/coubs/\(cid)") as? [String: Any],
+              let obj = try await ExtractorUtils.optionalRequest({ try await client.fetchJSON(url: "https://coub.com/api/v2/coubs/\(cid)") }) as? [String: Any],
               let fv = ((obj["file_versions"] as? [String: Any])?["html5"] as? [String: Any]) else {
             return try await GenericExtractor.extract(url: url, client: client)
         }

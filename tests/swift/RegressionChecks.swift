@@ -110,6 +110,10 @@ final class FixtureProtocol: URLProtocol {
         var failure: URLError?
 
         switch (url.host ?? "", url.path) {
+        case ("cdn.syndication.twimg.com", "/tweet-result"), ("instance.invalid", "/api/v1/videos/fixture"), ("i.imgur.com", "/abc123.mp4"):
+            status = 403
+        case ("metadata.invalid", _), ("sponsor.ajay.app", _):
+            status = 403
         case ("media.invalid", "/parallel.bin"):
             guard let bounds = range?.dropFirst(6).split(separator: "-"), bounds.count == 2,
                   let low = Int(bounds[0]), let requested = Int(bounds[1]) else { status = 400; break }
@@ -573,6 +577,47 @@ struct RegressionChecks {
 
     static func run(_ mode: String) async throws {
         switch mode {
+        case "metadata-refusal":
+            let out = AppPaths.appSupportDir.appendingPathComponent("out")
+            for stage in ["cover", "subtitles", "sponsors"] {
+                let media = MediaFormat(id: "video", url: "https://media.invalid/media", ext: "webm", proto: .http, vcodec: "vp9", acodec: "opus")
+                var info = MediaInfo(id: "fixture", title: stage, site: "YouTube", webpageURL: videoURL, formats: [media])
+                if stage == "cover" { info.thumbnail = "https://metadata.invalid/cover" }
+                if stage != "sponsors" { info.subtitles = [SubtitleTrack(lang: "en", name: "English", url: "https://metadata.invalid/subtitles")] }
+                var settings = Settings()
+                settings.embedMetadata = true
+                var options = DownloadRequestOptions()
+                options.cookieSource = "none"
+                options.outputDir = out.path
+                options.targetFormat = "webm"
+                options.downloadSubtitles = true
+                options.sponsorMode = "mark"
+                options.connections = 1
+                let before = FixtureProtocol.requests().count
+                var failure: Error?
+                do { _ = try await DownloadEngine().downloadSingle(url: videoURL, preExtracted: info, settings: settings, options: options) }
+                catch { failure = error }
+                let seen = FixtureProtocol.requests().dropFirst(before)
+                let wanted = stage == "sponsors" ? seen.last?.url.host == "sponsor.ajay.app" : seen.last?.url.path == "/" + stage
+                check(httpStatus(failure) == 403 && wanted && seen.dropLast().allSatisfy { $0.url.host == "media.invalid" } && savedOutputs().isEmpty,
+                      "no file or later request after denied \(stage): \(seen.map { $0.url.path }), output=\(savedOutputs())")
+            }
+        case "optional-refusal":
+            let out = AppPaths.appSupportDir.appendingPathComponent("out")
+            try FileManager.default.createDirectory(at: out, withIntermediateDirectories: true)
+            for (target, host, path) in [("https://x.com/fixture/status/123", "cdn.syndication.twimg.com", "/tweet-result"),
+                                         ("https://instance.invalid/w/fixture", "instance.invalid", "/api/v1/videos/fixture"),
+                                         ("https://imgur.com/abc123", "i.imgur.com", "/abc123.mp4")] {
+                let before = FixtureProtocol.requests().count
+                let (code, message) = await capturingStderr { await CLIRunner.run(arguments: [
+                    "ubit", "get", "--quiet", "--no-cookies", "--no-library", "-o", out.path, target
+                ]) }
+                let seen = FixtureProtocol.requests().dropFirst(before)
+                let files = try FileManager.default.contentsOfDirectory(atPath: out.path)
+                check(code == 1 && message.contains("403") && seen.count == 1 && seen.first?.url.host == host
+                      && seen.first?.url.path == path && files.isEmpty,
+                      "\(host) refusal: exit=\(code), requests=\(seen.map { $0.url.absoluteString }), output=\(files)")
+            }
         case "cancel-watch", "cancel-player", "cancel-probe":
             do {
                 _ = try await extract()

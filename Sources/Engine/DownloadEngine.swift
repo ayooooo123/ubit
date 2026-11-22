@@ -420,10 +420,10 @@ public final class DownloadEngine: @unchecked Sendable {
             audioIsTS = res.isTS
         }
 
-        // Fetch cover art, subtitles, and SponsorBlock segments concurrently!
+        // Request optional metadata before publishing the output.
         var coverJPEG: Data?
         if settings.embedMetadata || settings.saveThumbnail, let thumbURL = info.thumbnail, !thumbURL.isEmpty {
-            if let (rawImg, _) = try? await client.fetchData(url: thumbURL, includeCookies: false) {
+            if let (rawImg, _) = try await ExtractorUtils.optionalRequest({ try await client.fetchData(url: thumbURL, includeCookies: false) }) {
                 coverJPEG = MediaConverter.normalizeThumbnailToJPEG(rawImg)
             }
         }
@@ -432,7 +432,7 @@ public final class DownloadEngine: @unchecked Sendable {
         if options.downloadSubtitles && !info.subtitles.isEmpty {
             let chosenSubs = chooseSubtitles(available: info.subtitles, langSpec: options.subtitleLangs)
             for sub in chosenSubs {
-                if let (subText, _) = try? await client.fetchText(url: sub.url) {
+                if let (subText, _) = try await ExtractorUtils.optionalRequest({ try await client.fetchText(url: sub.url) }) {
                     let cues = SponsorAndSubtitles.parseSubtitleCues(subText)
                     if !cues.isEmpty { downloadedSubTracks.append((sub.lang, cues)) }
                 }
@@ -444,7 +444,7 @@ public final class DownloadEngine: @unchecked Sendable {
 
         if options.sponsorMode != "keep" && info.site.lowercased() == "youtube" {
             let cats = SponsorAndSubtitles.parseCategories(options.sponsorCategories)
-            let segs = await SponsorAndSubtitles.fetchSponsorSegments(client: client, videoID: info.id, categories: cats)
+            let segs = try await SponsorAndSubtitles.fetchSponsorSegments(client: client, videoID: info.id, categories: cats)
             if options.sponsorMode == "remove" && !segs.isEmpty {
                 onEvent?(.process(stage: "Removing sponsors"))
                 sponsorCutIntervals = segs.map { ($0.start, $0.end) }

@@ -57,6 +57,8 @@ ubit get --json <url>                                          # stream NDJSON e
 
 **Provider refusals.** On the native macOS Swift CLI, a provider access denial (HTTP 403), 410, 429, or a playability/verification challenge ends that URL's operation. uBit does not retry with another URL, client identity or route, and it saves no output for that URL. It does not claim that a provider verification check was completed. Sign-in cookies still authenticate ordinary requests; they do not justify a retry after a refusal.
 
+This also applies to optional requests. For example, if X denies the syndication request, the Swift client reports that error without contacting a second service.
+
 See **[`docs/agents.md`](docs/agents.md)** for full NDJSON schemas, exit codes (`0`, `1`, `2`, `130`), `UBIT_CONFIG_DIR` sandbox isolation, and authentication workflows.
 
 

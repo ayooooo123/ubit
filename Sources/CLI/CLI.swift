@@ -847,7 +847,7 @@ public enum CLIRunner {
           -i, --input FILE              Read URLs one per line (- reads stdin)
               --playlist / --no-playlist
               --items 1,3,5-7           Select specific playlist items
-              --section 1:00-2:30       Keyframe-accurate byte-range clip trim
+              --section 1:00-2:30       Keyframe-accurate clip trim (MP4, M4A, HLS, DASH)
               --sponsors-remove CATS    Excise SponsorBlock segments (default, all, or list)
               --sponsors-mark CATS      Mark SponsorBlock segments as MP4 chapters
               --keep-sponsors           Keep sponsors regardless of settings
@@ -878,7 +878,7 @@ public enum CLIRunner {
 
         ## Commands
         - `ubit get <url>... [flags]` — Download video/audio. Prefer `--json` (NDJSON events on stdout) or `--quiet` (prints only final saved file path(s), one per line).
-        - `ubit info <url> --json` — Probe metadata (`id`, `title`, `site`, `author`, `duration`, `isLive`, `isDRM`, `formats`, `subtitles`, `chapters`, `entries`) without saving a media file. YouTube extraction reads up to 4 KB of one stream for each client profile to test byte ranges. `info` and `formats` accept only `--json`, `--cookies FILE`, `--cookies-from-browser B`, `--no-cookies` and `--proxy URL`; any other flag exits with code `2`.
+        - `ubit info <url> --json` — Probe metadata (`id`, `title`, `site`, `author`, `duration`, `isLive`, `isDRM`, `formats`, `subtitles`, `chapters`, `entries`) without saving a media file. To test byte ranges, YouTube extraction requests a small byte range of one stream for each client profile (a server that ignores the range sends the whole stream). `info` and `formats` accept only `--json`, `--cookies FILE`, `--cookies-from-browser B`, `--no-cookies` and `--proxy URL`; any other flag exits with code `2`.
         - `ubit formats <url> --json` — Return JSON array of `MediaFormat` objects (`id`, `ext`, `proto`, `vcodec`, `acodec`, `width`, `height`, `fps`, `bitrate`, `filesize`).
         - `ubit list --json` — Return JSON array of library/queue items (`id`, `url`, `title`, `state`, `path`, `downloadedBytes`, `totalBytes`).
         - `ubit subs [list|add <url>|remove <n>|check] [--json] [--quiet]` — Manage channel/playlist subscriptions.
@@ -897,7 +897,7 @@ public enum CLIRunner {
           - `{"event":"stopped","url":"..."}`
         - `--quiet` — Suppress progress bars; print ONLY saved absolute file paths to stdout (ideal for command substitution `FILE=$(ubit get --quiet ...)`).
         - `--no-library` — Ephemeral run; do not append agent scratch downloads to the user's GUI library.
-        - `--section START-END` — Keyframe-accurate clip trim (e.g. `0:30-1:15` or `90-135`) for output that goes through the MP4 muxer (MP4, M4A, HLS, DASH); a WebM stream or a raw MP3, Opus, FLAC or WAV audio stream is saved whole without a trim. For an MP4/M4A stream with a `sidx` index and a server that accepts byte ranges, uBit fetches only the `init` box and the overlapping bytes (for example ~2–4 MB for a 15s clip of a 2h video); HLS fetches only the overlapping segments. Otherwise (no `sidx` index, DASH, or the YouTube UMP fallback when byte ranges are refused during the download) the whole stream is downloaded and then trimmed, so a short clip does not guarantee a small transfer. During YouTube extraction, uBit tests byte ranges on one format of each client profile and keeps the profile only when that test passes; the other formats of the profile are not tested. If YouTube refuses byte ranges from the first request, every profile fails the test and extraction fails without UMP.
+        - `--section START-END` — Keyframe-accurate clip trim (e.g. `0:30-1:15` or `90-135`) for output that goes through the MP4 muxer (MP4, M4A, HLS, DASH); a WebM stream or a raw MP3, Opus, FLAC or WAV audio stream is saved whole without a trim. For an MP4/M4A stream with a `sidx` index and a server that accepts byte ranges, uBit fetches only the `init` box and the overlapping bytes (for example ~2–4 MB for a 15s clip of a 2h video); HLS fetches only the overlapping segments. Otherwise (no `sidx` index, DASH, or the YouTube UMP fallback when byte ranges are refused during the download) the whole stream is downloaded and then trimmed, so a short clip does not guarantee a small transfer. During YouTube extraction, uBit tests byte ranges on one format of each client profile and keeps the profile only when that test passes; the other formats of the profile are not tested. If YouTube refuses byte ranges from the first request, no direct format is kept: uBit uses YouTube's HLS playlist when there is one, and otherwise extraction fails without UMP.
         - `-a --to wav` — Extract 16-bit 44.1 kHz stereo PCM `.wav` natively via macOS AudioToolbox (zero FFmpeg) for ASR/transcription pipelines.
         - `-q <best|2160|1440|1080|720|480|360>` / `-f <vid+aid>` — Bound resolution or select exact stream IDs.
         - `--subs --sub-langs en --sub-files` — Download WebVTT `.vtt` subtitle sidecar files alongside media.

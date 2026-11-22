@@ -159,6 +159,14 @@ final class FixtureProtocol: URLProtocol {
             data = Data("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n\(segments)\n#EXT-X-ENDLIST\n".utf8)
         case ("media.invalid", let path) where path.hasPrefix("/seg-"):
             data = Data(path.utf8)
+        case ("media.invalid", "/clip.m3u8"):
+            // An fMP4 VOD playlist of 15 segments, 4 s each, with four 1 s samples in each segment.
+            let segments = (0..<15).map { "#EXTINF:4.0,\nclip-\($0).m4s" }.joined(separator: "\n")
+            data = Data("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"clip-init.mp4\"\n\(segments)\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/clip-init.mp4"):
+            data = Data(Bytes.clipInit)
+        case ("media.invalid", let path) where path.hasPrefix("/clip-"):
+            data = Data(Bytes.clipSegment(Int(path.dropFirst(6).dropLast(4)) ?? 0))
         default:
             status = 404   // never forward an unexpected request
         }
@@ -250,6 +258,27 @@ enum Bytes {
     /// `ftyp` + one `moof`/`mdat` fragment: a valid box chain that stops before the next fragment.
     static let cutStream = ftyp + be32(16) + Array("moof".utf8) + [UInt8](repeating: 0, count: 8)
         + be32(20) + Array("mdat".utf8) + [UInt8](repeating: 7, count: 12)
+
+    static func box(_ type: String, _ payload: [UInt8]) -> [UInt8] { be32(UInt32(8 + payload.count)) + Array(type.utf8) + payload }
+
+    /// Init segment of a one-track audio fMP4: timescale 1000, default sample duration 1000 (1 s),
+    /// default sample size 1 byte.
+    static let clipInit: [UInt8] = {
+        let mdhd = box("mdhd", be32(0) + be32(0) + be32(0) + be32(1000) + be32(0) + be32(0))
+        let hdlr = box("hdlr", be32(0) + be32(0) + Array("soun".utf8) + [UInt8](repeating: 0, count: 13))
+        let stbl = box("stbl", box("stsd", be32(0) + be32(0)))
+        let trak = box("trak", box("mdia", mdhd + hdlr + box("minf", stbl)))
+        let trex = box("trex", be32(0) + be32(1) + be32(1) + be32(1000) + be32(1) + be32(0))
+        return ftyp + box("moov", trak + box("mvex", trex))
+    }()
+
+    /// Media segment `n`: one `moof` with four samples, and an `mdat` whose four bytes are the
+    /// stream seconds 4n to 4n+3. The data offset 60 is the `moof` (52 bytes) plus the `mdat` header.
+    static func clipSegment(_ n: Int) -> [UInt8] {
+        let tfhd = box("tfhd", be32(0x020000) + be32(1))
+        let trun = box("trun", be32(0x000001) + be32(4) + be32(60))
+        return box("moof", box("traf", tfhd + trun)) + box("mdat", (0..<4).map { UInt8(4 * n + $0) })
+    }
 }
 
 // MARK: - Cases
@@ -508,6 +537,23 @@ struct RegressionChecks {
             let fetched = FixtureProtocol.requests().map(\.url.path).filter { $0.hasPrefix("/seg-") }.sorted()
             check(result.startTime == 16 && fetched == ["/seg-4.ts", "/seg-5.ts", "/seg-6.ts"],
                   "a section of 0:20-0:26 fetches the three overlapping 4 s segments and reports that they start at 16 s; startTime=\(result.startTime), segments=\(fetched)")
+        case "hls-section-clip":
+            // The whole engine (playlist, segments, demux, trim, mux) must save the samples of
+            // stream seconds 20 to 25. Each sample is one byte: its second.
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.cookieSource = "none"
+            options.connections = 1
+            options.outputDir = AppPaths.appSupportDir.appendingPathComponent("out").path
+            options.section = SectionRange(start: 20, end: 26)
+            let file = try await DownloadEngine().downloadSingle(url: "https://media.invalid/clip.m3u8", settings: settings, options: options)
+            let saved = try Data(contentsOf: file)
+            let seconds = saved.range(of: Data("mdat".utf8)).map { saved[$0.upperBound...].map { Int($0) } } ?? []
+            let fetched = FixtureProtocol.requests().map(\.url.path).filter { $0.hasSuffix(".m4s") }.sorted()
+            check(seconds == [20, 21, 22, 23, 24, 25] && fetched == ["/clip-4.m4s", "/clip-5.m4s", "/clip-6.m4s"],
+                  "a 0:20-0:26 section of an HLS stream saves the samples of seconds 20 to 25; saved seconds=\(seconds), segments=\(fetched)")
         case "non-http-error":
             let (_, error) = await download(audioExt: "webm")
             check((error as? URLError)?.code == .cancelled && umpPosts().isEmpty,
@@ -534,8 +580,9 @@ struct RegressionChecks {
             check(error == nil && bytes == Data(Bytes.cutStream) && leftovers.isEmpty,
                   "a complete UMP stream is saved and no resume file is left; leftovers=\(leftovers), error=\(String(describing: error))")
         case "ump-cold":
-            // Documented boundary: UMP is a fallback for a URL that passed the range probe during
-            // extraction. When every range request is refused from the start, extraction fails.
+            // Documented boundary: extraction tests byte ranges on one format of each client profile.
+            // When every range request is refused from the start and no profile gives an HLS
+            // playlist, extraction fails without UMP.
             let info = try? await extract()
             check((info?.formats.isEmpty ?? true) && umpPosts().isEmpty,
                   "refused range probes end extraction without UMP; formats=\(info?.formats.count ?? 0), umpPosts=\(umpPosts().count)")

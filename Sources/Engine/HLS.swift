@@ -308,7 +308,8 @@ public enum HLSEngine {
     }
 
     /// Downloads VOD or Live HLS playlist segments into `destination` raw stream (fMP4 or MPEG-TS).
-    /// Returns `(isFragmentedMP4, recordedDurationSeconds)`.
+    /// Returns `(isFragmentedMP4, recordedDurationSeconds, startTime)`. `startTime` is the stream time
+    /// where the first saved segment starts; it is 0 without a section and for a live recording.
     public static func downloadStream(
         client: HTTPClient,
         playlistURL: String,

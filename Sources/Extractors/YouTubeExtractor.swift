@@ -325,17 +325,24 @@ public struct YouTubeExtractor: SiteExtractor {
     /// Prose that only explains verification is not a notice.
     private static func isNotice(_ text: String) -> Bool {
         // Check sentence starts, not arbitrary substrings such as “explains how to verify”.
+        func isDecision(_ sentence: Substring) -> Bool {
+            let blocked = "playback is blocked"
+            if sentence.hasPrefix(blocked) {
+                let tail = sentence.dropFirst(blocked.count)
+                return tail.first?.isLetter != true && !(tail.first.map(joiners.contains) ?? false)
+            }
+            return isInstruction(sentence)
+        }
         var start = text.startIndex
         for i in text.indices where ".!?".contains(text[i]) {
             let next = text.index(after: i)
             guard next == text.endIndex || text[next].isWhitespace else { continue }
             let sentence = text[start..<i].drop(while: \.isWhitespace)
-            if sentence == "playback is blocked" || isInstruction(sentence) { return true }
+            if isDecision(sentence) { return true }
             start = next
         }
         let last = text[start...].drop(while: \.isWhitespace)
-        return last == "playback is blocked" || isInstruction(last)
-            || (text.contains("playback is blocked") && text.contains("verif"))
+        return isDecision(last)
             || (text.contains("sign in to confirm") && (text.contains("not a bot") || text.contains("your age")))
             || text.contains("detected unusual traffic")
             || text == "unusual traffic" || text == "not a bot"

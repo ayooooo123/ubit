@@ -277,6 +277,50 @@ public enum MP4Muxer {
         return out
     }
 
+    static func hasPictureAndSound(_ initialization: Data) -> Bool {
+        func children(_ box: MP4BoxRef) -> [MP4BoxRef] {
+            listBoxes(in: initialization, from: box.payloadOffset, to: box.endOffset)
+        }
+        guard let movie = listBoxes(in: initialization, from: 0, to: initialization.count).first(where: { $0.type == "moov" }) else { return false }
+        var video = false, audio = false
+        for track in children(movie) where track.type == "trak" {
+            guard let media = children(track).first(where: { $0.type == "mdia" }),
+                  let handler = children(media).first(where: { $0.type == "hdlr" }), handler.payloadSize >= 12 else { continue }
+            switch initialization.fourCC(handler.payloadOffset + 8) {
+            case "vide": video = true
+            case "soun": audio = true
+            default: break
+            }
+        }
+        return video && audio
+    }
+
+    private static func decodeStart(_ box: MP4BoxRef, in data: Data) -> UInt64? {
+        let p = box.payloadOffset
+        guard box.payloadSize >= 8 else { return nil }
+        switch data[p] {
+        case 0: return UInt64(data.beU32(p + 4))
+        case 1 where box.payloadSize >= 12: return data.beU64(p + 4)
+        default: return nil
+        }
+    }
+
+    static func firstDecodeTimes(in media: Data) throws -> [UInt32: UInt64] {
+        var times: [UInt32: UInt64] = [:]
+        for moof in listBoxes(in: media, from: 0, to: media.count) where moof.type == "moof" {
+            for traf in listBoxes(in: media, from: moof.payloadOffset, to: moof.endOffset) where traf.type == "traf" {
+                let boxes = listBoxes(in: media, from: traf.payloadOffset, to: traf.endOffset)
+                guard let header = boxes.first(where: { $0.type == "tfhd" }), header.payloadSize >= 8 else { throw HTTPError.rangeUnsupported }
+                let id = media.beU32(header.payloadOffset + 4)
+                if times[id] != nil { continue }
+                guard let box = boxes.first(where: { $0.type == "tfdt" }), let time = decodeStart(box, in: media) else { throw HTTPError.rangeUnsupported }
+                times[id] = time
+            }
+        }
+        guard !times.isEmpty else { throw HTTPError.rangeUnsupported }
+        return times
+    }
+
     /// Parses `sidx` (Segment Index box) from the header bytes of a DASH/YouTube stream
     /// so `--section start-end` downloads ONLY the required byte ranges!
     public static func parseSidx(in headerData: Data) -> (initEndOffset: Int64, segments: [SidxSegment])? {
@@ -327,10 +371,9 @@ public enum MP4Muxer {
             let children = listBoxes(in: data, from: traf.payloadOffset, to: traf.endOffset)
             guard let tfhd = children.first(where: { $0.type == "tfhd" }), tfhd.payloadSize >= 8,
                   data.beU32(tfhd.payloadOffset + 4) == track.trackID else { continue }
-            guard base == nil, let tfdt = children.first(where: { $0.type == "tfdt" }), tfdt.payloadSize >= 8 else { return nil }
-            let p = tfdt.payloadOffset
-            guard data[p] <= 1, data[p] == 0 || tfdt.payloadSize >= 12 else { return nil }
-            base = data[p] == 0 ? UInt64(data.beU32(p + 4)) : data.beU64(p + 4)
+            guard base == nil, let tfdt = children.first(where: { $0.type == "tfdt" }),
+                  let time = decodeStart(tfdt, in: data) else { return nil }
+            base = time
         }
         guard let base, let ticks = Int64(exactly: base) else { return nil }
         let (origin, overflow) = ticks.subtractingReportingOverflow(track.editMediaTimeTicks ?? 0)
@@ -899,6 +942,7 @@ public enum MP4Muxer {
         section: SectionRange,
         baseStartTimeSec: Double = 0,
         baseStart: SectionTimeBase? = nil,
+        trackStartTicks: [UInt32: UInt64] = [:],
         clock: SectionClock? = nil
     ) -> [MP4Track] {
         // Section and playlist times are decimal seconds. Compare them as decimals
@@ -913,9 +957,13 @@ public enum MP4Muxer {
 
         // Round each boundary once per track. Integer comparisons in the sample loop
         // keep the requested end exclusive, including for rates such as 30 fps.
-        func boundaryTicks(_ boundary: Decimal, _ scale: UInt32, _ rounding: Decimal.RoundingMode) -> Int64 {
+        func base(of track: MP4Track) -> SectionTimeBase? {
+            trackStartTicks[track.trackID].map { SectionTimeBase(ticks: $0, timescale: track.timescale) } ?? baseStart
+        }
+        func boundaryTicks(_ boundary: Decimal, _ track: MP4Track, _ rounding: Decimal.RoundingMode) -> Int64 {
+            let scale = track.timescale
             var ticks: Decimal
-            if let baseStart {
+            if let baseStart = base(of: track) {
                 ticks = (boundary * Decimal(baseStart.timescale) - Decimal(baseStart.ticks))
                     * Decimal(scale) / Decimal(baseStart.timescale)
             } else {
@@ -933,9 +981,9 @@ public enum MP4Muxer {
             return overflow ? .min : result
         }
 
-        var syncStart: (ticks: Int64, scale: UInt32)?
+        var syncStart: (ticks: Decimal, scale: Decimal)?
         if let video = tracks.first(where: { $0.kind == .video }) {
-            let start = boundaryTicks(startBoundary, video.timescale, .down)
+            let start = boundaryTicks(startBoundary, video, .down)
             var dts: Int64 = 0, lastEnd = Int64.min
             var chosen: Int64?
             for sample in video.samples {
@@ -945,33 +993,31 @@ public enum MP4Muxer {
                 dts += Int64(sample.duration)
             }
             if let duration = video.editSegmentTicks { lastEnd = min(lastEnd, Int64(clamping: duration)) }
-            if lastEnd > start { syncStart = (chosen ?? 0, video.timescale) }
+            if lastEnd > start {
+                let origin = base(of: video)
+                let scale = Decimal(origin?.timescale ?? 1)
+                let ticks = origin.map { Decimal($0.ticks) } ?? (legacyBase ?? 0)
+                syncStart = (ticks * Decimal(video.timescale) + Decimal(chosen ?? 0) * scale, scale * Decimal(video.timescale))
+            }
         }
 
-        let baseScale = Decimal(baseStart?.timescale ?? 1)
-        let baseTicks = baseStart.map { Decimal($0.ticks) } ?? (legacyBase ?? 0)
-        if let clock, let syncStart {
-            clock.start = (baseTicks * Decimal(syncStart.scale) + Decimal(syncStart.ticks) * baseScale,
-                           baseScale * Decimal(syncStart.scale))
-        }
+        if let clock, let syncStart { clock.start = syncStart }
         return tracks.compactMap { track in
             let start: Int64
-            if let syncStart {
-                var ticks = Decimal(syncStart.ticks) * Decimal(track.timescale) / Decimal(syncStart.scale)
-                var rounded = Decimal()
-                NSDecimalRound(&rounded, &ticks, 0, track.kind == .audio ? .up : .down)
-                start = NSDecimalNumber(decimal: rounded).int64Value
-            } else if let startAt = clock?.start {
+            if let startAt = syncStart ?? clock?.start {
+                let origin = base(of: track)
+                let baseScale = Decimal(origin?.timescale ?? 1)
+                let baseTicks = origin.map { Decimal($0.ticks) } ?? (legacyBase ?? 0)
                 var ticks = ((startAt.ticks * baseScale - baseTicks * startAt.scale) * Decimal(track.timescale))
                     / (startAt.scale * baseScale)
                 var rounded = Decimal()
-                NSDecimalRound(&rounded, &ticks, 0, .up)
+                NSDecimalRound(&rounded, &ticks, 0, track.kind == .audio ? .up : .down)
                 start = NSDecimalNumber(decimal: rounded).int64Value
             } else {
-                start = boundaryTicks(startBoundary, track.timescale, .down)
+                start = boundaryTicks(startBoundary, track, .down)
             }
             let visibleEnd = track.editSegmentTicks.map { Int64(clamping: $0) } ?? Int64.max
-            let end = min(visibleEnd, endBoundary.map { boundaryTicks($0, track.timescale, .up) } ?? Int64.max)
+            let end = min(visibleEnd, endBoundary.map { boundaryTicks($0, track, .up) } ?? Int64.max)
             guard end > start else { return nil }
             // A video picture is displayed until the next presentation time. In a variable-rate
             // track its decode duration can reach past the next picture, so it does not set

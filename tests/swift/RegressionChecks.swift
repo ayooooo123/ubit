@@ -196,6 +196,34 @@ final class FixtureProtocol: URLProtocol {
                 headers["Content-Range"] = "bytes \(bounds[0])-\(bounds[1])/\(body.count)"
                 data = body.subdata(in: bounds[0]..<(bounds[1] + 1))
             } else { data = body }
+        case ("media.invalid", "/clock/master.m3u8"):
+            data = Data("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"main\",DEFAULT=YES,URI=\"audio.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=700000,RESOLUTION=128x96,CODECS=\"avc1.42c00a,mp4a.40.2\",AUDIO=\"a\"\nvideo.m3u8\n".utf8)
+        case ("media.invalid", let path) where path.hasPrefix("/clock/"):
+            let name = url.deletingPathExtension().lastPathComponent
+            let audio = name.hasPrefix("audio"), mux = name.hasPrefix("mux")
+            switch url.pathExtension {
+            case "m3u8":
+                let durations = audio ? ["0.618667", "0.597333", "0.597333", "0.597333", "1.6"] : ["2", "2"]
+                var text = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"\(name).mp4\"\n"
+                for (i, duration) in durations.enumerated() { text += "#EXTINF:\(duration),\n\(name)-\(i).m4s\n" }
+                data = Data((text + "#EXT-X-ENDLIST\n").utf8)
+            case "mp4":
+                let tracks = (audio ? [] : Bytes.clipTrak(timescale: 10, video: true, id: 1))
+                    + (audio || mux ? Bytes.clipTrak(timescale: 48000, video: false, id: 2) : [])
+                data = Data(Bytes.ftyp + Bytes.box("moov", tracks))
+            case "m4s":
+                let i = Int(name.split(separator: "-").last!)!
+                func fragment(_ range: Range<Int>, _ id: UInt32, _ duration: UInt32) -> [UInt8] {
+                    // Nonzero decode epochs: subtract the first tfdt, not an assumed zero.
+                    let time = UInt32(range.lowerBound) * duration + id * 50000
+                    return Bytes.renditionFragment(range.map(UInt8.init), video: id == 1, trackID: id, ticks: duration, start: time)
+                }
+                let bounds = audio ? [0, 29, 57, 85, 113, 188] : [0, 94, 188]
+                let pictures = audio ? [] : fragment(i*20..<(i+1)*20, 1, 1)
+                let sound = audio || mux ? fragment(bounds[i]..<bounds[i+1], 2, 1024) : []
+                data = Data(pictures + sound)
+            default: status = 404
+            }
         case ("media.invalid", "/paired.m3u8"):
             data = Data("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"main\",DEFAULT=YES,URI=\"sound.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=700000,RESOLUTION=128x96,CODECS=\"avc1.42c00a,mp4a.40.2\",AUDIO=\"a\"\npicture.m3u8\n".utf8)
         case ("media.invalid", "/picture.m3u8"), ("media.invalid", "/sound.m3u8"):
@@ -342,7 +370,7 @@ final class FixtureProtocol: URLProtocol {
                 case "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age", "watch-blocked-notice", "watch-header-age",
                      "watch-verify-human", "watch-open-details", "watch-details-summary", "watch-confirm-identity",
                      "watch-identity-phone", "watch-age-device", "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online",
-                     "watch-identity-right-now", "watch-age-upon", "watch-age-footnote", "watch-purpose-clause", "watch-second-sentence", "watch-blocked-statement":
+                     "watch-identity-right-now", "watch-age-upon", "watch-age-footnote", "watch-purpose-clause", "watch-second-sentence", "watch-blocked-statement", "watch-blocked-video":
                     player = Self.playerPayload(status: "OK", streaming: Self.directStreaming(1, hls: true), title: title)
                 case "hls-fallback-watchlist":
                     player = Self.hlsOnlyPlayer(title: title)
@@ -368,10 +396,10 @@ final class FixtureProtocol: URLProtocol {
                      "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
                      "watch-details-summary", "watch-confirm-identity", "watch-identity-phone", "watch-age-device",
                      "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online", "watch-identity-right-now",
-                     "watch-age-upon", "watch-age-footnote", "watch-purpose-clause", "watch-second-sentence", "watch-blocked-statement":
+                     "watch-age-upon", "watch-age-footnote", "watch-purpose-clause", "watch-second-sentence", "watch-blocked-statement", "watch-blocked-video":
                     data = Self.wallPage(player: player, mode: mode)
                 case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson",
-                     "watch-agent-settings", "watch-ordinary-objects":
+                     "watch-agent-settings", "watch-ordinary-objects", "watch-blocked-lesson":
                     data = Self.inertTextPage(player: mode == "watch-lesson-no-state" ? nil : player, visitor: visitor, mode: mode)
                 default:
                     data = Self.watchPage(player: player, visitor: visitor)
@@ -649,6 +677,7 @@ final class FixtureProtocol: URLProtocol {
         case "watch-purpose-clause": html += "<main role=\"alert\"><p>To continue watching, please verify your age.</p></main>"
         case "watch-second-sentence": html += "<main role=\"alert\">Playback unavailable. Please verify your age to continue watching.</main>"
         case "watch-blocked-statement": html += "<main role=\"alert\">Playback is blocked.</main>"
+        case "watch-blocked-video": html += "<main role=\"alert\">Playback is blocked for this video.</main>"
         default: html += "<main>Verify your identity before playback can continue. Playback is blocked.</main>"
         }
         if let player {
@@ -681,6 +710,8 @@ final class FixtureProtocol: URLProtocol {
         switch mode {
         case "watch-closed-details":
             html += "<h1>Music lesson</h1><details><summary>Help</summary><p>Please verify your age to play this video.</p></details>"
+        case "watch-blocked-lesson":
+            html += "<article>This lesson explains why playback is blocked during device verification.</article>"
         case "watch-verification-lesson":
             html += "<article><h1>Uploading a video</h1><p>This lesson explains why an upload remains private until verification is complete.</p></article>"
         case "watch-agent-settings":
@@ -804,12 +835,17 @@ enum Bytes {
 
     /// The track uses 1000 ticks per second and one byte per sample.
     static func clipInit(sampleTicks: UInt32, timescale: UInt32 = 1000, video: Bool = false) -> [UInt8] {
+        let trak = clipTrak(timescale: timescale, video: video, id: 1)
+        let trex = box("trex", be32(0) + be32(1) + be32(1) + be32(sampleTicks) + be32(1) + be32(0))
+        return ftyp + box("moov", trak + box("mvex", trex))
+    }
+
+    static func clipTrak(timescale: UInt32, video: Bool, id: UInt32) -> [UInt8] {
         let mdhd = box("mdhd", be32(0) + be32(0) + be32(0) + be32(timescale) + be32(0) + be32(0))
         let hdlr = box("hdlr", be32(0) + be32(0) + Array((video ? "vide" : "soun").utf8) + [UInt8](repeating: 0, count: 13))
         let stbl = box("stbl", box("stsd", be32(0) + be32(0)))
-        let trak = box("trak", box("mdia", mdhd + hdlr + box("minf", stbl)))
-        let trex = box("trex", be32(0) + be32(1) + be32(1) + be32(sampleTicks) + be32(1) + be32(0))
-        return ftyp + box("moov", trak + box("mvex", trex))
+        let header = id == 1 ? [] : box("tkhd", Array(repeating: 0, count: 12) + be32(id) + Array(repeating: 0, count: 68))
+        return box("trak", header + box("mdia", mdhd + hdlr + box("minf", stbl)))
     }
 
     /// Media segment `n`: one `moof` with four samples, and an `mdat` whose four bytes are the
@@ -822,11 +858,13 @@ enum Bytes {
     }
 
     // The first picture is a keyframe. Each payload byte identifies the source second and edition.
-    static func renditionFragment(_ bytes: [UInt8], video: Bool) -> [UInt8] {
-        let tfhd = box("tfhd", be32(0x020000) + be32(1))
+    static func renditionFragment(_ bytes: [UInt8], video: Bool, trackID: UInt32 = 1, ticks: UInt32? = nil, start: UInt32? = nil) -> [UInt8] {
+        let defaults = ticks.map { be32($0) + be32(1) } ?? []
+        let tfhd = box("tfhd", be32(ticks == nil ? 0x020000 : 0x020018) + be32(trackID) + defaults)
+        let tfdt = start.map { box("tfdt", be32(0) + be32($0)) } ?? []
         let entries = bytes.indices.flatMap { be32(video && $0 != 0 ? 0x10000 : 0) }
-        let trun = box("trun", be32(0x401) + be32(UInt32(bytes.count)) + be32(UInt32(60 + entries.count)) + entries)
-        return box("moof", box("traf", tfhd + trun)) + box("mdat", bytes)
+        let trun = box("trun", be32(0x401) + be32(UInt32(bytes.count)) + be32(UInt32(60 + entries.count + defaults.count + tfdt.count)) + entries)
+        return box("moof", box("traf", tfhd + tfdt + trun)) + box("mdat", bytes)
     }
 
     static let indexedClip: [UInt8] = makeIndexedClip(timescale: 1000, sampleBase: 0)
@@ -1046,14 +1084,14 @@ struct RegressionChecks {
              "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
              "watch-details-summary", "watch-confirm-identity", "watch-identity-phone", "watch-age-device",
              "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online", "watch-identity-right-now",
-             "watch-age-upon", "watch-age-footnote", "watch-purpose-clause", "watch-second-sentence", "watch-blocked-statement":
+             "watch-age-upon", "watch-age-footnote", "watch-purpose-clause", "watch-second-sentence", "watch-blocked-statement", "watch-blocked-video":
             let before = FixtureProtocol.requests().count
             let error = await extractError()
             let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
             check(closedByBotGate(error) && paths == ["/watch"] && savedOutputs().isEmpty,
                   "a visible verification notice stops after the first response, even when the page embeds ordinary player metadata; error=\(String(describing: error)), paths=\(paths), saved=\(savedOutputs())")
         case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson",
-             "watch-agent-settings", "watch-ordinary-objects":
+             "watch-agent-settings", "watch-ordinary-objects", "watch-blocked-lesson":
             let (file, error) = await download(audioExt: "webm")
             let bytes = file.flatMap { try? Data(contentsOf: $0) }
             let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
@@ -1577,6 +1615,23 @@ struct RegressionChecks {
             let fetched = FixtureProtocol.requests().map(\.url.path).filter { $0.hasPrefix("/seg-") }.sorted()
             check(result.startTime == 16 && fetched == ["/seg-4.ts", "/seg-5.ts", "/seg-6.ts"],
                   "the 20–26 s clip fetches two overlapping segments and one for preroll; startTime=\(result.startTime), segments=\(fetched)")
+        case "hls-clock-mux", "hls-clock-short":
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.connections = 1
+            options.cookieSource = "none"
+            options.section = SectionRange(start: 2.25, end: 4)
+            options.outputDir = AppPaths.appSupportDir.appendingPathComponent("out").path
+            let stem = mode == "hls-clock-mux" ? "mux" : "master"
+            let file = try await DownloadEngine().downloadSingle(url: "https://media.invalid/clock/\(stem).m3u8", settings: settings, options: options)
+            let tracks = try MP4Muxer.readTracks(from: file), media = try Data(contentsOf: file)
+            let pictures = tracks.first { $0.kind == .video }?.samples.map { media[Int($0.offset)] }
+            let sound = tracks.first { $0.kind == .audio }
+            let first = sound?.samples.first.map { media[Int($0.offset)] }
+            check(pictures == Array(20..<40).map(UInt8.init) && first == 93 && sound?.editMediaTimeTicks == 768,
+                  "cut at keyframe 20 keeps packet 93 and skips 768 audio ticks; first=\(String(describing: first)), edit=\(String(describing: sound?.editMediaTimeTicks))")
         case "paired-plain-a", "paired-plain-b", "paired-tagged-a", "paired-tagged-b", "paired-plain-changed", "paired-tagged-changed", "paired-clock":
             var settings = Settings()
             settings.embedMetadata = false

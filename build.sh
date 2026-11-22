@@ -137,7 +137,22 @@ PLIST
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 codesign --force --deep --sign - "$APP"
 ln -sf "$MACOS/ubit" "$DIST/ubit"
-tar -czf "$DIST/ubit-0.3.3-darwin-arm64.tar.gz" -C "$DIST" uBit.app
+# Use the smaller deflate window for pending symbols, not a different archive
+# format. The signed app and the tar member data stay unchanged.
+python3 - "$DIST" <<'PY'
+import subprocess, sys, zlib
+from pathlib import Path
+
+dist = Path(sys.argv[1])
+compressor = zlib.compressobj(level=9, wbits=31, memLevel=7)
+with (dist / "ubit-0.3.3-darwin-arm64.tar.gz").open("wb") as archive:
+    with subprocess.Popen(["tar", "-cf", "-", "-C", dist, "uBit.app"], stdout=subprocess.PIPE) as tar:
+        while block := tar.stdout.read(65536):
+            archive.write(compressor.compress(block))
+        if tar.wait():
+            sys.exit("Could not archive the signed app")
+    archive.write(compressor.flush())
+PY
 
 echo "✓ Built $APP and $DIST/ubit-0.3.3-darwin-arm64.tar.gz"
 ls -lh "$MACOS/ubit" "$RES/AppIcon.icns" "$DIST/ubit-0.3.3-darwin-arm64.tar.gz"

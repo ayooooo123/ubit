@@ -439,9 +439,10 @@ public enum HLSEngine {
         section: SectionRange? = nil,
         connections: Int = 8,
         renditions: RenditionEditions? = nil,
+        separateTracks: Bool = false,
         shouldStopLive: (@Sendable () -> Bool)? = nil,
         onProgress: (@Sendable (_ downloaded: Int64, _ estTotal: Int64, _ fraction: Double, _ recordedSec: Double) -> Void)? = nil
-    ) async throws -> (isFMP4: Bool, duration: Double, startTime: Double) {
+    ) async throws -> (isFMP4: Bool, duration: Double, startTime: Double, trackStartTicks: [UInt32: UInt64]) {
         let (text, finalURL) = try await client.fetchText(url: playlistURL, headers: headers)
         let pl = parseMediaPlaylist(text, baseURL: finalURL)
 
@@ -456,13 +457,14 @@ public enum HLSEngine {
                 shouldStop: shouldStopLive,
                 onProgress: onProgress
             )
-            return (isFMP4, recorded, 0)
+            return (isFMP4, recorded, 0, [:])
         }
 
         // Filter segments if section range was requested. The demuxers start the saved timeline
         // at 0, so the caller needs the stream time where the first kept segment starts.
         var selected = pl.segments
         var startTime: Double = 0
+        var preceding: (segment: HLSVals.Segment, start: Double)?
         if let sec = section {
             let start = Decimal(string: String(sec.start ?? 0)) ?? .greatestFiniteMagnitude
             let end = sec.end.flatMap { Decimal(string: String($0)) } ?? .greatestFiniteMagnitude
@@ -483,6 +485,8 @@ public enum HLSEngine {
                     if segStart == start, index > 0 {
                         filtered.append(pl.segments[index - 1])
                         base = previousStart
+                    } else if index > 0, pl.initURL != nil {
+                        preceding = (pl.segments[index - 1], Double(previousStart.description)!)
                     }
                     startTime = Double(base.description)!
                 }
@@ -531,11 +535,19 @@ public enum HLSEngine {
             if spellings[key]?.contains(url) != true { spellings[key, default: []].append(url) }
             if isRanged { ranged.insert(key) }
         }
-        if let url = pl.initURL { note(url, ranged: pl.initByteRange != nil) }
+        // If an extra clock or preroll read shares the init URI, its edition must be
+        // pinned before reading the init, not after inspecting the track layout.
+        let origin = pl.initURL != nil && selected.first?.index != 0 ? pl.segments.first : nil
+        let initKey = pl.initURL.map(resourceKey)
+        if let url = pl.initURL {
+            note(url, ranged: pl.initByteRange != nil)
+            for seg in [origin, preceding?.segment].compactMap({ $0 }) where resourceKey(seg.url) == initKey {
+                note(seg.url, ranged: seg.byteRange != nil)
+            }
+        }
         for seg in selected { note(seg.url, ranged: seg.byteRange != nil) }
         // A range used only once here may occur again in the other rendition.
-        var shared = renditions == nil ? repeated.intersection(ranged) : ranged
-        let wholeReads = WholeReads(renditions == nil ? repeated.subtracting(shared) : [])
+        func pinnedKeys() -> Set<String> { renditions == nil ? repeated.intersection(ranged) : ranged }
         var sources: [String: RangeSource] = [:]
         // One spelling keeps a strong ETag or a complete copy. Several spellings each give a
         // complete copy, and all copies must be the same bytes.
@@ -560,12 +572,32 @@ public enum HLSEngine {
         var initData: Data?
         if let initU = pl.initURL {
             let key = resourceKey(initU)
-            if shared.remove(key) != nil { try await pin(key) }
+            if pinnedKeys().contains(key) { try await pin(key) }
             let data = try await fetchPart(initU, range: pl.initByteRange, client: client, headers: headers, source: sources[initU], renditions: renditions)
-            try await wholeReads.check(key, data)
             initData = data
         }
-        for key in shared { try await pin(key) }
+        var clockOnly = false
+        if let origin, let initData {
+            let muxed = MP4Muxer.hasPictureAndSound(initData)
+            if muxed || separateTracks {
+                func prepend(_ segment: HLSVals.Segment) {
+                    selected.insert(segment, at: 0)
+                    if resourceKey(segment.url) != initKey { note(segment.url, ranged: segment.byteRange != nil) }
+                }
+                if muxed, let preceding {
+                    prepend(preceding.segment)
+                    startTime = preceding.start
+                }
+                if selected.first?.index != origin.index {
+                    prepend(origin)
+                    clockOnly = true
+                }
+            }
+        }
+        let shared = pinnedKeys()
+        let wholeReads = WholeReads(renditions == nil ? repeated.subtracting(shared) : [])
+        if let initKey, let initData { try await wholeReads.check(initKey, initData) }
+        for key in shared where key != initKey { try await pin(key) }
         let pinned = sources
 
         actor KeyStore {
@@ -646,11 +678,23 @@ public enum HLSEngine {
             firstBytes = initData.prefix(16)
         }
         var totalDur: Double = 0
+        var firstTimes: [UInt32: UInt64] = [:], trackStartTicks: [UInt32: UInt64] = [:]
         for pos in 0..<selected.count {
             try Task.checkCancellation()
-            totalDur += selected[pos].duration
+            if !clockOnly || pos > 0 { totalDur += selected[pos].duration }
             let segFile = segWorkDir.appendingPathComponent(String(format: "%06d.seg", pos))
-            let d = try Data(contentsOf: segFile)
+            let d = try Data(contentsOf: segFile, options: .mappedIfSafe)
+            if clockOnly {
+                if pos == 0 { firstTimes = try MP4Muxer.firstDecodeTimes(in: d); continue }
+                if pos == 1 {
+                    let starts = try MP4Muxer.firstDecodeTimes(in: d)
+                    guard starts.keys == firstTimes.keys else { throw HTTPError.rangeUnsupported }
+                    for (id, ticks) in starts {
+                        guard let first = firstTimes[id], ticks >= first else { throw HTTPError.rangeUnsupported }
+                        trackStartTicks[id] = ticks - first
+                    }
+                }
+            }
             if firstBytes.isEmpty { firstBytes = d.prefix(16) }
             try fh.write(contentsOf: d)
         }
@@ -661,7 +705,7 @@ public enum HLSEngine {
         try FileManager.default.moveItem(at: partOut, to: destination)
 
         let isFMP4 = initData != nil || (firstBytes.count >= 8 && String(decoding: firstBytes[4..<8], as: UTF8.self) == "ftyp") || (firstBytes.first != 0x47)
-        return (isFMP4, totalDur, startTime)
+        return (isFMP4, totalDur, startTime, trackStartTicks)
     }
 
     private static func recordLiveStream(

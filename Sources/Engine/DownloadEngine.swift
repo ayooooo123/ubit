@@ -302,7 +302,7 @@ public final class DownloadEngine: @unchecked Sendable {
         var videoIsTS = false
         var audioIsTS = false
 
-        func fetchStream(_ fmt: MediaFormat, to dest: URL, priorBytes: Int64, isVideoRole: Bool) async throws -> (baseSec: Double, isTS: Bool) {
+        func fetchStream(_ fmt: MediaFormat, to dest: URL, priorBytes: Int64) async throws -> (baseSec: Double, isTS: Bool) {
             var mergedHeaders = fmt.headers ?? [:]
             if let ref = options.referer, mergedHeaders["Referer"] == nil { mergedHeaders["Referer"] = ref }
 
@@ -384,7 +384,7 @@ public final class DownloadEngine: @unchecked Sendable {
 
         var vActualBytes: Int64 = 0
         if let vFmt = selected.video {
-            let res = try await fetchStream(vFmt, to: vTemp, priorBytes: 0, isVideoRole: true)
+            let res = try await fetchStream(vFmt, to: vTemp, priorBytes: 0)
             videoSectionBaseSec = res.baseSec
             videoIsTS = res.isTS
             vActualBytes = (try? FileManager.default.attributesOfItem(atPath: vTemp.path)[.size] as? Int64) ?? 0
@@ -392,13 +392,13 @@ public final class DownloadEngine: @unchecked Sendable {
             // If HLS stream had a separate #EXT-X-MEDIA audio rendition URL and no separate audio format was picked:
             if selected.audio == nil, let hlsAudioURL = vFmt.audioTrackURL {
                 let synthAudio = MediaFormat(id: "hls-audio", url: hlsAudioURL, ext: "m4a", proto: .hls, vcodec: "none", acodec: "mp4a", headers: vFmt.headers)
-                let aRes = try await fetchStream(synthAudio, to: aTemp, priorBytes: vActualBytes, isVideoRole: false)
+                let aRes = try await fetchStream(synthAudio, to: aTemp, priorBytes: vActualBytes)
                 audioSectionBaseSec = aRes.baseSec
                 audioIsTS = aRes.isTS
             }
         }
         if let aFmt = selected.audio {
-            let res = try await fetchStream(aFmt, to: aTemp, priorBytes: vActualBytes, isVideoRole: false)
+            let res = try await fetchStream(aFmt, to: aTemp, priorBytes: vActualBytes)
             audioSectionBaseSec = res.baseSec
             audioIsTS = res.isTS
         }

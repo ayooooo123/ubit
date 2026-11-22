@@ -162,14 +162,15 @@ public enum ExtractorUtils {
     /// a block. Comments, script, style, title and template content are left out, and so is
     /// everything under a hidden ancestor: `hidden`, `aria-hidden="true"`, `display:none`,
     /// `visibility:hidden`, a closed `<dialog>`, `<noscript>`, or the body of a closed `<details>`
-    /// (its `<summary>` stays visible). `onElement` receives the name and the attributes of each
-    /// visible element.
+    /// (its first `<summary>` child stays visible; a browser hides any later one). `onElement`
+    /// receives the name and the attributes of each visible element.
     static func visibleTextBlocks(in html: String, onElement: (String, [String: String]) -> Void = { _, _ in }) -> [String] {
         let bytes = Array(html.utf8), n = bytes.count
         var blocks: [String] = [], run: [UInt8] = []
         // `hidden` applies to the content of the element. For a closed `<details>`, `outer` is
-        // the state outside it, which its `<summary>` keeps.
-        var open: [(name: String, hidden: Bool, outer: Bool, closedDetails: Bool)] = []
+        // the state outside it, which its first `<summary>` keeps; `summarySeen` records that
+        // the first `<summary>` child has opened.
+        var open: [(name: String, hidden: Bool, outer: Bool, closedDetails: Bool, summarySeen: Bool)] = []
         let commentOpen = Array("<!--".utf8), commentClose = Array("-->".utf8)
         func lower(_ b: UInt8) -> UInt8 { (0x41...0x5A).contains(b) ? b + 0x20 : b }
         func isSpace(_ b: UInt8) -> Bool { b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0C || b == 0x0D }
@@ -253,7 +254,11 @@ public enum ExtractorUtils {
                 continue
             }
             let style = (attributes["style"] ?? "").lowercased().filter { !$0.isWhitespace }
-            let inherited = name == "summary" && open.last?.closedDetails == true ? open.last!.outer : hidden
+            var inherited = hidden
+            if name == "summary", let parent = open.indices.last, open[parent].name == "details" {
+                if open[parent].closedDetails && !open[parent].summarySeen { inherited = open[parent].outer }
+                open[parent].summarySeen = true
+            }
             let isHidden = inherited || attributes["hidden"] != nil || attributes["aria-hidden"]?.lowercased() == "true"
                 || style.contains("display:none") || style.contains("visibility:hidden")
                 || (name == "dialog" && attributes["open"] == nil) || name == "template" || name == "noscript"
@@ -265,7 +270,7 @@ public enum ExtractorUtils {
             }
             if !voidElements.contains(name) && !selfClosing {
                 let closedDetails = name == "details" && attributes["open"] == nil
-                open.append((name, isHidden || closedDetails, isHidden, closedDetails))
+                open.append((name, isHidden || closedDetails, isHidden, closedDetails, false))
             }
         }
         flush()

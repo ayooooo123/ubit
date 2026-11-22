@@ -162,15 +162,45 @@ public enum SponsorAndSubtitles {
         s.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
     }
 
+    /// Named references that page text uses for punctuation and spaces.
+    private static let namedEntities: [String: Character] = [
+        "amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": " ",
+        "rsquo": "\u{2019}", "lsquo": "\u{2018}", "rdquo": "\u{201D}", "ldquo": "\u{201C}",
+        "ndash": "\u{2013}", "mdash": "\u{2014}", "hellip": "\u{2026}",
+    ]
+
+    /// Decodes decimal (`&#8217;`) and hexadecimal (`&#x2019;`) character references and the
+    /// names in `namedEntities`, in one pass, so `&amp;#39;` stays `&#39;`. A reference that is
+    /// unknown, malformed or names no valid character stays as it is.
     public static func decodeHTMLEntities(_ s: String) -> String {
-        s.replacingOccurrences(of: "&amp;", with: "&")
-         .replacingOccurrences(of: "&lt;", with: "<")
-         .replacingOccurrences(of: "&gt;", with: ">")
-         .replacingOccurrences(of: "&quot;", with: "\"")
-         .replacingOccurrences(of: "&#39;", with: "'")
-         .replacingOccurrences(of: "&apos;", with: "'")
-         .replacingOccurrences(of: "&#x27;", with: "'")
-         .replacingOccurrences(of: "&nbsp;", with: " ")
+        guard s.contains("&") else { return s }
+        var out = ""
+        out.reserveCapacity(s.count)
+        var i = s.startIndex
+        while i < s.endIndex {
+            guard s[i] == "&", let semi = s[i...].prefix(12).firstIndex(of: ";") else {
+                out.append(s[i])
+                i = s.index(after: i)
+                continue
+            }
+            let body = s[s.index(after: i)..<semi]
+            var decoded: Character?
+            if body.hasPrefix("#x") || body.hasPrefix("#X") {
+                decoded = UInt32(body.dropFirst(2), radix: 16).flatMap(Unicode.Scalar.init).map(Character.init)
+            } else if body.hasPrefix("#") {
+                decoded = UInt32(body.dropFirst(), radix: 10).flatMap(Unicode.Scalar.init).map(Character.init)
+            } else {
+                decoded = namedEntities[String(body)]
+            }
+            if let decoded {
+                out.append(decoded)
+                i = s.index(after: semi)
+            } else {
+                out.append(s[i])
+                i = s.index(after: i)
+            }
+        }
+        return out
     }
 
     public static func formatWebVTT(_ cues: [(start: Double, end: Double, text: String)]) -> String {

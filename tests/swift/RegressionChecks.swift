@@ -41,14 +41,6 @@ final class FixtureProtocol: URLProtocol {
     static let firstVisitor = "CgtFixtureVisitorFirst00000000000000"
     static let secondVisitor = "CgtFixtureVisitorSecond0000000000000"
     static let mediaBytes = Data("fixture-media-payload-for-the-http-path".utf8)
-    /// An untagged object 1 MiB larger than the live recorder's 64 MiB copy budget. Its first
-    /// KiB holds "A" and its last KiB holds "Z".
-    static let oversized: Data = {
-        var bytes = Data(count: 65 << 20)
-        bytes.replaceSubrange(0..<1024, with: Data(repeating: 0x41, count: 1024))
-        bytes.replaceSubrange((bytes.count - 1024)..<bytes.count, with: Data(repeating: 0x5A, count: 1024))
-        return bytes
-    }()
     /// A fail-closed HTTP denial on one stage of the YouTube path. `deny` covers an HTTP status;
     /// `denyPlayability` covers an explicit playability status with usable streaming data.
     nonisolated(unsafe) private static var deniedStage = ""
@@ -115,8 +107,9 @@ final class FixtureProtocol: URLProtocol {
         var status = 200
         var data = Data()
         var headers: [String: String] = [:]
-        var failure: URLError?
+        var failure: Error?
         var lostAfterResponse = false
+        var deliveredURL = url
 
         switch (url.host ?? "", url.path) {
         case ("cdn.syndication.twimg.com", "/tweet-result"), ("instance.invalid", "/api/v1/videos/fixture"), ("i.imgur.com", "/abc123.mp4"):
@@ -157,6 +150,9 @@ final class FixtureProtocol: URLProtocol {
             status = 405
         case ("imgur.com", "/abc405"):
             data = Data("<html><head><meta property=\"og:video\" content=\"https://media.invalid/media.mp4\"></head></html>".utf8)
+        case ("i.imgur.com", "/abcreset.mp4"):
+            // A connection reset before the status that URLSession reports as a POSIX error.
+            failure = NSError(domain: NSPOSIXErrorDomain, code: Int(ECONNRESET))
         case (_, let path) where path.hasPrefix("/embed/"):
             // Embedding is disabled, so the page carries its own UNPLAYABLE decision.
             let decision = #"{"playabilityStatus":{"status":"UNPLAYABLE","reason":"Playback on other websites has been disabled by the video owner."}}"#
@@ -176,9 +172,14 @@ final class FixtureProtocol: URLProtocol {
                 case let notice where notice.hasPrefix("notice-"):
                     player = Self.playerPayload(status: "OK", streaming: Self.directStreaming(1, hls: true), title: title)
                 case "hls-fallback-watchlist":
-                    player = Self.hlsOnlyPlayer(title: title)
+                    player = Self.hlsOnlyPlayer(title: title, playlist: Self.watchPlaylist)
+                case "hls-fallback":
+                    // Both the watch page and the profiles advertise a playlist.
+                    player = Self.hlsOnlyPlayer(title: title, playlist: Self.watchPlaylist)
                 case "hls-fallback-nowatch", "hls-fallback-lateprofile":
                     player = nil
+                case "ok-reason":
+                    player = Self.playerPayload(status: "OK", reason: "Sign in to confirm your age", streaming: nil, title: title)
                 default:
                     break
                 }
@@ -203,6 +204,8 @@ final class FixtureProtocol: URLProtocol {
                     data = Self.watchPage(player: player, visitor: visitor)
                 }
                 if mode == "cancel-watch" { failure = URLError(.cancelled) }
+                if mode == "redirect-google" { deliveredURL = URL(string: "https://accounts.google.com/ServiceLogin")! }
+                if mode == "redirect-ordinary" { deliveredURL = URL(string: "https://fixture.invalid/sorry/article")! }
             }
         case (_, let path) where path.hasSuffix("/player"):
             if mode == "watch-flags" {
@@ -230,6 +233,14 @@ final class FixtureProtocol: URLProtocol {
                     streaming: Self.directStreaming(playerNumber, hls: true),
                     title: "\(title)-\(playerNumber)"
                 ))
+            } else if mode == "player-body-lost" && playerNumber == 1 {
+                // HTTP 200 and half of an ordinary body, then the connection breaks. Trailing
+                // spaces make the half larger than the 512 bytes that URLSession can hold back to
+                // sniff the content type.
+                data = Self.json(Self.normalPlayer(playerNumber, title: title)) + Data(repeating: 0x20, count: 8192)
+                lostAfterResponse = true
+            } else if mode == "player-timeout" {
+                failure = URLError(.timedOut)
             } else if mode == "pace-retry" && playerNumber == 1 {
                 status = 503
             } else if ["watch-gate", "player-gate", "pace-concurrent", "wall-unusable-cookie", "watch-challenge-cookie", "player-challenge-cookie", "pace-retry"].contains(mode) {
@@ -238,9 +249,9 @@ final class FixtureProtocol: URLProtocol {
                 // An ordinary empty response, not a denial: extraction goes on to the next profile.
                 data = Self.json(Self.emptyPlayer(title: title))
             } else if mode == "hls-fallback" {
-                data = Self.json(Self.hlsOnlyPlayer(title: title))
+                data = Self.json(Self.hlsOnlyPlayer(title: title, playlist: Self.profilePlaylist))
             } else if mode == "hls-fallback-lateprofile" && playerNumber > 1 {
-                data = Self.json(Self.hlsOnlyPlayer(title: title))
+                data = Self.json(Self.hlsOnlyPlayer(title: title, playlist: Self.profilePlaylist))
             } else if mode == "hls-fallback-lateprofile" {
                 data = Self.json(Self.missingFormatPlayer(playerNumber, title: title))
             } else if ["hls-fallback-nowatch", "hls-fallback-watchlist"].contains(mode) {
@@ -269,7 +280,7 @@ final class FixtureProtocol: URLProtocol {
             } else {
                 data = Self.mediaBytes
             }
-        case ("media.invalid", "/clip.m3u8"):
+        case ("media.invalid", let path) where path.hasSuffix(".m3u8"):
             // An HLS playlist of 15 fragmented MP4 segments, 4 s each. Extraction reads only the playlist.
             let segments = (0..<15).map { "#EXTINF:4.0,\nclip-\($0).m4s" }.joined(separator: "\n")
             data = Data("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"clip-init.mp4\"\n\(segments)\n#EXT-X-ENDLIST\n".utf8)
@@ -290,10 +301,19 @@ final class FixtureProtocol: URLProtocol {
             return
         }
         headers["Content-Length"] = String(data.count)
-        let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
+        let response = HTTPURLResponse(url: deliveredURL, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
         client!.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         if lostAfterResponse {
-            client!.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+            guard !data.isEmpty else {
+                client!.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+                return
+            }
+            // Half of the body, then the connection breaks a moment later, after URLSession has
+            // handed over the response.
+            client!.urlProtocol(self, didLoad: data.prefix(data.count / 2))
+            DispatchQueue.global().asyncAfter(deadline: .now() + 0.35) {
+                self.client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+            }
             return
         }
         if !data.isEmpty { client!.urlProtocol(self, didLoad: data) }
@@ -312,8 +332,11 @@ final class FixtureProtocol: URLProtocol {
         return streaming
     }
 
-    static func hlsStreaming() -> [String: Any] {
-        ["hlsManifestUrl": "https://media.invalid/clip.m3u8"]
+    static let watchPlaylist = "https://media.invalid/watch.m3u8"
+    static let profilePlaylist = "https://media.invalid/profile.m3u8"
+
+    static func hlsStreaming(_ playlist: String = "https://media.invalid/clip.m3u8") -> [String: Any] {
+        ["hlsManifestUrl": playlist]
     }
 
     static func playerPayload(
@@ -352,8 +375,8 @@ final class FixtureProtocol: URLProtocol {
         playerPayload(status: "OK", streaming: ["adaptiveFormats": [Any]()], title: title)
     }
 
-    static func hlsOnlyPlayer(title: String) -> [String: Any] {
-        playerPayload(status: "OK", streaming: hlsStreaming(), title: title)
+    static func hlsOnlyPlayer(title: String, playlist: String) -> [String: Any] {
+        playerPayload(status: "OK", streaming: hlsStreaming(playlist), title: title)
     }
 
     static func missingFormatPlayer(_ n: Int, title: String) -> [String: Any] {
@@ -397,6 +420,10 @@ final class FixtureProtocol: URLProtocol {
         switch mode {
         case "notice-bot":
             html += "<main role=\"alert\"><p>Sign in to confirm you’re not a bot.</p><p>This helps protect our community.</p></main>"
+        case "notice-entity":
+            html += "<p>Sign in to confirm you&rsquo;re not a bot.</p>"
+        case "notice-entity-number":
+            html += "<p>Sign&#32;in to confirm you&#x2019;re not a bot.</p>"
         case "notice-bot-text":
             html += "<div>Sign in to confirm you're not a bot</div>"
         case "notice-age":
@@ -440,6 +467,9 @@ final class FixtureProtocol: URLProtocol {
         switch mode {
         case "plain-closed-details":
             html += "<h1>Music lesson</h1><details><summary>Help</summary><p>Sign in to confirm your age.</p></details>"
+        case "plain-secondary-summary":
+            // A browser shows only the first summary of a closed details element.
+            html += "<h1>Music lesson</h1><details><summary>Help</summary><summary>Sign in to confirm your age</summary></details>"
         case "plain-unlisted":
             // Wording that the earlier sentence guesser treated as a notice. None is listed.
             html += "<main role=\"alert\"><p>Please verify your age to play this video.</p><p>Playback is blocked.</p>"
@@ -570,16 +600,6 @@ struct RegressionChecks {
     static func check(_ ok: Bool, _ message: String) {
         print("\(ok ? "PASS" : "FAIL") \(FixtureProtocol.mode): \(message)")
         if !ok { exit(1) }
-    }
-
-    /// The highest physical memory footprint of this process so far.
-    static func peakFootprint() -> Int64 {
-        var info = task_vm_info_data_t()
-        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
-        let result = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
-        }
-        return result == KERN_SUCCESS ? info.ledger_phys_footprint_peak : 0
     }
 
     static func extract(_ id: String = "Fixture0001", client: HTTPClient = HTTPClient()) async throws -> MediaInfo {
@@ -745,6 +765,50 @@ struct RegressionChecks {
             let hosts = FixtureProtocol.requests().filter { $0.url.path != "/sanity" }.compactMap(\.url.host)
             check(info.formats.first?.url == "https://media.invalid/media.mp4" && hosts == ["i.imgur.com", "imgur.com"],
                   "a 405 probe falls back to the page; formats=\(info.formats.map(\.url)), hosts=\(hosts)")
+        // A reset before the status that is not a URLError still leaves the status unknown, so
+        // Imgur's optional direct probe ends the operation instead of moving on to the page.
+        case "imgur-reset":
+            var failure: Error?
+            do { _ = try await ImgurExtractor().extract(url: URL(string: "https://imgur.com/abcreset")!, client: HTTPClient()) }
+            catch { failure = error }
+            let hosts = FixtureProtocol.requests().filter { $0.url.path != "/sanity" }.compactMap(\.url.host)
+            var unknown = false
+            if case HTTPError.noStatus? = failure as? HTTPError { unknown = true }
+            check(unknown && hosts == ["i.imgur.com"],
+                  "a POSIX reset before the status is an unknown status that allows no later request; error=\(String(describing: failure)), hosts=\(hosts)")
+        // An OK playability status allows playback. A listed sentence as its reason is only
+        // information, so extraction goes on to the player.
+        case "ok-reason":
+            let error = await extractError()
+            check(error == nil && FixtureProtocol.playerCount() == 1,
+                  "OK with a listed reason and no visible notice is not a challenge; error=\(String(describing: error)), players=\(FixtureProtocol.playerCount())")
+        // A watch page that ends on Google's sign-in host is a challenge. A `/sorry/` path on
+        // another host is an ordinary page.
+        case "redirect-google", "redirect-ordinary":
+            let error = await extractError()
+            let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
+            if mode == "redirect-google" {
+                check(closedByBotGate(error) && paths == ["/watch"],
+                      "a watch page that ends on accounts.google.com stops at once; error=\(String(describing: error)), paths=\(paths)")
+            } else {
+                check(error == nil && FixtureProtocol.playerCount() == 1,
+                      "a /sorry/ path on a host that is not Google is not a challenge; error=\(String(describing: error)), paths=\(paths)")
+            }
+        // A /player body that breaks off after HTTP 200 had a known status, so the player tries
+        // again in its next pacing slot. A timeout before the status is not tried again.
+        case "player-body-lost", "player-timeout":
+            let start = now()
+            let error = await extractError()
+            let offsets = playerOffsets(from: start)
+            if mode == "player-body-lost" {
+                check(error == nil && offsets.count == 2 && keepsSlots(offsets),
+                      "a broken 2xx body is tried again in the next 3 s slot; error=\(String(describing: error)), offsets from the start=\(offsets)")
+            } else {
+                var unknown = false
+                if case HTTPError.noStatus? = error as? HTTPError { unknown = true }
+                check(unknown && offsets.count == 1,
+                      "a /player timeout before the status is not tried again; error=\(String(describing: error)), offsets from the start=\(offsets)")
+            }
         case "cancel-watch", "cancel-player", "cancel-probe":
             do {
                 _ = try await extract()
@@ -782,7 +846,7 @@ struct RegressionChecks {
 
         // Every listed HTTP status fails closed on each stage, with no later request.
         case "watch-status":
-            for code in [401, 403, 410, 429, 451] {
+            for code in [401, 403, 407, 410, 429, 451] {
                 FixtureProtocol.deny(stage: "watch", status: code)
                 let before = FixtureProtocol.requests().count
                 let error = await extractError()
@@ -792,7 +856,7 @@ struct RegressionChecks {
             }
             check(savedOutputs().isEmpty, "watch denials save no output; saved=\(savedOutputs())")
         case "player-status":
-            for code in [401, 403, 410, 429, 451] {
+            for code in [401, 403, 407, 410, 429, 451] {
                 FixtureProtocol.deny(stage: "player", status: code)
                 let before = FixtureProtocol.requests().count
                 let error = await extractError()
@@ -802,7 +866,7 @@ struct RegressionChecks {
             }
             check(savedOutputs().isEmpty, "player denials save no output; saved=\(savedOutputs())")
         case "probe-status":
-            for code in [401, 403, 410, 429, 451] {
+            for code in [401, 403, 407, 410, 429, 451] {
                 FixtureProtocol.deny(stage: "probe", status: code)
                 let before = FixtureProtocol.requests().count
                 let error = await extractError()
@@ -812,7 +876,7 @@ struct RegressionChecks {
             }
             check(savedOutputs().isEmpty, "probe denials save no output; saved=\(savedOutputs())")
         case "download-status":
-            for code in [401, 403, 410, 429, 451] {
+            for code in [401, 403, 407, 410, 429, 451] {
                 FixtureProtocol.deny(stage: "download", status: code)
                 let fresh = HTTPClient(userAgent: "FixtureAgent/\(code)")
                 let before = FixtureProtocol.requests().count
@@ -828,7 +892,7 @@ struct RegressionChecks {
         case "download-stream-status":
             // The probe succeeds and the single-stream GET is refused, so the streaming read must
             // throw the status too, not re-extract.
-            for code in [401, 403, 410, 429, 451] {
+            for code in [401, 403, 407, 410, 429, 451] {
                 FixtureProtocol.deny(stage: "stream", status: code)
                 let fresh = HTTPClient(userAgent: "FixtureAgent/\(code)")
                 let before = FixtureProtocol.requests().count
@@ -914,8 +978,8 @@ struct RegressionChecks {
             check(status == 429 && attempts == 1,
                   "HTTP 429 is not retried; status=\(status), attempts=\(attempts)")
         // A refusal whose explanation breaks off or stalls after the headers is still the refusal:
-        // one request and its status. A connection lost before any response stays a transport
-        // failure and is retried.
+        // one request and its status. A connection lost before any response leaves the status
+        // unknown, and uBit does not send the request again.
         case "refusal-body-reset", "refusal-body-stall", "lost-before-response":
             let explanation = String(repeating: "Not available. ", count: 200)
             let origin = WireOrigin { connection, number, _ in
@@ -944,16 +1008,71 @@ struct RegressionChecks {
             } catch { failure = error }
             if mode == "lost-before-response" {
                 // URLSession itself can repeat a request whose connection closed before any
-                // response byte, so the origin count is not checked. uBit adds no attempt of its
-                // own: it reports the unknown status instead of the transport error.
+                // response byte, and how often depends on the OS. A raw URLSession request on
+                // the same runtime is the control: uBit may add no attempt of its own.
+                let control = WireOrigin { connection, _, _ in WireOrigin.reset(connection) }
+                _ = try? await URLSession(configuration: .ephemeral).data(from: URL(string: "http://127.0.0.1:\(control.port)/unavailable")!)
                 var unknown = false
                 if case HTTPError.noStatus? = failure as? HTTPError { unknown = true }
-                check(status == 0 && unknown,
-                      "a connection lost before any status ends with an unknown status; requests=\(origin.requests), error=\(String(describing: failure))")
+                check(status == 0 && unknown && origin.requests == control.requests,
+                      "a connection lost before any status ends with an unknown status and no attempt of uBit's own; requests=\(origin.requests), one-request control=\(control.requests), error=\(String(describing: failure))")
             } else {
                 check(status == 403 && origin.requests == 1,
                       "a 403 ends the request at its headers, whatever happens to its body; status=\(status), requests=\(origin.requests), error=\(String(describing: failure))")
             }
+        // A refused range ends the whole transfer: no worker requests that range again, and no
+        // final file is left. The other ranges answer only after the refusal.
+        case "range-refusal":
+            final class Ranges: @unchecked Sendable {
+                private let lock = NSLock()
+                private var seen: [String: Int] = [:]
+                private var refusedRange: String?
+                /// Records `range` and returns true when it is the first range after the probe.
+                func add(_ range: String) -> Bool {
+                    lock.withLock {
+                        seen[range, default: 0] += 1
+                        guard range != "bytes=0-0", refusedRange == nil || refusedRange == range else { return false }
+                        refusedRange = range
+                        return true
+                    }
+                }
+                var all: [String: Int] { lock.withLock { seen } }
+                var refused: String? { lock.withLock { refusedRange } }
+            }
+            let ranges = Ranges()
+            let size = 1 << 20
+            let refusal = DispatchSemaphore(value: 0)
+            let origin = WireOrigin { connection, _, request in
+                let range = request.split(separator: "\r\n")
+                    .first { $0.lowercased().hasPrefix("range:") }
+                    .map { $0.dropFirst(6).trimmingCharacters(in: .whitespaces) } ?? ""
+                let refuse = ranges.add(range)
+                if range == "bytes=0-0" {
+                    WireOrigin.transmit(connection, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/\(size)\r\nETag: \"e1\"\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx")
+                } else if refuse {
+                    WireOrigin.transmit(connection, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    refusal.signal()
+                } else {
+                    _ = refusal.wait(timeout: .now() + 5)
+                    refusal.signal()
+                    usleep(400_000)
+                    let bounds = range.dropFirst(6).split(separator: "-").compactMap { Int($0) }
+                    if bounds.count == 2 {
+                        let length = bounds[1] - bounds[0] + 1
+                        WireOrigin.transmit(connection, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes \(bounds[0])-\(bounds[1])/\(size)\r\nETag: \"e1\"\r\nContent-Length: \(length)\r\nConnection: close\r\n\r\n" + String(repeating: "x", count: length))
+                    }
+                }
+                close(connection)
+            }
+            let file = AppPaths.appSupportDir.appendingPathComponent("range-refusal.bin")
+            var failure: Error?
+            do {
+                try await HTTPClient().downloadFile(url: "http://127.0.0.1:\(origin.port)/refused.bin", destination: file, connections: 2)
+            } catch { failure = error }
+            let seen = ranges.all
+            let refused = ranges.refused ?? ""
+            check(httpStatus(failure) == 403 && seen[refused] == 1 && !FileManager.default.fileExists(atPath: file.path),
+                  "a refused range is requested once and ends the transfer without a final file; refused=\(refused), ranges=\(seen), error=\(String(describing: failure))")
         // URLSession can hold a response until some of its body arrives. A 403 that sends its
         // headers and then no body reaches uBit as a timeout, so its status is unknown; neither
         // fetchData, a probe, a parallel range worker nor a single stream sends that request
@@ -1239,14 +1358,19 @@ struct RegressionChecks {
             }
             let missing = FixtureProtocol.requests().filter { $0.url.path == "/missing" }
             let denied = FixtureProtocol.requests().filter {
-                $0.url.path == "/media" && [401, 403, 410, 429, 451].contains($0.status)
+                $0.url.path == "/media" && [401, 403, 407, 410, 429, 451].contains($0.status)
             }
+            let playlists = FixtureProtocol.requests().map(\.url.path).filter { $0.hasSuffix(".m3u8") }
+            // A profile playlist outranks the watch-page playlist; the watch-page playlist is
+            // used only when no profile has one.
+            let expected = ["hls-fallback": ["/profile.m3u8"], "hls-fallback-lateprofile": ["/profile.m3u8"],
+                            "hls-fallback-watchlist": ["/watch.m3u8"], "hls-fallback-nowatch": []][mode] ?? []
             let ok = mode == "hls-fallback-nowatch"
                 ? formats.isEmpty && !failure.isEmpty && missing.isEmpty && denied.isEmpty
                 : !formats.isEmpty && formats.allSatisfy { $0.hasSuffix(":hls") } && failure.isEmpty
                     && denied.isEmpty && (mode != "hls-fallback-lateprofile" || missing.count == 1)
-            check(ok,
-                  "the HLS playlist is used after an ordinary empty or not-found miss, never a denial; formats=\(formats), failure=\(failure), missing=\(missing.count), denied=\(denied.map(\.status))")
+            check(ok && playlists == expected,
+                  "the HLS playlist is used after an ordinary empty or not-found miss, never a denial, and a profile playlist outranks the watch page; formats=\(formats), failure=\(failure), missing=\(missing.count), denied=\(denied.map(\.status)), playlists=\(playlists)")
         case "dash-refusal":
             let dir = AppPaths.appSupportDir.appendingPathComponent("out")
             let file = dir.appendingPathComponent("video.mp4")
@@ -1305,10 +1429,15 @@ struct RegressionChecks {
                  await CLIRunner.run(arguments: ["ubit", "get", "--proxy", "socks4://user:\(marker)@127.0.0.1:9", target]),
                  await CLIRunner.run(arguments: ["ubit", "settings", "proxy", "socks4a://user:\(marker)@127.0.0.1:9"]))
             }
+            // A port outside 1...65535 cannot be installed either.
+            let (highPort, zeroPort) = (
+                await CLIRunner.run(arguments: ["ubit", "info", "--no-cookies", "--proxy", "socks5://127.0.0.1:65536", target]),
+                await CLIRunner.run(arguments: ["ubit", "info", "--no-cookies", "--proxy", "http://127.0.0.1:0", target]))
             let added = FixtureProtocol.requests().count - before
             var settings = Settings()
             let storedBad = settings.setByKey("proxy", value: "bogus")
             let storedSocks4a = settings.setByKey("proxy", value: "socks4a://127.0.0.1:9")
+            let storedHighPort = settings.setByKey("proxy", value: "socks5://127.0.0.1:65536")
             let storedGood = settings.setByKey("proxy", value: "socks5://127.0.0.1:9")
             _ = await CLIRunner.run(arguments: ["ubit", "info", "--no-cookies", "--proxy", "socks5://127.0.0.1:9", "https://fixture.invalid/video"])
             _ = await CLIRunner.run(arguments: ["ubit", "info", "--no-cookies", "--proxy", "SOCKS5://127.0.0.1", "https://fixture.invalid/video"])
@@ -1317,9 +1446,10 @@ struct RegressionChecks {
             let capitalPort = resolved.contains("\(kCFProxyTypeSOCKS as String) 127.0.0.1:1080")
             let leaked = stderrText.contains(marker)
             check(formats == 2 && info == 2 && get == 2 && socks4 == 2 && socks4a == 2 && getSocks4 == 2 && settingsSocks4a == 2
+                    && highPort == 2 && zeroPort == 2
                     && added == 0 && !leaked && stderrText.contains("invalid")
-                    && !storedBad && !storedSocks4a && storedGood && routed && capitalPort,
-                  "invalid proxies exit 2 before any request without repeating the value, settings refuse them, valid ones are installed and a capital SOCKS5 scheme gets port 1080; formats=\(formats), info=\(info), get=\(get), socks4=\(socks4), socks4a=\(socks4a), getSocks4=\(getSocks4), settings=\(settingsSocks4a), requests=\(added), password in stderr=\(leaked), storedBad=\(storedBad), storedSocks4a=\(storedSocks4a), resolved=\(resolved)")
+                    && !storedBad && !storedSocks4a && !storedHighPort && storedGood && routed && capitalPort,
+                  "invalid proxies exit 2 before any request without repeating the value, settings refuse them, valid ones are installed and a capital SOCKS5 scheme gets port 1080; formats=\(formats), info=\(info), get=\(get), socks4=\(socks4), socks4a=\(socks4a), getSocks4=\(getSocks4), settings=\(settingsSocks4a), port 65536=\(highPort), port 0=\(zeroPort), requests=\(added), password in stderr=\(leaked), storedBad=\(storedBad), storedSocks4a=\(storedSocks4a), storedHighPort=\(storedHighPort), resolved=\(resolved)")
         case "proxy-stored":
             // A proxy that was stored before validation existed (or typed into settings.json)
             // must fail the command, not send the request without a proxy. Its error must not

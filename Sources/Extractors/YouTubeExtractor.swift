@@ -232,13 +232,15 @@ public struct YouTubeExtractor: SiteExtractor {
               let status = decision["status"] as? String else {
             throw ExtractorError.playbackDenied("YouTube did not confirm playback.")
         }
+        // An OK status allows playback; a reason next to it is only information.
+        if status == "OK" {
+            if decision["errorScreen"] != nil { throw ExtractorError.playbackDenied("YouTube declined playback.") }
+            return
+        }
         let reason = decision["reason"] as? String ?? ""
         if isNotice(reason.lowercased()) { throw ExtractorError.botGate("YouTube") }
         if status == "LOGIN_REQUIRED" { throw ExtractorError.loginRequired("YouTube") }
-        if status != "OK" {
-            throw ExtractorError.playbackDenied(reason.isEmpty ? "YouTube declined playback (\(status))." : reason)
-        }
-        if decision["errorScreen"] != nil { throw ExtractorError.playbackDenied("YouTube declined playback.") }
+        throw ExtractorError.playbackDenied(reason.isEmpty ? "YouTube declined playback (\(status))." : reason)
     }
 
     /// The only sentences that mark a verification challenge, on a visible part of the page or
@@ -258,9 +260,13 @@ public struct YouTubeExtractor: SiteExtractor {
             .contains { noticeSentences.contains($0.trimmingCharacters(in: .whitespaces)) }
     }
 
-    /// A page that ended on Google's challenge, sign-in or consent host is a challenge.
+    /// A page that ended on Google's challenge page (`/sorry/` on a Google host), on Google's
+    /// sign-in host or on a YouTube or Google consent host is a challenge.
     private static func checkChallengeRedirect(_ url: URL) throws {
-        if url.path.hasPrefix("/sorry/") || url.host == "accounts.google.com" || url.host?.hasPrefix("consent.") == true {
+        let host = url.host?.lowercased() ?? ""
+        let google = host == "google.com" || host.hasSuffix(".google.com")
+        if (google && url.path.hasPrefix("/sorry/")) || host == "accounts.google.com"
+            || host == "consent.youtube.com" || host == "consent.google.com" {
             throw ExtractorError.botGate("YouTube")
         }
     }
@@ -610,7 +616,11 @@ public struct YouTubeExtractor: SiteExtractor {
                 return response
             } catch HTTPError.status(let code, _) where attempt < 2 && [500, 502, 503, 504].contains(code) {
                 attempt += 1
-            } catch let error as URLError where attempt < 2 && HTTPClient.canRetryTransport(error) {
+            } catch let error as URLError where attempt < 2 && error.code != .cancelled {
+                // `responseBytes` turns every failure before the status into `noStatus`, except
+                // one that proves that the request never reached the server. Any other URLError
+                // here broke off the body of a 2xx answer, so the status is known and allows a
+                // new attempt, which waits for its own pacing permit.
                 attempt += 1
             }
         }

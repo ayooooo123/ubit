@@ -95,6 +95,7 @@ private actor WorkStealingQueue {
     private var active: [Int: ActiveWorker] = [:]
     private var nextID: Int = 1
     private let minStealSize: Int64 = 512 * 1024 // 512 KB minimum split
+    private var stopped = false
 
     init(state: ChunkStateFile, stateURL: URL, initialSplits: Int) {
         self.state = state
@@ -116,6 +117,7 @@ private actor WorkStealingQueue {
     }
 
     func claimWork() -> (workerID: Int, range: ByteRange)? {
+        guard !stopped else { return nil }
         if !pending.isEmpty {
             let r = pending.removeFirst()
             let id = nextID
@@ -170,10 +172,12 @@ private actor WorkStealingQueue {
         return (keepGoing, allowed, state.downloadedBytes)
     }
 
-    func failWorker(workerID: Int) {
-        if let w = active.removeValue(forKey: workerID), w.currentPos <= w.endPos {
-            pending.insert(ByteRange(start: w.currentPos, end: w.endPos), at: 0)
-        }
+    /// Ends the transfer after a worker fails: no range is put back, and no worker claims new
+    /// work. A refused range is therefore never requested again by another worker.
+    func stop() {
+        stopped = true
+        pending.removeAll()
+        active.removeAll()
     }
 
     func flushState() {
@@ -208,12 +212,14 @@ public final class HTTPClient: @unchecked Sendable {
     }
 
     /// True for a proxy URL that `init` can install: an http, https, socks, socks5 or socks5h
-    /// scheme and a host. URLSession speaks SOCKS version 5 for every socks scheme, so socks4
-    /// and socks4a are refused. Any other string would leave the session without a proxy, so
-    /// callers reject it instead of sending the requests directly.
+    /// scheme, a host, and no port or a TCP port from 1 to 65535. URLSession speaks SOCKS
+    /// version 5 for every socks scheme, so socks4 and socks4a are refused. Any other string
+    /// would leave the session without a working proxy, so callers reject it instead of
+    /// sending the requests.
     public static func isValidProxy(_ proxy: String) -> Bool {
         guard let url = URL(string: proxy), let host = url.host, !host.isEmpty,
               let scheme = url.scheme?.lowercased() else { return false }
+        if let port = url.port, !(1...65535).contains(port) { return false }
         return ["http", "https", "socks", "socks5", "socks5h"].contains(scheme)
     }
 
@@ -294,16 +300,21 @@ public final class HTTPClient: @unchecked Sendable {
     }
 
     /// Sends `req` and returns when URLSession hands over the response. A refusal status throws
-    /// `HTTPError.status` at once, without reading the body. A transport failure before the
-    /// status stays a `URLError` only when `canRetryTransport` proves that the request never
-    /// reached the server; any other failure becomes `HTTPError.noStatus`, which no caller
-    /// repeats. URLSession can hold a response until some body arrives, so a refusal that sends
-    /// only headers reaches uBit as `noStatus` after the 30 s request timeout.
+    /// `HTTPError.status` at once, without reading the body. A failure before the status stays
+    /// as it is only for a cancellation or when `canRetryTransport` proves that the request
+    /// never reached the server; any other failure, also one that is not a `URLError`, becomes
+    /// `HTTPError.noStatus`, which no caller repeats. URLSession can hold a response until some
+    /// body arrives, so a refusal that sends only headers reaches uBit as `noStatus` after the
+    /// 30 s request timeout.
     func responseBytes(for req: URLRequest, url: String) async throws -> (URLSession.AsyncBytes, HTTPURLResponse) {
         let bytes: URLSession.AsyncBytes, response: URLResponse
         do {
             (bytes, response) = try await session.bytes(for: req)
-        } catch let error as URLError where error.code != .cancelled && !Self.canRetryTransport(error) {
+        } catch let error as URLError where error.code == .cancelled || Self.canRetryTransport(error) {
+            throw error
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
             throw HTTPError.noStatus(url)
         }
         guard let http = response as? HTTPURLResponse else {
@@ -496,7 +507,9 @@ public final class HTTPClient: @unchecked Sendable {
                         }
                     }
                 }
-                try await group.waitForAll()
+                // The first failure ends the group at once and cancels the other workers. A
+                // plain `waitForAll` would let them finish and claim more work first.
+                for try await _ in group {}
             }
         } catch {
             await workQueue.flushState()
@@ -538,7 +551,6 @@ public final class HTTPClient: @unchecked Sendable {
                 let (bytes, http) = try await responseBytes(for: req, url: url)
                 guard http.statusCode == 206 else {
                     bytes.task.cancel()
-                    await workQueue.failWorker(workerID: workerID)
                     throw HTTPError.rangeUnsupported
                 }
 
@@ -557,7 +569,7 @@ public final class HTTPClient: @unchecked Sendable {
                         }
                         if !res.keepGoing { return }
                         if Task.isCancelled {
-                            await workQueue.failWorker(workerID: workerID)
+                            await workQueue.stop()
                             throw CancellationError()
                         }
                     }
@@ -569,19 +581,14 @@ public final class HTTPClient: @unchecked Sendable {
                 }
                 attempts = 0
                 if reqEnd >= origEnd { return }
-            } catch is CancellationError {
-                await workQueue.failWorker(workerID: workerID)
-                throw CancellationError()
-            } catch let e as HTTPError {
-                await workQueue.failWorker(workerID: workerID)
-                throw e
-            } catch {
+            } catch let error as URLError where error.code != .cancelled && attempts < 3 {
+                // The status was 206 and the body broke off, or the connection never opened
+                // (`responseBytes` turns every other failure before the status into `noStatus`).
                 attempts += 1
-                if attempts >= 4 {
-                    await workQueue.failWorker(workerID: workerID)
-                    throw error
-                }
                 try await Task.sleep(nanoseconds: UInt64(350_000_000 * attempts))
+            } catch {
+                await workQueue.stop()
+                throw error
             }
         }
     }

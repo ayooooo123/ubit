@@ -55,9 +55,75 @@ public enum HLSEngine {
         return out
     }
 
+    /// Resolves a playlist URI to the URL that an HTTP request for it asks for. Edition checks
+    /// compare these URLs, so two spellings of one resource ("pack.m4s" and "pack.m4s#") are one
+    /// resource there too.
     private static func resolve(_ rel: String, base: URL) -> String {
-        if rel.hasPrefix("http://") || rel.hasPrefix("https://") { return rel }
-        return URL(string: rel, relativeTo: base)?.absoluteURL.absoluteString ?? rel
+        if rel.hasPrefix("http://") || rel.hasPrefix("https://") { return retrievalURL(rel) }
+        return retrievalURL(URL(string: rel, relativeTo: base)?.absoluteURL.absoluteString ?? rel)
+    }
+
+    /// `url` without the parts that do not change the requested resource (RFC 3986, 6.2.2): the
+    /// fragment, which a client does not send, the case of the scheme and host, a default port,
+    /// dot segments and percent-encoded unreserved characters. Path and query stay otherwise as
+    /// they are.
+    static func retrievalURL(_ url: String) -> String {
+        guard var parts = URLComponents(string: url), let scheme = parts.scheme?.lowercased() else { return url }
+        parts.scheme = scheme
+        parts.percentEncodedHost = parts.percentEncodedHost?.lowercased()
+        if (scheme == "http" && parts.port == 80) || (scheme == "https" && parts.port == 443) { parts.port = nil }
+        parts.fragment = nil
+        var path = removeDotSegments(normalizePercents(parts.percentEncodedPath))
+        if path.isEmpty, parts.percentEncodedHost != nil { path = "/" }
+        parts.percentEncodedPath = path
+        if let query = parts.percentEncodedQuery { parts.percentEncodedQuery = normalizePercents(query) }
+        return parts.string ?? url
+    }
+
+    /// Decodes percent-encoded unreserved characters and writes other escapes in uppercase.
+    private static func normalizePercents(_ text: String) -> String {
+        guard text.contains("%") else { return text }
+        func digit(_ byte: UInt8) -> UInt8? {
+            switch byte {
+            case UInt8(ascii: "0")...UInt8(ascii: "9"): return byte - UInt8(ascii: "0")
+            case UInt8(ascii: "A")...UInt8(ascii: "F"): return byte - UInt8(ascii: "A") + 10
+            case UInt8(ascii: "a")...UInt8(ascii: "f"): return byte - UInt8(ascii: "a") + 10
+            default: return nil
+            }
+        }
+        let hex = Array("0123456789ABCDEF".utf8)
+        let unreserved = Set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~".utf8)
+        let bytes = Array(text.utf8)
+        var out: [UInt8] = []
+        out.reserveCapacity(bytes.count)
+        var i = 0
+        while i < bytes.count {
+            if bytes[i] == UInt8(ascii: "%"), i + 2 < bytes.count, let high = digit(bytes[i + 1]), let low = digit(bytes[i + 2]) {
+                let value = high << 4 | low
+                if unreserved.contains(value) { out.append(value) } else { out += [UInt8(ascii: "%"), hex[Int(high)], hex[Int(low)]] }
+                i += 3
+            } else {
+                out.append(bytes[i])
+                i += 1
+            }
+        }
+        return String(decoding: out, as: UTF8.self)
+    }
+
+    /// RFC 3986, 5.2.4, for an absolute path.
+    private static func removeDotSegments(_ path: String) -> String {
+        let segments = path.split(separator: "/", omittingEmptySubsequences: false)
+        var out: [Substring] = []
+        for (index, segment) in segments.enumerated() {
+            let last = index == segments.count - 1
+            if segment == "." || segment == ".." {
+                if segment == "..", out.count > 1 { out.removeLast() }
+                if last { out.append("") }
+                continue
+            }
+            out.append(segment)
+        }
+        return out.joined(separator: "/")
     }
 
     private static func parseByteRange(_ s: String, prevEnd: inout Int64) -> ByteRange? {

@@ -232,12 +232,30 @@ private final class ResponseStart: NSObject, URLSessionTaskDelegate, @unchecked 
 private actor StatusGate {
     private var busy = false
     private var stopped: Error?
-    private var waiting: [CheckedContinuation<Void, Error>] = []
+    private var waiting: [(id: UInt64, request: CheckedContinuation<Void, Error>)] = []
+    private var lastID: UInt64 = 0
 
+    /// Waits until no other request waits for its status. A cancelled task stops waiting at
+    /// once and keeps the order of the other waiting requests.
     func enter() async throws {
         if let stopped { throw stopped }
         guard busy else { busy = true; return }
-        try await withCheckedThrowingContinuation { waiting.append($0) }
+        lastID += 1
+        let id = lastID
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (request: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled { request.resume(throwing: CancellationError()) } else { waiting.append((id, request)) }
+            }
+        } onCancel: {
+            Task { await self.cancel(id) }
+        }
+    }
+
+    /// Ends the wait of a cancelled request. A request that `leave` has already admitted is no
+    /// longer here: it holds the gate, sees the cancellation in `responseBytes` and leaves.
+    private func cancel(_ id: UInt64) {
+        guard let index = waiting.firstIndex(where: { $0.id == id }) else { return }
+        waiting.remove(at: index).request.resume(throwing: CancellationError())
     }
 
     /// Ends the wait of the current request. A `stop` error ends the operation: every waiting
@@ -246,12 +264,12 @@ private actor StatusGate {
         if stopped == nil, let stop { stopped = stop }
         if let stopped {
             busy = false
-            for next in waiting { next.resume(throwing: stopped) }
+            for next in waiting { next.request.resume(throwing: stopped) }
             waiting.removeAll()
         } else if waiting.isEmpty {
             busy = false
         } else {
-            waiting.removeFirst().resume()
+            waiting.removeFirst().request.resume()
         }
     }
 }

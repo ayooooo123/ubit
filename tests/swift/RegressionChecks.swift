@@ -200,6 +200,9 @@ final class FixtureProtocol: URLProtocol {
             data = Data("#EXTM3U\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@0\npack.ts\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST\n".utf8)
         case ("media.invalid", "/repeat.m3u8"):
             data = Data("#EXTM3U\n#EXTINF:2,\npack.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:2,\npack.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/alias.m3u8"):
+            // Four spellings of one HTTP resource: a fragment, an encoded letter and a default port.
+            data = Data("#EXTM3U\n#EXTINF:2,\npack.ts\n#EXTINF:2,\npack.ts#\n#EXTINF:2,\n%70ack.ts\n#EXTINF:2,\nhttps://media.invalid:443/pack.ts\n#EXT-X-ENDLIST\n".utf8)
         case ("media.invalid", "/lost-after-headers"):
             // A 403 response, and then the connection is lost before any body byte.
             status = 403
@@ -208,7 +211,7 @@ final class FixtureProtocol: URLProtocol {
             // hls-live-whole-changed: every read after the first comes from a new edition.
             let changed = range == "bytes=2-3" || Self.lock.withLock {
                 (mode == "hls-live-changed" && Self.seen.contains { $0.url.path == url.path && $0.range == nil })
-                    || ((mode == "hls-live-whole-changed" || mode == "hls-repeat-changed") && Self.seen.contains { $0.url.path == url.path })
+                    || (["hls-live-whole-changed", "hls-repeat-changed", "hls-alias-changed"].contains(mode) && Self.seen.contains { $0.url.path == url.path })
             }
             let edition = Data((changed ? "BBBB" : "AAAA").utf8)
             if mode != "hls-untagged-edition" && !mode.hasPrefix("hls-live-") { headers["ETag"] = changed ? "\"B\"" : "\"A\"" }
@@ -259,7 +262,8 @@ final class FixtureProtocol: URLProtocol {
                 case "watch-wall-text", "watch-blocked-text":
                     player = nil
                 case "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age", "watch-blocked-notice", "watch-header-age",
-                     "watch-verify-human", "watch-open-details", "watch-details-summary", "watch-confirm-identity":
+                     "watch-verify-human", "watch-open-details", "watch-details-summary", "watch-confirm-identity",
+                     "watch-identity-phone", "watch-age-device":
                     player = Self.playerPayload(status: "OK", streaming: Self.directStreaming(1, hls: true), title: title)
                 case "hls-fallback-watchlist":
                     player = Self.hlsOnlyPlayer(title: title)
@@ -283,7 +287,7 @@ final class FixtureProtocol: URLProtocol {
                 switch mode {
                 case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age",
                      "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
-                     "watch-details-summary", "watch-confirm-identity":
+                     "watch-details-summary", "watch-confirm-identity", "watch-identity-phone", "watch-age-device":
                     data = Self.wallPage(player: player, mode: mode)
                 case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson",
                      "watch-agent-settings", "watch-ordinary-objects":
@@ -553,6 +557,8 @@ final class FixtureProtocol: URLProtocol {
         case "watch-open-details": html += "<h1>Music lesson</h1><details open><summary>Help</summary><p>Please verify your age to play this video.</p></details>"
         case "watch-details-summary": html += "<details><summary>Verify your age to play this video.</summary><p>Help</p></details>"
         case "watch-confirm-identity": html += "<main><p>Please confirm your identity to continue watching.</p></main>"
+        case "watch-identity-phone": html += "<main role=\"alert\"><p>Please confirm your identity using your phone to continue watching.</p></main>"
+        case "watch-age-device": html += "<main role=\"alert\"><p>Verify your age on this device to continue watching.</p></main>"
         default: html += "<main>Verify your identity before playback can continue. Playback is blocked.</main>"
         }
         if let player {
@@ -590,7 +596,7 @@ final class FixtureProtocol: URLProtocol {
         case "watch-agent-settings":
             html += "<article><h1>Remote playback</h1><p>Verify your agent settings, then try again.</p><p>Verify your audio settings.</p></article>"
         case "watch-ordinary-objects":
-            html += "<article><h1>Storage setup</h1><p>Confirm your identity provider settings before you save the configuration.</p><p>Verify the cable is not a bottleneck for the disk.</p></article>"
+            html += "<article><h1>Storage setup</h1><p>Confirm your identity provider settings before you save the configuration.</p><p>Confirm your identity-provider settings before you save the configuration.</p><p>Verify the cable is not a bottleneck for the disk.</p></article>"
         default: break
         }
         if mode == "watch-hidden-notice" {
@@ -940,7 +946,7 @@ struct RegressionChecks {
         // Finding 2: a visible notice outranks embedded metadata; inert text is not a notice.
         case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age",
              "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
-             "watch-details-summary", "watch-confirm-identity":
+             "watch-details-summary", "watch-confirm-identity", "watch-identity-phone", "watch-age-device":
             let before = FixtureProtocol.requests().count
             let error = await extractError()
             let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
@@ -1266,6 +1272,33 @@ struct RegressionChecks {
             if case HTTPError.noStatus? = failure as? HTTPError { unknown = true }
             check(unknown && attempts == 1,
                   "uninformative metrics do not allow another request; attempts=\(attempts), error=\(String(describing: failure))")
+        // A request that waits at the gate for another request's status can be cancelled alone:
+        // it returns at once, it never reaches the origin, and the gate still admits later requests.
+        case "gate-cancel-waiter":
+            let hold = DispatchSemaphore(value: 0)
+            let origin = WireOrigin { connection, _, request in
+                let path = request.split(separator: " ").dropFirst().first.map(String.init) ?? ""
+                if path == "/first" { hold.wait() }
+                WireOrigin.transmit(connection, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n" + (path == "/first" ? "AAAA" : "BBBB"))
+                close(connection)
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) { hold.signal() }
+            let client = HTTPClient()
+            let base = "http://127.0.0.1:\(origin.port)"
+            let first = Task { try await client.fetchData(url: base + "/first").0 }
+            while origin.requests == 0 { try? await Task.sleep(nanoseconds: 10_000_000) }
+            let waiter = Task { try await client.fetchData(url: base + "/later").0 }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            let started = Date()
+            waiter.cancel()
+            let cancelled: Bool
+            do { _ = try await waiter.value; cancelled = false } catch { cancelled = error is CancellationError }
+            let elapsed = Date().timeIntervalSince(started)
+            let onWire = origin.requests
+            let firstBody = try? await first.value
+            let later = try? await client.fetchData(url: base + "/later").0
+            check(cancelled && elapsed < 0.5 && onWire == 1 && firstBody == Data("AAAA".utf8) && later == Data("BBBB".utf8) && origin.requests == 2,
+                  "a cancelled request that waits for another request's status returns at once and leaves the gate usable; cancelled=\(cancelled), elapsed=\(elapsed), requestsAtCancel=\(onWire), first=\(firstBody.map { String(decoding: $0, as: UTF8.self) } ?? "none"), later=\(later.map { String(decoding: $0, as: UTF8.self) } ?? "none")")
         case "cancel-slots":
             // A waiter that is cancelled gives its slot back when nobody queued behind it.
             let pacer = YouTubeExtractor.YTGuard()
@@ -1817,15 +1850,16 @@ struct RegressionChecks {
                   "two playlist ranges must not publish bytes from different editions")
         // Two whole reads of one URI in one selection give one edition: a changed object fails
         // without a clip, and an unchanged object is saved twice.
-        case "hls-repeat-stable", "hls-repeat-changed":
+        case "hls-repeat-stable", "hls-repeat-changed", "hls-alias-stable", "hls-alias-changed":
+            let alias = mode.hasPrefix("hls-alias")
             let file = AppPaths.appSupportDir.appendingPathComponent("repeat.ts")
             var rejected = false
             do {
-                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/repeat.m3u8", destination: file, connections: 1)
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/\(alias ? "alias" : "repeat").m3u8", destination: file, connections: 1)
             } catch HTTPError.rangeUnsupported { rejected = true }
             let saved = try? Data(contentsOf: file)
-            check(mode == "hls-repeat-changed" ? rejected && saved == nil : saved == Data("AAAAAAAA".utf8),
-                  "two whole reads of one URI must not publish bytes from different editions; saved=\(saved.map { String(decoding: $0, as: UTF8.self) } ?? "none")")
+            check(mode.hasSuffix("-changed") ? rejected && saved == nil : saved == Data(String(repeating: "AAAA", count: alias ? 4 : 2).utf8),
+                  "whole reads of one HTTP resource, also under other spellings, must not publish bytes from different editions; saved=\(saved.map { String(decoding: $0, as: UTF8.self) } ?? "none")")
         case "hls-short-range":
             let folder = AppPaths.appSupportDir.appendingPathComponent("out")
             var options = DownloadRequestOptions()
@@ -1870,6 +1904,28 @@ struct RegressionChecks {
             let storedPadded = settings.setByKey("cookies", value: " brave ")
             check(unknown == 2 && chromium == 1 && added == 0 && !storedBrave && !storedPadded,
                   "unknown info flag exits 2, a Chromium cookie source fails before any request, settings refuse it even with spaces; unknown=\(unknown), chromium=\(chromium), requests=\(added), stored=\(storedBrave), storedPadded=\(storedPadded)")
+        // One SIGINT while a command waits for metadata stops it at once with exit code 130, not
+        // with a late success. One signal for each process: the second SIGINT ends the process.
+        case "sigint-info", "sigint-formats", "sigint-get":
+            let hold = DispatchSemaphore(value: 0)
+            let origin = WireOrigin { connection, number, _ in
+                if number == 1 { hold.wait() }
+                let body = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nordinary.ts\n#EXT-X-ENDLIST\n"
+                WireOrigin.transmit(connection, "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n" + body)
+                close(connection)
+            }
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) { hold.signal() }
+            let command = String(mode.dropFirst("sigint-".count))
+            var arguments = ["ubit", command, "--json", "--no-cookies"]
+            if command == "get" { arguments += ["--no-library", "--keep-sponsors", "-o", AppPaths.appSupportDir.appendingPathComponent("out").path] }
+            let run = Task { await CLIRunner.run(arguments: arguments + ["http://127.0.0.1:\(origin.port)/session.m3u8"]) }
+            while origin.requests == 0 { try? await Task.sleep(nanoseconds: 10_000_000) }
+            let started = Date()
+            kill(getpid(), SIGINT)
+            let code = await run.value
+            let elapsed = Date().timeIntervalSince(started)
+            check(code == 130 && elapsed < 0.5,
+                  "one SIGINT during the metadata request of \(command) exits 130 at once; code=\(code), elapsed=\(elapsed), requests=\(origin.requests)")
         case "proxy-values":
             // A proxy value that cannot be installed must not send the requests directly.
             let before = FixtureProtocol.requests().count

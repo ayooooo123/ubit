@@ -271,13 +271,25 @@ public struct YouTubeExtractor: SiteExtractor {
         return ["your age", "your identity"] + subjects.flatMap { subject in human.map { subject + $0 } }
     }()
 
-    /// Words that can follow the object of an instruction and start a new part of the sentence.
-    private static let clauseWords: Set<String> = ["to", "before", "and", "so", "by", "with", "first", "now", "again", "then", "or", "if", "below", "here"]
+    /// Function words that can follow the object of an instruction: prepositions,
+    /// conjunctions and adverbs that start a new part of the sentence ("verify your age on this
+    /// device", "confirm your identity using your phone"). A noun after the object instead makes
+    /// it part of a longer name ("your identity provider settings").
+    private static let functionWords: Set<String> = [
+        "about", "above", "after", "again", "and", "as", "at", "because", "before", "below", "but",
+        "by", "first", "for", "from", "here", "if", "in", "inside", "into", "now", "on", "once",
+        "or", "please", "since", "so", "then", "through", "to", "today", "unless", "until",
+        "using", "via", "when", "while", "with", "within", "without",
+    ]
+
+    /// Characters that join two words into one compound word.
+    private static let joiners: Set<Character> = ["-", "\u{2010}", "\u{2011}", "'", "’"]
 
     /// True for "verify" or "confirm", an optional "that", and an object that ends there:
-    /// after it comes the end of the text, a punctuation mark, or a word from `clauseWords`.
-    /// So "verify your agent settings", "confirm your identity provider settings" and "verify
-    /// the cable is not a bottleneck" are not instructions.
+    /// after it comes the end of the text, a punctuation mark, or a word from `functionWords`.
+    /// A hyphen or apostrophe followed by a letter continues the word. So "verify your agent
+    /// settings", "confirm your identity provider settings", "confirm your identity-provider
+    /// settings" and "verify the cable is not a bottleneck" are not instructions.
     private static func isInstruction(_ text: String) -> Bool {
         var rest = Substring(text)
         if rest.hasPrefix("please ") { rest = rest.dropFirst(7) }
@@ -288,7 +300,8 @@ public struct YouTubeExtractor: SiteExtractor {
             guard rest.hasPrefix(object) else { return false }
             let after = rest.dropFirst(object.count)
             guard let next = after.first else { return true }
-            if next == " " { return clauseWords.contains(String(after.dropFirst().prefix(while: \.isLetter))) }
+            if next == " " { return functionWords.contains(String(after.dropFirst().prefix(while: \.isLetter))) }
+            if joiners.contains(next), after.dropFirst().first?.isLetter == true { return false }
             return !next.isLetter && !next.isNumber
         }
     }

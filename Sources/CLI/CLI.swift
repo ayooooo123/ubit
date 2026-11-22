@@ -287,17 +287,7 @@ public enum CLIRunner {
 
             // Probe first in case targetURL is a playlist / channel
             do {
-                let probe = Task { [targetURL, settings, opts] in
-                    try Task.checkCancellation()
-                    return try await engine.extract(url: targetURL, settings: settings, options: opts)
-                }
-                InterruptController.shared.setCancelHandler { probe.cancel() }
-                let initialInfo: MediaInfo
-                do {
-                    defer { InterruptController.shared.setCancelHandler(nil) }
-                    initialInfo = try await probe.value
-                    if probe.isCancelled { throw CancellationError() }
-                }
+                let initialInfo = try await extractCancellable(engine: engine, url: targetURL, settings: settings, options: opts)
                 if !initialInfo.entries.isEmpty && initialInfo.formats.isEmpty {
                     let chosenEntries = filterPlaylistEntries(initialInfo.entries, spec: itemsSpec)
                     var itemOpts = opts
@@ -536,6 +526,20 @@ public enum CLIRunner {
 
     // MARK: - `ubit info` & `ubit formats`
 
+    /// Reads the metadata of `url`. The first SIGINT cancels the request, and then this throws
+    /// `CancellationError`.
+    private static func extractCancellable(engine: DownloadEngine, url: String, settings: Settings, options: DownloadRequestOptions) async throws -> MediaInfo {
+        let probe = Task { [url, settings, options] in
+            try Task.checkCancellation()
+            return try await engine.extract(url: url, settings: settings, options: options)
+        }
+        InterruptController.shared.setCancelHandler { probe.cancel() }
+        defer { InterruptController.shared.setCancelHandler(nil) }
+        let info = try await probe.value
+        if probe.isCancelled { throw CancellationError() }
+        return info
+    }
+
     private static func runInfo(_ args: [String], formatsOnly: Bool) async -> Int32 {
         let jsonMode = args.contains("--json")
         var cookieSrc = Settings.load().cookies
@@ -572,7 +576,7 @@ public enum CLIRunner {
         let engine = DownloadEngine()
 
         do {
-            let info = try await engine.extract(url: url, settings: settings, options: opts)
+            let info = try await extractCancellable(engine: engine, url: url, settings: settings, options: opts)
             if info.isDRM && info.formats.isEmpty {
                 fputs("error: this media is protected by DRM and can't be downloaded\n", stderr)
                 return 1
@@ -619,6 +623,10 @@ public enum CLIRunner {
             }
             return 0
         } catch {
+            if InterruptController.shared.interruptCount > 0 {
+                fputs("Stopped.\n", stderr)
+                return 130
+            }
             fputs("error: \(error.localizedDescription)\n", stderr)
             return 1
         }

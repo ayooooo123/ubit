@@ -205,10 +205,14 @@ final class FixtureProtocol: URLProtocol {
             data = Data(Bytes.clipInit(sampleTicks: mode == "hls-decimal" ? 200 : 1000))
         case ("media.invalid", let path) where path.hasPrefix("/clip-"):
             data = Data(Bytes.clipSegment(Int(path.dropFirst(6).dropLast(4)) ?? 0))
-        case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4", "/cut-unknown.mp4"].contains(path):
-            var bytes = mode == "sidx-fragments" ? Bytes.fragmentIndexedClip : Bytes.indexedClip
+        case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4", "/cut-unknown.mp4", "/cut-later.mp4"].contains(path):
+            var bytes = mode == "sidx-fragments" || path == "/cut-later.mp4" ? Bytes.fragmentIndexedClip : Bytes.indexedClip
             if mode == "sidx-padding" { bytes += Bytes.box("free", Array(repeating: 0, count: 24)) }
-            if path.hasPrefix("/cut-") { bytes.removeLast(13 * Bytes.clipSegment(0).count) }
+            if path == "/cut-later.mp4" {
+                let data = Data(bytes)
+                let indexes = MP4Muxer.listBoxes(in: data, from: 0, to: data.count).filter { $0.type == "sidx" }
+                bytes.removeSubrange(indexes[2].endOffset...)
+            } else if path.hasPrefix("/cut-") { bytes.removeLast(13 * Bytes.clipSegment(0).count) }
             if path != "/cut-200.mp4", let range, let dash = range.firstIndex(of: "-"),
                let start = Int(range.dropFirst(6).prefix(while: { $0 != "-" })),
                let end = Int(range[range.index(after: dash)...]), start < bytes.count {
@@ -838,7 +842,7 @@ struct RegressionChecks {
             let clips: [(Double, Double, [Int], [String])] = hls ? [
                 (8, 9.6, Array(40..<48), ["/clip-9.m4s", "/clip-10.m4s", "/clip-11.m4s"]),
                 (11.999999, 12, [59], ["/clip-14.m4s"])
-            ] : mode == "sidx-fragments" ? [(4, 8, Array(4..<8), []), (2, 6, Array(2..<6), [])]
+            ] : mode == "sidx-fragments" ? [(4, 12, Array(4..<12), []), (2, 6, Array(2..<6), [])]
                                          : [(56, 60, Array(56..<60), [])]
             for (start, end, expected, parts) in clips {
                 let before = FixtureProtocol.requests().count
@@ -859,7 +863,7 @@ struct RegressionChecks {
             options.cookieSource = "none"
             let out = AppPaths.appSupportDir.appendingPathComponent("out")
             options.outputDir = out.path
-            let scenarios: [(String, Double?)] = [("200", 10), ("206", 10), ("206", 61), ("unknown", 61), ("unknown", nil)]
+            let scenarios: [(String, Double?)] = [("200", 10), ("206", 10), ("206", 61), ("unknown", 61), ("unknown", nil), ("later", 12)]
             for (status, end) in scenarios {
                 options.section = SectionRange(start: start, end: end)
                 do {

@@ -229,7 +229,8 @@ public enum MP4Muxer {
                 guard pos + 16 <= limit else { break }
                 let sz64 = data.beU64(pos + 8)
                 hdrLen = 16
-                boxEnd = pos + Int(clamping: sz64)
+                guard sz64 <= UInt64(limit - pos) else { break }
+                boxEnd = pos + Int(sz64)
             } else if sz32 == 0 {
                 boxEnd = limit
             } else {
@@ -247,11 +248,31 @@ public enum MP4Muxer {
     public static func parseSidx(in headerData: Data) -> (initEndOffset: Int64, segments: [SidxSegment])? {
         let boxes = listBoxes(in: headerData, from: 0, to: headerData.count)
         guard let sidx = boxes.first(where: { $0.type == "sidx" }) else { return nil }
+        var segments: [SidxSegment] = []
+        guard endOfReferences(in: headerData, box: sidx, visit: { segments.append($0) }) != nil,
+              !segments.isEmpty else { return nil }
+        return (Int64(sidx.endOffset - 1), segments)
+    }
+
+    /// The complete resource, unlike a range assembled for one clip, must contain every referenced byte.
+    static func checkFullFileIndexes(at url: URL, lastProbedByte: Int64?) throws {
+        let data = try Data(contentsOf: url, options: .alwaysMapped)
+        if let lastProbedByte, lastProbedByte >= Int64(data.count) { throw HTTPError.rangeUnsupported }
+        let boxes = listBoxes(in: data, from: 0, to: data.count)
+        guard boxes.last?.endOffset == data.count else { throw HTTPError.rangeUnsupported }
+        for box in boxes where box.type == "sidx" {
+            guard let end = endOfReferences(in: data, box: box, visit: { _ in }), end <= Int64(data.count)
+            else { throw HTTPError.rangeUnsupported }
+        }
+    }
+
+    private static func endOfReferences(in headerData: Data, box sidx: MP4BoxRef,
+                                        visit: (SidxSegment) -> Void) -> Int64? {
         let p = sidx.payloadOffset
         guard p + 12 <= sidx.endOffset else { return nil }
         let version = headerData[headerData.startIndex + p]
         let timescale = headerData.beU32(p + 8)
-        guard timescale > 0 else { return nil }
+        guard version <= 1, timescale > 0 else { return nil }
 
         var off = p + 12
         let earliestPTS: UInt64
@@ -271,9 +292,9 @@ public enum MP4Muxer {
         let refCount = Int(headerData.beU16(off + 2))
         off += 4
 
+        guard firstOffset <= UInt64(Int64.max) - UInt64(sidx.endOffset) else { return nil }
         var curByte = Int64(sidx.endOffset) + Int64(firstOffset)
         var curTicks = earliestPTS
-        var segs: [SidxSegment] = []
 
         for _ in 0..<refCount {
             guard off + 12 <= sidx.endOffset else { return nil }
@@ -282,9 +303,10 @@ public enum MP4Muxer {
             let subsegDur = UInt64(headerData.beU32(off + 4))
             off += 12
             if refSize > 0 {
+                guard refSize <= Int64.max - curByte, subsegDur <= UInt64.max - curTicks else { return nil }
                 let startSec = Double(curTicks) / Double(timescale)
                 curTicks += subsegDur
-                segs.append(SidxSegment(
+                visit(SidxSegment(
                     byteRange: ByteRange(start: curByte, end: curByte + refSize - 1),
                     startTimeSec: startSec,
                     endTimeSec: Double(curTicks) / Double(timescale)
@@ -292,8 +314,7 @@ public enum MP4Muxer {
                 curByte += refSize
             }
         }
-        guard !segs.isEmpty else { return nil }
-        return (Int64(sidx.endOffset - 1), segs)
+        return curByte
     }
 
     /// Reads all video and audio tracks from either a standard MP4/M4A or a fragmented fMP4 file.

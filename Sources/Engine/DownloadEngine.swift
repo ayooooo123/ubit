@@ -384,7 +384,8 @@ public final class DownloadEngine: @unchecked Sendable {
             case .http:
                 do {
                     var lastIndexedByte: Int64?
-                    if let sec = options.section, fmt.ext == "mp4" || fmt.ext == "m4a" {
+                    let isMP4Section = options.section != nil && (fmt.ext == "mp4" || fmt.ext == "m4a")
+                    if isMP4Section, let sec = options.section {
                         switch try await tryDownloadSectionViaSidx(client: client, fmt: fmt, headers: mergedHeaders, section: sec, destination: dest) {
                         case .downloaded(let start): return (start, false)
                         case .wholeFile(let last): lastIndexedByte = last
@@ -407,11 +408,12 @@ public final class DownloadEngine: @unchecked Sendable {
                             }
                         }
                     }
-                    if let lastIndexedByte {
-                        let attrs = try FileManager.default.attributesOfItem(atPath: dest.path)
-                        guard let size = attrs[.size] as? NSNumber, size.int64Value > lastIndexedByte else {
-                            try FileManager.default.removeItem(at: dest)
-                            throw HTTPError.rangeUnsupported
+                    if isMP4Section {
+                        do {
+                            try MP4Muxer.checkFullFileIndexes(at: dest, lastProbedByte: lastIndexedByte)
+                        } catch {
+                            try? FileManager.default.removeItem(at: dest)
+                            throw error
                         }
                     }
                     return (0, false)

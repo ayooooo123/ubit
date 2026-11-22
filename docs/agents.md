@@ -38,6 +38,8 @@ VIDEO_PATH="$(ubit get -q 720 --no-library --quiet -o /tmp/work 'https://www.you
 
 For indexed MP4/M4A input, `ubit` requests the start of the file through the index (at least 32 KiB, or 64 KiB if the position is unknown). It takes the initialization data from that response and requests the overlapping media bytes. If a section extends beyond the index, `ubit` checks whether further media can follow. When the references reach the known file end or leave only a single recognized random-access or padding box, it needs no further media bytes to reject a section outside the stream. Otherwise it can fetch the whole file, for example to trim a later fragment. The downloaded file must contain the bytes that the index references, even when the first response did not give the total file size. Without a usable index, for DASH, or after a YouTube UMP fallback, the transfer can also include the whole stream. If the server ignores byte ranges, it can send the whole file for each request.
 
+When `ubit` downloads a whole MP4 or M4A over HTTP to trim a section, it checks each top-level segment index against the file length. If a later index refers to missing bytes, the command fails instead of saving a partial clip.
+
 For HLS, at least one segment must contain media inside the requested interval. A section that starts at or beyond the end of the playlist fails without fetching a media segment. At an exact segment boundary, `ubit` also keeps the previous segment, if present, for keyframe preroll. WebM and raw MP3, Opus, FLAC or WAV do not go through the MP4 trimmer: `ubit` saves the whole file over plain HTTP, or the selected segments over HLS.
 
 ```sh

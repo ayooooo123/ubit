@@ -878,6 +878,15 @@ public enum MP4Muxer {
 
     // MARK: - Keyframe Trimming & SponsorBlock Excising
 
+    /// One clock for sequential trims of separately fetched picture and sound. Store the
+    /// video start as a ratio until it is converted to the audio track's ticks.
+    public final class SectionClock {
+        fileprivate var start: (ticks: Decimal, scale: Decimal)?
+        var fetchStart: Double? {
+            start.map { max(0, NSDecimalNumber(decimal: $0.ticks / $0.scale).doubleValue.nextDown) }
+        }
+    }
+
     /// Cuts `tracks` to a section, choosing pictures by presentation time and keeping
     /// the decode-order prefix that the surviving pictures need. A later reference
     /// picture that stays only for decoding is hidden with an edit list.
@@ -889,7 +898,8 @@ public enum MP4Muxer {
         _ tracks: [MP4Track],
         section: SectionRange,
         baseStartTimeSec: Double = 0,
-        baseStart: SectionTimeBase? = nil
+        baseStart: SectionTimeBase? = nil,
+        clock: SectionClock? = nil
     ) -> [MP4Track] {
         // Section and playlist times are decimal seconds. Compare them as decimals
         // with sample ticks so that, for example, 8.0 - 7.2 does not select the
@@ -938,10 +948,22 @@ public enum MP4Muxer {
             if lastEnd > start { syncStart = (chosen ?? 0, video.timescale) }
         }
 
+        let baseScale = Decimal(baseStart?.timescale ?? 1)
+        let baseTicks = baseStart.map { Decimal($0.ticks) } ?? (legacyBase ?? 0)
+        if let clock, let syncStart {
+            clock.start = (baseTicks * Decimal(syncStart.scale) + Decimal(syncStart.ticks) * baseScale,
+                           baseScale * Decimal(syncStart.scale))
+        }
         return tracks.compactMap { track in
             let start: Int64
             if let syncStart {
                 var ticks = Decimal(syncStart.ticks) * Decimal(track.timescale) / Decimal(syncStart.scale)
+                var rounded = Decimal()
+                NSDecimalRound(&rounded, &ticks, 0, .down)
+                start = NSDecimalNumber(decimal: rounded).int64Value
+            } else if let startAt = clock?.start {
+                var ticks = ((startAt.ticks * baseScale - baseTicks * startAt.scale) * Decimal(track.timescale))
+                    / (startAt.scale * baseScale)
                 var rounded = Decimal()
                 NSDecimalRound(&rounded, &ticks, 0, .down)
                 start = NSDecimalNumber(decimal: rounded).int64Value

@@ -307,6 +307,13 @@ public enum HLSEngine {
         case tagged(HTTPClient.Edition)
         case snapshot(Data)
 
+        func observe(in renditions: RenditionEditions, key: String) async throws {
+            switch self {
+            case .tagged(let edition): try await renditions.observe(key, edition: edition)
+            case .snapshot(let data): try await renditions.observe(key, digest: SHA256.hash(data: data))
+            }
+        }
+
         static func open(_ url: String, client: HTTPClient, headers: [String: String]?) async throws -> Self {
             if let edition = try await client.probeRemote(url: url, headers: headers).edition { return .tagged(edition) }
             return .snapshot(try await snapshotOf(url, client: client, headers: headers))
@@ -323,7 +330,25 @@ public enum HLSEngine {
         }
     }
 
-    private static func fetchPart(_ url: String, range: ByteRange?, client: HTTPClient, headers: [String: String]?, source: RangeSource? = nil) async throws -> Data {
+    /// Evidence shared by all HLS renditions of one output, never by independent downloads.
+    /// Keep validators and hashes, not the media bodies of a completed rendition.
+    public actor RenditionEditions {
+        private var seen: [String: (HTTPClient.Edition?, SHA256.Digest?)] = [:]
+
+        fileprivate func observe(_ key: String, edition: HTTPClient.Edition? = nil, digest: SHA256.Digest? = nil) throws {
+            if let (original, hash) = seen[key] {
+                if let hash, let digest {
+                    guard hash == digest else { throw HTTPError.rangeUnsupported }
+                } else {
+                    guard let original, original == edition else { throw HTTPError.rangeUnsupported }
+                }
+            } else {
+                seen[key] = (edition, digest)
+            }
+        }
+    }
+
+    private static func fetchPart(_ url: String, range: ByteRange?, client: HTTPClient, headers: [String: String]?, source: RangeSource? = nil, renditions: RenditionEditions? = nil) async throws -> Data {
         var edition: HTTPClient.Edition?
         switch source {
         case .snapshot(let data):
@@ -342,6 +367,9 @@ public enum HLSEngine {
         if let edition { fields["If-Match"] = edition.tag }
         let (data, response) = try await client.fetchData(url: edition?.location ?? url, headers: fields)
         if let edition, HTTPClient.edition(response) != edition { throw HTTPError.rangeUnsupported }
+        if source == nil, let renditions {
+            try await renditions.observe(resourceKey(url), edition: HTTPClient.edition(response), digest: SHA256.hash(data: data))
+        }
         return data
     }
 
@@ -410,6 +438,7 @@ public enum HLSEngine {
         headers: [String: String]? = nil,
         section: SectionRange? = nil,
         connections: Int = 8,
+        renditions: RenditionEditions? = nil,
         shouldStopLive: (@Sendable () -> Bool)? = nil,
         onProgress: (@Sendable (_ downloaded: Int64, _ estTotal: Int64, _ fraction: Double, _ recordedSec: Double) -> Void)? = nil
     ) async throws -> (isFMP4: Bool, duration: Double, startTime: Double) {
@@ -423,6 +452,7 @@ public enum HLSEngine {
                 initialPlaylist: pl,
                 destination: destination,
                 headers: headers,
+                renditions: renditions,
                 shouldStop: shouldStopLive,
                 onProgress: onProgress
             )
@@ -503,20 +533,27 @@ public enum HLSEngine {
         }
         if let url = pl.initURL { note(url, ranged: pl.initByteRange != nil) }
         for seg in selected { note(seg.url, ranged: seg.byteRange != nil) }
-        var shared = repeated.intersection(ranged)
-        let wholeReads = WholeReads(repeated.subtracting(shared))
+        // A range used only once here may occur again in the other rendition.
+        var shared = renditions == nil ? repeated.intersection(ranged) : ranged
+        let wholeReads = WholeReads(renditions == nil ? repeated.subtracting(shared) : [])
         var sources: [String: RangeSource] = [:]
         // One spelling keeps a strong ETag or a complete copy. Several spellings each give a
         // complete copy, and all copies must be the same bytes.
         func pin(_ key: String) async throws {
             let urls = spellings[key] ?? []
-            if urls.count == 1 { sources[urls[0]] = try await RangeSource.open(urls[0], client: client, headers: headers); return }
+            if urls.count == 1 {
+                let source = try await RangeSource.open(urls[0], client: client, headers: headers)
+                if let renditions { try await source.observe(in: renditions, key: key) }
+                sources[urls[0]] = source
+                return
+            }
             var first: SHA256.Digest?
             for url in urls {
                 let copy = try await RangeSource.snapshotOf(url, client: client, headers: headers)
                 let digest = SHA256.hash(data: copy)
                 if let first, digest != first { throw HTTPError.rangeUnsupported }
                 first = digest
+                try await renditions?.observe(key, digest: digest)
                 sources[url] = .snapshot(copy)
             }
         }
@@ -524,7 +561,7 @@ public enum HLSEngine {
         if let initU = pl.initURL {
             let key = resourceKey(initU)
             if shared.remove(key) != nil { try await pin(key) }
-            let data = try await fetchPart(initU, range: pl.initByteRange, client: client, headers: headers, source: sources[initU])
+            let data = try await fetchPart(initU, range: pl.initByteRange, client: client, headers: headers, source: sources[initU], renditions: renditions)
             try await wholeReads.check(key, data)
             initData = data
         }
@@ -581,7 +618,7 @@ public enum HLSEngine {
                         let seg = selected[pos]
                         let segFile = segWorkDir.appendingPathComponent(String(format: "%06d.seg", pos))
                         let resource = resourceKey(seg.url)
-                        var raw = try await fetchPart(seg.url, range: seg.byteRange, client: client, headers: headers, source: pinned[seg.url])
+                        var raw = try await fetchPart(seg.url, range: seg.byteRange, client: client, headers: headers, source: pinned[seg.url], renditions: renditions)
                         try await wholeReads.check(resource, raw)
                         if let kurl = seg.keyURL {
                             try Task.checkCancellation()
@@ -633,6 +670,7 @@ public enum HLSEngine {
         initialPlaylist: HLSVals.MediaPlaylist,
         destination: URL,
         headers: [String: String]?,
+        renditions: RenditionEditions?,
         shouldStop: (@Sendable () -> Bool)?,
         onProgress: (@Sendable (Int64, Int64, Double, Double) -> Void)?
     ) async throws -> (isFMP4: Bool, duration: Double) {
@@ -711,10 +749,15 @@ public enum HLSEngine {
             } else if liveSources[key] == nil {
                 guard range != nil else {
                     let (data, response) = try await client.fetchData(url: url, headers: headers)
-                    if let edition = HTTPClient.edition(response) { liveSources[key] = .tagged(edition) } else { digests[key] = SHA256.hash(data: data) }
+                    let edition = HTTPClient.edition(response)
+                    let digest = edition == nil || renditions != nil ? SHA256.hash(data: data) : nil
+                    try await renditions?.observe(key, edition: edition, digest: digest)
+                    if let edition { liveSources[key] = .tagged(edition) } else { digests[key] = digest }
                     return data
                 }
-                keep(key, try await RangeSource.open(url, client: client, headers: headers))
+                let source = try await RangeSource.open(url, client: client, headers: headers)
+                if let renditions { try await source.observe(in: renditions, key: key) }
+                keep(key, source)
             }
             let part = try await fetchPart(url, range: range, client: client, headers: headers, source: liveSources[key])
             // A copy that alone exceeds the budget is not kept after it has served its range.

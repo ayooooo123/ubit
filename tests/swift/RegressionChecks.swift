@@ -196,6 +196,33 @@ final class FixtureProtocol: URLProtocol {
                 headers["Content-Range"] = "bytes \(bounds[0])-\(bounds[1])/\(body.count)"
                 data = body.subdata(in: bounds[0]..<(bounds[1] + 1))
             } else { data = body }
+        case ("media.invalid", "/paired.m3u8"):
+            data = Data("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"main\",DEFAULT=YES,URI=\"sound.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=700000,RESOLUTION=128x96,CODECS=\"avc1.42c00a,mp4a.40.2\",AUDIO=\"a\"\npicture.m3u8\n".utf8)
+        case ("media.invalid", "/picture.m3u8"), ("media.invalid", "/sound.m3u8"):
+            let picture = url.path == "/picture.m3u8"
+            let first = Bytes.renditionFragment([0, 1, 2, 3], video: true).count
+            let unit = Bytes.renditionFragment([40], video: false).count
+            var list = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"\(picture ? "picture" : "sound").mp4\"\n"
+            for i in 0..<(picture ? 1 : 4) {
+                list += "#EXTINF:\(picture ? 4 : 1),\n#EXT-X-BYTERANGE:\(picture ? first : unit)@\(picture ? 0 : first + unit*i)\npaired.pack\n"
+            }
+            data = Data((list + "#EXT-X-ENDLIST\n").utf8)
+        case ("media.invalid", "/picture.mp4"), ("media.invalid", "/sound.mp4"):
+            data = Data(Bytes.clipInit(sampleTicks: 1000, video: url.path == "/picture.mp4"))
+        case ("media.invalid", "/paired.pack"):
+            let changed = mode.contains("changed") && Self.lock.withLock { Self.seen.contains { $0.url.path == "/sound.m3u8" } }
+            let base: UInt8 = changed || mode.hasSuffix("-b") ? 100 : 0
+            let body = Bytes.renditionFragment((0..<4).map { base + $0 }, video: true)
+                + (40..<44).flatMap { Bytes.renditionFragment([base + $0], video: false) }
+            if mode.contains("tagged") { headers["ETag"] = "\"\(base)\"" }
+            if let range {
+                let bounds = range.dropFirst(6).split(separator: "-").compactMap { Int($0) }
+                guard bounds.count == 2, bounds[0] < body.count else { status = 416; break }
+                let last = min(bounds[1], body.count - 1)
+                headers["Content-Range"] = "bytes \(bounds[0])-\(last)/\(body.count)"
+                status = 206
+                data = Data(body[bounds[0]...last])
+            } else { data = Data(body) }
         case ("media.invalid", "/editions.m3u8"):
             data = Data("#EXTM3U\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@0\npack.ts\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST\n".utf8)
         case ("media.invalid", "/repeat.m3u8"):
@@ -315,7 +342,7 @@ final class FixtureProtocol: URLProtocol {
                 case "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age", "watch-blocked-notice", "watch-header-age",
                      "watch-verify-human", "watch-open-details", "watch-details-summary", "watch-confirm-identity",
                      "watch-identity-phone", "watch-age-device", "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online",
-                     "watch-identity-right-now", "watch-age-upon", "watch-age-footnote", "watch-purpose-clause":
+                     "watch-identity-right-now", "watch-age-upon", "watch-age-footnote", "watch-purpose-clause", "watch-second-sentence", "watch-blocked-statement":
                     player = Self.playerPayload(status: "OK", streaming: Self.directStreaming(1, hls: true), title: title)
                 case "hls-fallback-watchlist":
                     player = Self.hlsOnlyPlayer(title: title)
@@ -341,7 +368,7 @@ final class FixtureProtocol: URLProtocol {
                      "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
                      "watch-details-summary", "watch-confirm-identity", "watch-identity-phone", "watch-age-device",
                      "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online", "watch-identity-right-now",
-                     "watch-age-upon", "watch-age-footnote", "watch-purpose-clause":
+                     "watch-age-upon", "watch-age-footnote", "watch-purpose-clause", "watch-second-sentence", "watch-blocked-statement":
                     data = Self.wallPage(player: player, mode: mode)
                 case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson",
                      "watch-agent-settings", "watch-ordinary-objects":
@@ -620,6 +647,8 @@ final class FixtureProtocol: URLProtocol {
         case "watch-age-upon": html += "<main role=\"alert\"><p>Please verify your age upon signing in to watch this video.</p></main>"
         case "watch-age-footnote": html += "<main role=\"alert\"><p>Verify your age<sup>1</sup> to continue watching.</p></main>"
         case "watch-purpose-clause": html += "<main role=\"alert\"><p>To continue watching, please verify your age.</p></main>"
+        case "watch-second-sentence": html += "<main role=\"alert\">Playback unavailable. Please verify your age to continue watching.</main>"
+        case "watch-blocked-statement": html += "<main role=\"alert\">Playback is blocked.</main>"
         default: html += "<main>Verify your identity before playback can continue. Playback is blocked.</main>"
         }
         if let player {
@@ -774,9 +803,9 @@ enum Bytes {
     static func box(_ type: String, _ payload: [UInt8]) -> [UInt8] { be32(UInt32(8 + payload.count)) + Array(type.utf8) + payload }
 
     /// The track uses 1000 ticks per second and one byte per sample.
-    static func clipInit(sampleTicks: UInt32, timescale: UInt32 = 1000) -> [UInt8] {
+    static func clipInit(sampleTicks: UInt32, timescale: UInt32 = 1000, video: Bool = false) -> [UInt8] {
         let mdhd = box("mdhd", be32(0) + be32(0) + be32(0) + be32(timescale) + be32(0) + be32(0))
-        let hdlr = box("hdlr", be32(0) + be32(0) + Array("soun".utf8) + [UInt8](repeating: 0, count: 13))
+        let hdlr = box("hdlr", be32(0) + be32(0) + Array((video ? "vide" : "soun").utf8) + [UInt8](repeating: 0, count: 13))
         let stbl = box("stbl", box("stsd", be32(0) + be32(0)))
         let trak = box("trak", box("mdia", mdhd + hdlr + box("minf", stbl)))
         let trex = box("trex", be32(0) + be32(1) + be32(1) + be32(sampleTicks) + be32(1) + be32(0))
@@ -790,6 +819,14 @@ enum Bytes {
         let tfdt = box("tfdt", be32(0) + be32(UInt32(n * 4000)))
         let trun = box("trun", be32(0x000001) + be32(4) + be32(76))
         return box("moof", box("traf", tfhd + tfdt + trun)) + box("mdat", (0..<4).map { UInt8(sampleBase + 4 * n + $0) })
+    }
+
+    // The first picture is a keyframe. Each payload byte identifies the source second and edition.
+    static func renditionFragment(_ bytes: [UInt8], video: Bool) -> [UInt8] {
+        let tfhd = box("tfhd", be32(0x020000) + be32(1))
+        let entries = bytes.indices.flatMap { be32(video && $0 != 0 ? 0x10000 : 0) }
+        let trun = box("trun", be32(0x401) + be32(UInt32(bytes.count)) + be32(UInt32(60 + entries.count)) + entries)
+        return box("moof", box("traf", tfhd + trun)) + box("mdat", bytes)
     }
 
     static let indexedClip: [UInt8] = makeIndexedClip(timescale: 1000, sampleBase: 0)
@@ -1009,7 +1046,7 @@ struct RegressionChecks {
              "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
              "watch-details-summary", "watch-confirm-identity", "watch-identity-phone", "watch-age-device",
              "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online", "watch-identity-right-now",
-             "watch-age-upon", "watch-age-footnote", "watch-purpose-clause":
+             "watch-age-upon", "watch-age-footnote", "watch-purpose-clause", "watch-second-sentence", "watch-blocked-statement":
             let before = FixtureProtocol.requests().count
             let error = await extractError()
             let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
@@ -1540,6 +1577,32 @@ struct RegressionChecks {
             let fetched = FixtureProtocol.requests().map(\.url.path).filter { $0.hasPrefix("/seg-") }.sorted()
             check(result.startTime == 16 && fetched == ["/seg-4.ts", "/seg-5.ts", "/seg-6.ts"],
                   "the 20–26 s clip fetches two overlapping segments and one for preroll; startTime=\(result.startTime), segments=\(fetched)")
+        case "paired-plain-a", "paired-plain-b", "paired-tagged-a", "paired-tagged-b", "paired-plain-changed", "paired-tagged-changed", "paired-clock":
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.connections = 1
+            options.cookieSource = "none"
+            let out = AppPaths.appSupportDir.appendingPathComponent("out")
+            options.outputDir = out.path
+            let cut = mode == "paired-clock"
+            if cut { options.section = SectionRange(start: 1, end: 3) }
+            do {
+                let file = try await DownloadEngine().downloadSingle(url: "https://media.invalid/paired.m3u8", settings: settings, options: options)
+                let tracks = try MP4Muxer.readTracks(from: file)
+                let media = try Data(contentsOf: file)
+                func bytes(_ kind: MP4TrackKind) -> [UInt8] {
+                    tracks.first { $0.kind == kind }?.samples.map { media[Int($0.offset)] } ?? []
+                }
+                let first: UInt8 = mode.hasSuffix("-b") ? 100 : 0
+                let picture = (0..<(cut ? 3 : 4)).map { first + UInt8($0) }
+                check(bytes(.video) == picture && bytes(.audio) == picture.map { $0 + 40 },
+                      "picture and audio sample identifiers on the movie clock: video=\(bytes(.video)), audio=\(bytes(.audio))")
+            } catch HTTPError.rangeUnsupported where mode.contains("changed") {
+                let files = try FileManager.default.contentsOfDirectory(atPath: out.path)
+                check(files.isEmpty, "a changed cross-rendition edition leaves no output: \(files)")
+            }
         case "hls-section-clip":
             // The whole engine (playlist, segments, demux, trim, mux) must save the samples of
             // stream seconds 20 to 25. Each sample is one byte: its second.

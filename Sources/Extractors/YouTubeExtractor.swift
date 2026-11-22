@@ -296,8 +296,8 @@ public struct YouTubeExtractor: SiteExtractor {
     /// continues the word. So "verify your agent settings", "confirm your identity provider
     /// settings", "confirm your identity-provider settings" and "verify the cable is not a
     /// bottleneck" are not instructions.
-    private static func isInstruction(_ text: String) -> Bool {
-        var rest = Substring(text)
+    private static func isInstruction(_ sentence: Substring) -> Bool {
+        var rest = sentence
         // A purpose clause can precede the imperative: “To continue watching, please verify …”.
         if rest.hasPrefix("to "), let comma = rest.firstIndex(of: ",") {
             rest = rest[rest.index(after: comma)...].drop(while: \.isWhitespace)
@@ -324,7 +324,17 @@ public struct YouTubeExtractor: SiteExtractor {
     /// Text that a reader sees as a verification instruction, read from one visible block.
     /// Prose that only explains verification is not a notice.
     private static func isNotice(_ text: String) -> Bool {
-        isInstruction(text)
+        // Check sentence starts, not arbitrary substrings such as “explains how to verify”.
+        var start = text.startIndex
+        for i in text.indices where ".!?".contains(text[i]) {
+            let next = text.index(after: i)
+            guard next == text.endIndex || text[next].isWhitespace else { continue }
+            let sentence = text[start..<i].drop(while: \.isWhitespace)
+            if sentence == "playback is blocked" || isInstruction(sentence) { return true }
+            start = next
+        }
+        let last = text[start...].drop(while: \.isWhitespace)
+        return last == "playback is blocked" || isInstruction(last)
             || (text.contains("playback is blocked") && text.contains("verif"))
             || (text.contains("sign in to confirm") && (text.contains("not a bot") || text.contains("your age")))
             || text.contains("detected unusual traffic")

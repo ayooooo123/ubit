@@ -353,10 +353,14 @@ public enum HLSEngine {
                 if filtered.isEmpty { firstStart = segStart }
                 filtered.append(seg)
             }
-            if !filtered.isEmpty {
-                selected = filtered
-                startTime = firstStart
+            // A section that no segment overlaps (for example one after the end) is an error: the
+            // whole playlist must not be saved as if it were the clip.
+            guard !filtered.isEmpty else {
+                throw NSError(domain: "HLSEngine", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                    "The --section range is outside the stream (\(Int(acc.rounded())) s long)"])
             }
+            selected = filtered
+            startTime = firstStart
         }
 
         let segWorkDir = destination.deletingLastPathComponent().appendingPathComponent(".\(destination.lastPathComponent).segs", isDirectory: true)

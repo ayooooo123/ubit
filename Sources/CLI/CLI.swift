@@ -213,7 +213,7 @@ public enum CLIRunner {
             case "--proxy":
                 guard let v = nextVal(a) else { return 2 }
                 guard HTTPClient.isValidProxy(v) else {
-                    fputs("ubit get: invalid --proxy value \(v): use http://host:port or socks5://host:port\n", stderr)
+                    fputs("ubit get: invalid --proxy value: use http://host:port or socks5://host:port\n", stderr)
                     return 2
                 }
                 opts.proxy = v
@@ -544,7 +544,7 @@ public enum CLIRunner {
             return 2
         }
         if let proxy, !HTTPClient.isValidProxy(proxy) {
-            fputs("error: invalid --proxy value \(proxy): use http://host:port or socks5://host:port\n", stderr)
+            fputs("error: invalid --proxy value: use http://host:port or socks5://host:port\n", stderr)
             return 2
         }
 
@@ -753,7 +753,7 @@ public enum CLIRunner {
         let key = positional[0]
         let val = positional.dropFirst().joined(separator: " ")
         guard settings.setByKey(key, value: val) else {
-            fputs("error: invalid setting or value '\(key) = \(val)'\n", stderr)
+            fputs("error: invalid setting or value for '\(key)'\n", stderr)
             return 2
         }
         do {
@@ -847,7 +847,7 @@ public enum CLIRunner {
           -i, --input FILE              Read URLs one per line (- reads stdin)
               --playlist / --no-playlist
               --items 1,3,5-7           Select specific playlist items
-              --section 1:00-2:30       Keyframe-accurate clip trim (MP4, M4A, HLS, DASH)
+              --section 1:00-2:30       Clip on keyframes (MP4/M4A output; raw audio, WebM untrimmed)
               --sponsors-remove CATS    Excise SponsorBlock segments (default, all, or list)
               --sponsors-mark CATS      Mark SponsorBlock segments as MP4 chapters
               --keep-sponsors           Keep sponsors regardless of settings
@@ -897,7 +897,7 @@ public enum CLIRunner {
           - `{"event":"stopped","url":"..."}`
         - `--quiet` — Suppress progress bars; print ONLY saved absolute file paths to stdout (ideal for command substitution `FILE=$(ubit get --quiet ...)`).
         - `--no-library` — Ephemeral run; do not append agent scratch downloads to the user's GUI library.
-        - `--section START-END` — Keyframe-accurate clip trim (e.g. `0:30-1:15` or `90-135`) for output that goes through the MP4 muxer (MP4 or M4A output from a progressive, HLS or DASH stream). A WebM stream or a raw MP3, Opus, FLAC or WAV audio stream is not trimmed: over plain HTTP it is saved whole, and over HLS the segments that overlap the section are saved as they are. For an MP4/M4A stream with a `sidx` index and a server that accepts byte ranges, uBit fetches only the `init` box and the overlapping bytes (for example ~2–4 MB for a 15s clip of a 2h video); HLS fetches only the overlapping segments. Otherwise (no `sidx` index, DASH, or the YouTube UMP fallback when byte ranges are refused during the download) the whole stream is downloaded and then trimmed, so a short clip does not guarantee a small transfer. During YouTube extraction, uBit tests byte ranges on one format of each client profile that it tries and keeps the first profile whose test passes; the other formats of that profile are not tested. If YouTube refuses byte ranges from the first request, no direct format is kept. uBit then uses YouTube's HLS playlist when a profile named one and the watch page gave player data; otherwise extraction fails without UMP.
+        - `--section START-END` — Keyframe-accurate clip trim (e.g. `0:30-1:15` or `90-135`) for output that goes through the MP4 muxer (MP4 or M4A output from a progressive, HLS or DASH stream). A WebM stream or a raw MP3, Opus, FLAC or WAV audio stream is not trimmed: over plain HTTP it is saved whole, and over HLS the segments that overlap the section are saved as they are. Over HLS, a section that no segment overlaps is an error. For an MP4/M4A stream with a `sidx` index and a server that accepts byte ranges, uBit first requests the start of the file to read the index (64 KB when the index position is not known), and then fetches only the `init` box and the overlapping bytes (for example ~2–4 MB for a 15s clip of a 2h video); HLS fetches only the overlapping segments. A server that ignores byte ranges sends the whole file for each request, and uBit keeps only the requested bytes. Otherwise (no `sidx` index, DASH, or the YouTube UMP fallback when byte ranges are refused during the download) the whole stream is downloaded and then trimmed, so a short clip does not guarantee a small transfer. During YouTube extraction, uBit tests byte ranges on one format of each client profile that it tries and keeps the first profile whose test passes; the other formats of that profile are not tested. If the test fails for every profile that uBit tries, no direct format is kept, and uBit tries YouTube's HLS playlist. This needs two things: player data, from the watch page or from a profile that named a playlist and gave no direct format; and a playlist that uBit can read, named by any profile or by the watch page. If either is missing, extraction fails without UMP.
         - `-a --to wav` — Extract 16-bit 44.1 kHz stereo PCM `.wav` natively via macOS AudioToolbox (zero FFmpeg) for ASR/transcription pipelines.
         - `-q <best|2160|1440|1080|720|480|360>` / `-f <vid+aid>` — Bound resolution or select exact stream IDs.
         - `--subs --sub-langs en --sub-files` — Download WebVTT `.vtt` subtitle sidecar files alongside media.

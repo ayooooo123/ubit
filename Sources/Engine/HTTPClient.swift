@@ -338,11 +338,25 @@ public final class HTTPClient: @unchecked Sendable {
         return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
     }
 
+    /// Returns the bytes `range.start...range.end` (fewer at the end of the file). A server that
+    /// ignores `Range` answers 200 with the whole file; the requested bytes are then cut out of it,
+    /// so a caller never takes the start of the file for the requested bytes. A 206 answer whose
+    /// `Content-Range` starts at another offset is refused.
     public func fetchRangeBytes(url: String, range: ByteRange, headers: [String: String]? = nil) async throws -> Data {
         var hdrs = headers ?? [:]
         hdrs["Range"] = "bytes=\(range.start)-\(range.end)"
-        let (data, _) = try await fetchData(url: url, headers: hdrs)
-        return data
+        let (data, http) = try await fetchData(url: url, headers: hdrs)
+        if http.statusCode == 206 {
+            if let cr = http.value(forHTTPHeaderField: "Content-Range"),
+               let first = cr.split(separator: " ").last?.split(separator: "-").first,
+               let start = Int64(first), start != range.start {
+                throw HTTPError.rangeUnsupported
+            }
+            return data
+        }
+        guard Int64(data.count) > range.start else { throw HTTPError.rangeUnsupported }
+        let end = min(Int64(data.count), range.end + 1)
+        return data.subdata(in: Int(range.start)..<Int(end))
     }
 
     /// Probes total file size and range support using a tiny `Range: bytes=0-0` request.

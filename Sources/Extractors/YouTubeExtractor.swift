@@ -151,6 +151,7 @@ public struct YouTubeExtractor: SiteExtractor {
         private var visitorData: String?
         private var cache: [CacheKey: (info: MediaInfo, exp: Date)] = [:]
         private var nextPlayerSlot: TimeInterval = 0
+        private var lastPlayerSend: TimeInterval = -.infinity
         private var fileURL: URL { AppPaths.appSupportDir.appendingPathComponent("yt_visitor.txt") }
 
         func visitor() -> String? {
@@ -188,20 +189,27 @@ public struct YouTubeExtractor: SiteExtractor {
 
         /// Waits until this caller may send one /player request. Slots are reserved 3 s apart
         /// before the actor suspends, so concurrent callers queue behind each other instead of
-        /// waking together. A late wake-up can make one gap between actual sends shorter, but
-        /// the slots, and so the average rate, stay 3 s apart. Cancellation ends the wait with
-        /// `CancellationError` and frees the slot when no later caller has queued behind it.
+        /// waking together. A caller that wakes late (a suspended process, a busy thread pool)
+        /// sleeps again while the last actual send is less than 3 s ago, so callers that wake
+        /// together still go one by one. Cancellation ends the wait with `CancellationError` and
+        /// frees the slot when no later caller has queued behind it.
         func pace() async throws {
             let now = ProcessInfo.processInfo.systemUptime
             let slot = max(now, nextPlayerSlot)
             nextPlayerSlot = slot + Self.playerGap
-            guard slot > now else { return }
+            var wait = max(slot, lastPlayerSend + Self.playerGap) - now
             do {
-                try await Task.sleep(nanoseconds: UInt64((slot - now) * 1_000_000_000))
+                while wait > 0 {
+                    try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
+                    wait = lastPlayerSend + Self.playerGap - ProcessInfo.processInfo.systemUptime
+                }
             } catch {
                 if nextPlayerSlot == slot + Self.playerGap { nextPlayerSlot = slot }
                 throw error
             }
+            // No suspension point since the last check, so no other caller can send in between.
+            lastPlayerSend = ProcessInfo.processInfo.systemUptime
+            nextPlayerSlot = max(nextPlayerSlot, lastPlayerSend + Self.playerGap)
         }
     }
 
@@ -219,13 +227,13 @@ public struct YouTubeExtractor: SiteExtractor {
         return SHA256.hash(data: Data(context.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// The SAPISID value for SAPISIDHASH sign-in: a nonempty `SAPISID` (or `__Secure-3PAPISID`)
-    /// cookie that a /player request would actually send, so neither expired nor out of scope.
+    /// The SAPISID value for SAPISIDHASH sign-in: the `SAPISID` (or else `__Secure-3PAPISID`)
+    /// cookie that a /player request actually sends (in scope, not expired, and not shadowed by a
+    /// cookie of the same name with a longer path), when its value is nonempty.
     /// The bot-wall decision and the Authorization header both use this one test.
     static func signInCookie(in cookies: CookieVault) -> String? {
-        let url = URL(string: playerURL)!
-        let usable = cookies.all().filter { $0.matches(url: url) && !$0.value.isEmpty }
-        return (usable.first { $0.name == "SAPISID" } ?? usable.first { $0.name == "__Secure-3PAPISID" })?.value
+        let sent = cookies.effectiveCookies(for: URL(string: playerURL)!).filter { !$0.value.isEmpty }
+        return (sent.first { $0.name == "SAPISID" } ?? sent.first { $0.name == "__Secure-3PAPISID" })?.value
     }
 
     /// Drops the cached metadata of the video at `url`. Pass the extracted `webpageURL`, not the

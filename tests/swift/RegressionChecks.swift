@@ -41,8 +41,13 @@ final class FixtureProtocol: URLProtocol {
     static let firstVisitor = "CgtFixtureVisitorFirst00000000000000"
     static let secondVisitor = "CgtFixtureVisitorSecond0000000000000"
     static let mediaBytes = Data("fixture-media-payload-for-the-http-path".utf8)
-    /// Modes in which every /player response names an HLS playlist and every range test fails.
-    static let hlsFallbackModes: Set<String> = ["hls-fallback", "hls-fallback-nowatch"]
+    /// Modes in which every range test fails and extraction must decide on the HLS fallback.
+    /// hls-fallback: every /player response names a playlist, and the watch page has player data.
+    /// hls-fallback-nowatch: as hls-fallback, but the watch page has no player data.
+    /// hls-fallback-watchlist: only the watch page names a playlist.
+    /// hls-fallback-lateprofile: the watch page has no player data; the first /player response has a
+    /// direct format, and the later ones name only a playlist.
+    static let hlsFallbackModes: Set<String> = ["hls-fallback", "hls-fallback-nowatch", "hls-fallback-watchlist", "hls-fallback-lateprofile"]
 
     static func requests() -> [SeenRequest] { lock.withLock { seen } }
     static func beginDownload() { lock.withLock { downloadPhase = true } }
@@ -90,12 +95,12 @@ final class FixtureProtocol: URLProtocol {
             headers["Content-Type"] = "text/html"
         case (_, "/watch"):
             let visitor = mode == "visitor-reuse" ? Self.secondVisitor : Self.firstVisitor
-            let player: [String: Any] = ["watch-gate", "wall-unusable-cookie"].contains(mode)
+            var player: [String: Any] = ["watch-gate", "wall-unusable-cookie"].contains(mode)
                 ? ["playabilityStatus": ["status": "LOGIN_REQUIRED", "reason": "Sign in to confirm you're not a bot"]]
                 : ["playabilityStatus": ["status": "OK"]]
+            if mode == "hls-fallback-watchlist" { player["streamingData"] = ["hlsManifestUrl": "https://media.invalid/clip.m3u8"] }
             let json = String(data: try! JSONSerialization.data(withJSONObject: player), encoding: .utf8)!
-            // hls-fallback-nowatch: the watch page carries no ytInitialPlayerResponse.
-            data = mode == "hls-fallback-nowatch"
+            data = ["hls-fallback-nowatch", "hls-fallback-lateprofile"].contains(mode)
                 ? Data("<script>var ytcfg = {\"VISITOR_DATA\":\"\(visitor)\"};</script>".utf8)
                 : Data("<script>var ytcfg = {\"VISITOR_DATA\":\"\(visitor)\"};</script><script>var ytInitialPlayerResponse = \(json);</script>".utf8)
         case (_, let path) where path.hasSuffix("/player"):
@@ -121,9 +126,14 @@ final class FixtureProtocol: URLProtocol {
                 case "ump-unknown-length": break
                 default: format["contentLength"] = String(Self.mediaBytes.count)
                 }
-                // In the hls-fallback modes, /player also names an HLS playlist.
                 var streaming: [String: Any] = ["adaptiveFormats": [format]]
-                if Self.hlsFallbackModes.contains(mode) { streaming["hlsManifestUrl"] = "https://media.invalid/clip.m3u8" }
+                switch mode {
+                case "hls-fallback", "hls-fallback-nowatch":
+                    streaming["hlsManifestUrl"] = "https://media.invalid/clip.m3u8"
+                case "hls-fallback-lateprofile" where playerNumber > 1:
+                    streaming = ["hlsManifestUrl": "https://media.invalid/clip.m3u8"]
+                default: break
+                }
                 data = Self.json([
                     "playabilityStatus": ["status": "OK"],
                     "videoDetails": ["title": "\(title)-\(playerNumber)", "lengthSeconds": "8"],
@@ -316,6 +326,25 @@ struct RegressionChecks {
 
     static func now() -> TimeInterval { ProcessInfo.processInfo.systemUptime }
 
+    /// Runs `body` with this process's standard error sent to a file, and returns what it wrote.
+    static func capturingStderr<T>(_ body: () async throws -> T) async rethrows -> (T, String) {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("stderr-\(UUID().uuidString)")
+        FileManager.default.createFile(atPath: file.path, contents: nil)
+        let fd = open(file.path, O_WRONLY)
+        fflush(stderr)
+        let saved = dup(2)
+        dup2(fd, 2)
+        defer {
+            fflush(stderr)
+            dup2(saved, 2)
+            close(saved)
+            close(fd)
+        }
+        let result = try await body()
+        fflush(stderr)
+        return (result, (try? String(contentsOf: file, encoding: .utf8)) ?? "")
+    }
+
     /// Seconds from `start` (taken before the first extraction began) to each /player request.
     static func playerOffsets(from start: TimeInterval) -> [TimeInterval] {
         FixtureProtocol.playerRequests().map { $0.time - start }.sorted()
@@ -431,16 +460,46 @@ struct RegressionChecks {
             let offsets = log.all().map { $0 - start }.sorted()
             check(offsets.count == 5 && keepsSlots(offsets),
                   "after a middle waiter is cancelled, every wait still ends in its own 3 s slot; offsets from the start=\(offsets)")
+        case "pace-late-wake":
+            // Seventh review: callers that wake late together must still send 3 s apart. Every
+            // thread of the cooperative pool is blocked for 7 s, so the waiters for the slots at
+            // 3 s and 6 s wake together at about 7 s. The second send must have woken late, or the
+            // pool was not blocked and the case proves nothing. The 0.5 s slack covers the hop from
+            // the pacer back to the waiter on a loaded machine; without the fix the gap is about 0 s.
+            let pacer = YouTubeExtractor.YTGuard()
+            let log = TimeLog()
+            let start = now()
+            try await pacer.pace()
+            log.add(now())
+            var waiters: [Task<Void, Error>] = []
+            for _ in 0..<3 {
+                waiters.append(Task { try await pacer.pace(); log.add(now()) })
+                try await Task.sleep(nanoseconds: 100_000_000)   // reserve the slots in this order
+            }
+            for _ in 0..<ProcessInfo.processInfo.activeProcessorCount {
+                _ = Task.detached { usleep(7_000_000) }
+            }
+            for waiter in waiters { _ = await waiter.result }
+            let offsets = log.all().map { $0 - start }.sorted()
+            let gaps = zip(offsets.dropFirst(), offsets).map { $0 - $1 }
+            check(offsets.count == 4 && offsets[1] > 6 && gaps.allSatisfy { $0 >= 2.5 },
+                  "callers that wake late together still send 3 s apart; offsets from the start=\(offsets), gaps=\(gaps)")
         case "wall-unusable-cookie":
-            // An expired or empty SAPISID is never sent, so it must not keep extraction going.
+            // An expired or empty SAPISID is never sent, so it must not keep extraction going. Nor
+            // must a nonempty root SAPISID that an empty /youtubei SAPISID shadows: the request
+            // sends the cookie with the longer path.
             let expired = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", expires: 1, name: "SAPISID", value: "fixture-only")]))
             let empty = HTTPClient(cookies: CookieVault(entries: [CookieEntry(domain: ".youtube.com", name: "SAPISID", value: "")]))
+            let shadowed = HTTPClient(cookies: CookieVault(entries: [
+                CookieEntry(domain: ".youtube.com", path: "/", name: "SAPISID", value: "fixture-only"),
+                CookieEntry(domain: ".youtube.com", path: "/youtubei", name: "SAPISID", value: ""),
+            ]))
             var stopped = 0
-            for client in [expired, empty] {
+            for client in [expired, empty, shadowed] {
                 do { _ = try await extract(client: client) } catch ExtractorError.botGate { stopped += 1 }
             }
             let players = FixtureProtocol.playerRequests().count
-            check(stopped == 2 && players == 0, "an expired or empty sign-in cookie stops at the watch-page wall; stopped=\(stopped), player requests=\(players)")
+            check(stopped == 3 && players == 0, "an expired, empty or shadowed sign-in cookie stops at the watch-page wall; stopped=\(stopped), player requests=\(players)")
         case "signed-in-wall":
             // Review of PR #1: a bot wall for the anonymous profiles must not stop the profile
             // that sends the user's sign-in cookies.
@@ -566,6 +625,41 @@ struct RegressionChecks {
             let fetched = FixtureProtocol.requests().map(\.url.path).filter { $0.hasSuffix(".m4s") }.sorted()
             check(seconds == [20, 21, 22, 23, 24, 25] && fetched == ["/clip-4.m4s", "/clip-5.m4s", "/clip-6.m4s"],
                   "a 0:20-0:26 section of an HLS stream saves the samples of seconds 20 to 25; saved seconds=\(seconds), segments=\(fetched)")
+        case "hls-section-outside":
+            // Seventh review: a section after the end of a 60 s stream is an error. No media
+            // segment is fetched, and no file is saved.
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.cookieSource = "none"
+            options.connections = 1
+            let outDir = AppPaths.appSupportDir.appendingPathComponent("out")
+            options.outputDir = outDir.path
+            options.section = SectionRange(start: 65, end: 70)
+            var failure = ""
+            do {
+                _ = try await DownloadEngine().downloadSingle(url: "https://media.invalid/clip.m3u8", settings: settings, options: options)
+            } catch {
+                failure = error.localizedDescription
+            }
+            let fetched = FixtureProtocol.requests().map(\.url.path).filter { $0.hasSuffix(".m4s") }
+            let saved = ((try? FileManager.default.contentsOfDirectory(atPath: outDir.path)) ?? []).filter { !$0.hasPrefix(".") }
+            check(failure.contains("outside the stream") && fetched.isEmpty && saved.isEmpty,
+                  "a section after the end fails without fetching or saving media; failure=\(failure), segments=\(fetched), saved=\(saved)")
+        case "range-ignored":
+            // Seventh review: a server that ignores Range answers 200 with the whole file. The
+            // fixture's /seg- route does that, and its body is its own path.
+            let client = HTTPClient()
+            let part = try await client.fetchRangeBytes(url: "https://media.invalid/seg-whole.mp3", range: ByteRange(start: 5, end: 9))
+            var pastEnd = false
+            do {
+                _ = try await client.fetchRangeBytes(url: "https://media.invalid/seg-whole.mp3", range: ByteRange(start: 100, end: 200))
+            } catch HTTPError.rangeUnsupported {
+                pastEnd = true
+            }
+            let text = String(decoding: part, as: UTF8.self)
+            check(text == "whole" && pastEnd, "a 200 answer to a range request gives only the requested bytes; bytes 5-9=\(text), past the end refused=\(pastEnd)")
         case "hls-raw-section", "http-raw-section":
             // A raw MP3 stream (the shape that the SoundCloud extractor returns) with a 0:20-0:26
             // section is not trimmed. Over plain HTTP it is saved whole; over HLS, the segments that
@@ -589,10 +683,11 @@ struct RegressionChecks {
             let saved = String(decoding: try Data(contentsOf: file), as: UTF8.self)
             let expected = overHLS ? "/seg-4.ts/seg-5.ts/seg-6.ts" : "/seg-whole.mp3"
             check(saved == expected, "a raw MP3 stream with --section is not trimmed (whole over HTTP, overlapping segments over HLS); saved=\(saved), expected=\(expected)")
-        case "hls-fallback", "hls-fallback-nowatch":
-            // Every range test fails, and every /player response names an HLS playlist. With player
-            // data on the watch page, extraction offers only the HLS formats. Without it, extraction
-            // fails. Neither mode tries UMP.
+        case "hls-fallback", "hls-fallback-nowatch", "hls-fallback-watchlist", "hls-fallback-lateprofile":
+            // Every range test fails. The HLS fallback needs player data (from the watch page, or from
+            // a /player response that names a playlist and has no direct format) and a playlist (from
+            // any /player response or from the watch page). Only hls-fallback-nowatch lacks player
+            // data, so only it fails. No mode tries UMP.
             var formats: [String] = []
             var failure = ""
             do {
@@ -600,11 +695,11 @@ struct RegressionChecks {
             } catch ExtractorError.notFound(let message) {
                 failure = message
             }
-            let ok = FixtureProtocol.mode == "hls-fallback"
-                ? !formats.isEmpty && formats.allSatisfy { $0.hasSuffix(":hls") } && failure.isEmpty
-                : formats.isEmpty && failure.contains("player request failed")
+            let ok = FixtureProtocol.mode == "hls-fallback-nowatch"
+                ? formats.isEmpty && failure.contains("player request failed")
+                : !formats.isEmpty && formats.allSatisfy { $0.hasSuffix(":hls") } && failure.isEmpty
             check(ok && umpPosts().isEmpty,
-                  "after every range test fails, the HLS playlist is used only with player data from the watch page; formats=\(formats), failure=\(failure), umpPosts=\(umpPosts().count)")
+                  "after every range test fails, the HLS playlist is used when there is player data and a playlist; formats=\(formats), failure=\(failure), umpPosts=\(umpPosts().count)")
         case "non-http-error":
             let (_, error) = await download(audioExt: "webm")
             check((error as? URLError)?.code == .cancelled && umpPosts().isEmpty,
@@ -680,8 +775,14 @@ struct RegressionChecks {
             let formats = await CLIRunner.run(arguments: ["ubit", "formats", "--no-cookies", "--proxy", "--bogus", target])
             let info = await CLIRunner.run(arguments: ["ubit", "info", "--proxy", "127.0.0.1:9", target])
             let get = await CLIRunner.run(arguments: ["ubit", "get", "--proxy", "not a proxy", target])
-            let socks4 = await CLIRunner.run(arguments: ["ubit", "info", "--proxy", "socks4://127.0.0.1:9", target])
-            let socks4a = await CLIRunner.run(arguments: ["ubit", "info", "--proxy", "socks4a://127.0.0.1:9", target])
+            // A refused proxy URL can hold a password, so no message may repeat the value.
+            let marker = "pw-marker-7f3a"
+            let ((socks4, socks4a, getSocks4, settingsSocks4a), stderrText) = await capturingStderr {
+                (await CLIRunner.run(arguments: ["ubit", "info", "--proxy", "socks4://user:\(marker)@127.0.0.1:9", target]),
+                 await CLIRunner.run(arguments: ["ubit", "info", "--proxy", "socks4a://user:\(marker)@127.0.0.1:9", target]),
+                 await CLIRunner.run(arguments: ["ubit", "get", "--proxy", "socks4://user:\(marker)@127.0.0.1:9", target]),
+                 await CLIRunner.run(arguments: ["ubit", "settings", "proxy", "socks4a://user:\(marker)@127.0.0.1:9"]))
+            }
             let added = FixtureProtocol.requests().count - before
             var settings = Settings()
             let storedBad = settings.setByKey("proxy", value: "bogus")
@@ -692,19 +793,27 @@ struct RegressionChecks {
             let resolved = FixtureProtocol.resolvedProxies()
             let routed = resolved.contains("\(kCFProxyTypeSOCKS as String) 127.0.0.1:9")
             let capitalPort = resolved.contains("\(kCFProxyTypeSOCKS as String) 127.0.0.1:1080")
-            check(formats == 2 && info == 2 && get == 2 && socks4 == 2 && socks4a == 2 && added == 0
+            let leaked = stderrText.contains(marker)
+            check(formats == 2 && info == 2 && get == 2 && socks4 == 2 && socks4a == 2 && getSocks4 == 2 && settingsSocks4a == 2
+                    && added == 0 && !leaked && stderrText.contains("invalid")
                     && !storedBad && !storedSocks4a && storedGood && routed && capitalPort,
-                  "invalid proxies exit 2 before any request, settings refuse them, valid ones are installed and a capital SOCKS5 scheme gets port 1080; formats=\(formats), info=\(info), get=\(get), socks4=\(socks4), socks4a=\(socks4a), requests=\(added), storedBad=\(storedBad), storedSocks4a=\(storedSocks4a), resolved=\(resolved)")
+                  "invalid proxies exit 2 before any request without repeating the value, settings refuse them, valid ones are installed and a capital SOCKS5 scheme gets port 1080; formats=\(formats), info=\(info), get=\(get), socks4=\(socks4), socks4a=\(socks4a), getSocks4=\(getSocks4), settings=\(settingsSocks4a), requests=\(added), password in stderr=\(leaked), storedBad=\(storedBad), storedSocks4a=\(storedSocks4a), resolved=\(resolved)")
         case "proxy-stored":
             // A proxy that was stored before validation existed (or typed into settings.json)
-            // must fail the command, not send the request without a proxy.
+            // must fail the command, not send the request without a proxy. Its error must not
+            // repeat the stored value, which can hold a password.
+            let marker = "pw-marker-c41e"
             var settings = Settings.load()
-            settings.proxy = "127.0.0.1:9"
+            settings.proxy = "socks4://user:\(marker)@127.0.0.1:9"
             try settings.save()
             let before = FixtureProtocol.requests().count
-            let info = await CLIRunner.run(arguments: ["ubit", "info", "--no-cookies", "https://fixture.invalid/must-not-contact"])
+            let (info, stderrText) = await capturingStderr {
+                await CLIRunner.run(arguments: ["ubit", "info", "--no-cookies", "https://fixture.invalid/must-not-contact"])
+            }
             let added = FixtureProtocol.requests().count - before
-            check(info != 0 && added == 0, "a stored invalid proxy fails the command before any request; exit=\(info), requests=\(added)")
+            let leaked = stderrText.contains(marker)
+            check(info != 0 && added == 0 && !leaked && stderrText.contains("invalid proxy"),
+                  "a stored invalid proxy fails the command before any request without repeating the value; exit=\(info), requests=\(added), password in stderr=\(leaked), stderr=\(stderrText)")
 
         // Report 1 #7 / report 2 #6, #1: Safari cookie parsing.
         case "safari-values":

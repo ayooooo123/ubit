@@ -37,7 +37,7 @@ swiftc \
 
 # visitor-first and visitor-reuse share one config directory: the second process must reuse
 # the visitor ID that the first one stored. Naming visitor-reuse alone runs visitor-first first.
-CASES="${*:-watch-gate player-gate visitor-first visitor-reuse pace-concurrent pace-retry cancel-slots cancel-middle wall-unusable-cookie signed-in-wall auth-header cache cache-context cache-scope cache-prune cache-cancelled normal stale stale-embed section hls-section-base hls-section-clip hls-raw-section http-raw-section non-http-error ump-cut ump-unknown-length ump-complete ump-cold hls-fallback hls-fallback-nowatch ump-redirect ump-oversized-box ump-truncated ump-mixed-streams cli-flags proxy-values proxy-stored safari-values safari-infinite-expiry safari-expiry-sentinels chromium}"
+CASES="${*:-watch-gate player-gate visitor-first visitor-reuse pace-concurrent pace-retry cancel-slots cancel-middle pace-late-wake wall-unusable-cookie signed-in-wall auth-header cache cache-context cache-scope cache-prune cache-cancelled normal stale stale-embed section hls-section-base hls-section-clip hls-section-outside range-ignored hls-raw-section http-raw-section non-http-error ump-cut ump-unknown-length ump-complete ump-cold hls-fallback hls-fallback-nowatch hls-fallback-watchlist hls-fallback-lateprofile ump-redirect ump-oversized-box ump-truncated ump-mixed-streams cli-flags proxy-values proxy-stored safari-values safari-infinite-expiry safari-expiry-sentinels chromium}"
 
 failed=""
 for case in $CASES; do

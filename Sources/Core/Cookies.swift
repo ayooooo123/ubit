@@ -53,20 +53,24 @@ public final class CookieVault: @unchecked Sendable {
         return entries
     }
 
-    public func cookieHeader(for url: URL) -> String? {
+    /// The cookies that a request to `url` sends: for each name, the matching cookie with the
+    /// longest path, and the earlier one in the vault when two paths are equally long. The
+    /// Cookie header and YouTube's sign-in test both use this one selection.
+    public func effectiveCookies(for url: URL) -> [CookieEntry] {
         lock.lock()
-        let matching = entries.filter { $0.matches(url: url) }
+        let matching = entries.enumerated().filter { $0.element.matches(url: url) }
         lock.unlock()
-        guard !matching.isEmpty else { return nil }
-        var seen = Set<String>()
-        var pairs: [String] = []
-        // Prefer more specific path first
-        for c in matching.sorted(by: { $0.path.count > $1.path.count }) {
-            if seen.insert(c.name).inserted {
-                pairs.append("\(c.name)=\(c.value)")
-            }
+        let ordered = matching.sorted { a, b in
+            a.element.path.count != b.element.path.count ? a.element.path.count > b.element.path.count : a.offset < b.offset
         }
-        return pairs.joined(separator: "; ")
+        var seen = Set<String>()
+        return ordered.map(\.element).filter { seen.insert($0.name).inserted }
+    }
+
+    public func cookieHeader(for url: URL) -> String? {
+        let cookies = effectiveCookies(for: url)
+        guard !cookies.isEmpty else { return nil }
+        return cookies.map { "\($0.name)=\($0.value)" }.joined(separator: "; ")
     }
 
     public func cookieValue(named name: String, forDomain domainSuffix: String) -> String? {

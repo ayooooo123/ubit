@@ -183,7 +183,7 @@ public final class DownloadEngine: @unchecked Sendable {
         let proxy = options.proxy ?? (settings.proxy.isEmpty ? nil : settings.proxy)
         // A proxy string that the client cannot install would send every request directly.
         if let proxy, !proxy.isEmpty, !HTTPClient.isValidProxy(proxy) {
-            throw HTTPError.badURL("invalid proxy \(proxy): use http://host:port or socks5://host:port")
+            throw HTTPError.badURL("invalid proxy setting: use http://host:port or socks5://host:port")
         }
         let cookies = try CookieVault.load(source: options.cookieSource)
         var extra = options.extraHeaders

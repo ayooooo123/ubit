@@ -19,7 +19,7 @@ Run `ubit --llms` at any time to print the installed binary's exact CLI and NDJS
 
 ## Core Agent Workflows
 
-### 1. Probe Metadata, Formats & Subtitles First (Zero Media Bytes Downloaded)
+### 1. Probe Metadata, Formats & Subtitles First (No Media File Saved)
 
 ```sh
 ubit info --json "<url>"

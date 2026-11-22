@@ -345,6 +345,10 @@ public final class HTTPClient: @unchecked Sendable {
     /// so a caller never takes the start of the file for the requested bytes. A partial answer
     /// must contain the full requested interval, or prove that it ends at EOF.
     public func fetchRangeBytes(url: String, range: ByteRange, headers: [String: String]? = nil) async throws -> Data {
+        try await fetchRange(url: url, range: range, headers: headers).data
+    }
+
+    func fetchRange(url: String, range: ByteRange, headers: [String: String]?) async throws -> (data: Data, fileSize: Int64?) {
         guard range.start >= 0, range.end >= range.start else { throw HTTPError.rangeUnsupported }
         var hdrs = headers ?? [:]
         hdrs["Range"] = "bytes=\(range.start)-\(range.end)"
@@ -364,16 +368,17 @@ public final class HTTPClient: @unchecked Sendable {
             let length = interval[interval.index(after: slash)...]
             if length == "*" {
                 guard last == range.end else { throw HTTPError.rangeUnsupported }
+                return (data, nil)
             } else {
                 guard let size = Int64(length), size > last, last == min(range.end, size - 1) else {
                     throw HTTPError.rangeUnsupported
                 }
+                return (data, size)
             }
-            return data
         }
         guard Int64(data.count) > range.start else { throw HTTPError.rangeUnsupported }
         let last = min(range.end, Int64(data.count - 1))
-        return data.subdata(in: Int(range.start)..<(Int(last) + 1))
+        return (data.subdata(in: Int(range.start)..<(Int(last) + 1)), Int64(data.count))
     }
 
     /// Probes total file size and range support using a tiny `Range: bytes=0-0` request.

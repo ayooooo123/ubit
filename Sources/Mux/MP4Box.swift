@@ -681,10 +681,10 @@ public enum MP4Muxer {
                 if sec > targetStart { break }
                 accTicks += UInt64(s.duration)
             }
-            effectiveStart = lastSyncSec
+            if Double(accTicks) / Double(vTrack.timescale) > targetStart { effectiveStart = lastSyncSec }
         }
 
-        return tracks.map { track in
+        return tracks.compactMap { track in
             var kept: [MP4Sample] = []
             var accTicks: UInt64 = 0
             for s in track.samples {
@@ -695,8 +695,9 @@ public enum MP4Muxer {
                 if let e = targetEnd, sStart >= e { break }
                 kept.append(s)
             }
+            guard !kept.isEmpty else { return nil }
             var copy = track
-            copy.samples = kept.isEmpty ? Array(track.samples.prefix(1)) : kept
+            copy.samples = kept
             return copy
         }
     }

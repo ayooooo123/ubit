@@ -435,9 +435,17 @@ public final class DownloadEngine: @unchecked Sendable {
             }
         }
 
+        var hasVFile = false
+        var hasAFile = false
+        defer {
+            // These are completed inputs owned by this download, not resumable .part files.
+            if hasVFile { try? FileManager.default.removeItem(at: vTemp) }
+            if hasAFile { try? FileManager.default.removeItem(at: aTemp) }
+        }
         var vActualBytes: Int64 = 0
         if let vFmt = selected.video {
             let res = try await fetchStream(vFmt, to: vTemp, priorBytes: 0, isVideoRole: true)
+            hasVFile = true
             videoSectionBaseSec = res.baseSec
             videoIsTS = res.isTS
             vActualBytes = (try? FileManager.default.attributesOfItem(atPath: vTemp.path)[.size] as? Int64) ?? 0
@@ -446,12 +454,14 @@ public final class DownloadEngine: @unchecked Sendable {
             if selected.audio == nil, let hlsAudioURL = vFmt.audioTrackURL {
                 let synthAudio = MediaFormat(id: "hls-audio", url: hlsAudioURL, ext: "m4a", proto: .hls, vcodec: "none", acodec: "mp4a", headers: vFmt.headers)
                 let aRes = try await fetchStream(synthAudio, to: aTemp, priorBytes: vActualBytes, isVideoRole: false)
+                hasAFile = true
                 audioSectionBaseSec = aRes.baseSec
                 audioIsTS = aRes.isTS
             }
         }
         if let aFmt = selected.audio {
             let res = try await fetchStream(aFmt, to: aTemp, priorBytes: vActualBytes, isVideoRole: false)
+            hasAFile = true
             audioSectionBaseSec = res.baseSec
             audioIsTS = res.isTS
         }
@@ -500,9 +510,6 @@ public final class DownloadEngine: @unchecked Sendable {
         let muxOutURL = (targetExt == "mp4" || targetExt == "m4a")
             ? finalURL
             : itemWorkDir.appendingPathComponent("muxed.\(intermediateExtension)")
-
-        let hasVFile = FileManager.default.fileExists(atPath: vTemp.path)
-        let hasAFile = FileManager.default.fileExists(atPath: aTemp.path)
 
         let isRawNonMP4AudioOnly = !hasVFile && hasAFile && ["mp3", "opus", "flac", "wav"].contains(selected.audio?.ext.lowercased() ?? "")
         let canUseNativeMP4Mux = !isRawNonMP4AudioOnly && !((selected.video?.ext == "webm") || (selected.audio?.ext == "webm"))
@@ -554,6 +561,10 @@ public final class DownloadEngine: @unchecked Sendable {
                 allTracks.append(contentsOf: at)
             }
 
+            if options.section != nil && allTracks.isEmpty {
+                throw NSError(domain: "DownloadEngine", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                    "The --section range is outside the stream"])
+            }
             let totalDur = allTracks.map(\.durationSeconds).max() ?? info.duration ?? 0
             if !options.externalSubtitles && !isAudioOut {
                 for (lang, cues) in downloadedSubTracks {
@@ -592,9 +603,6 @@ public final class DownloadEngine: @unchecked Sendable {
                 try FileManager.default.moveItem(at: aTemp, to: finalURL)
             }
         }
-
-        try? FileManager.default.removeItem(at: vTemp)
-        try? FileManager.default.removeItem(at: aTemp)
 
         // Optional format conversion (mov, wav, flac, aiff natively; mp3, opus, mkv, webm via ffmpeg)
         if muxOutURL != finalURL && FileManager.default.fileExists(atPath: muxOutURL.path) {
@@ -653,11 +661,30 @@ public final class DownloadEngine: @unchecked Sendable {
         destination: URL
     ) async throws -> Double? {
         let probeEnd = fmt.indexRange?.end ?? 65_535
-        let head = try await client.fetchRangeBytes(url: fmt.url, range: ByteRange(start: 0, end: max(32_767, probeEnd)), headers: headers)
-        guard let parsed = MP4Muxer.parseSidx(in: head) else { return nil }
+        let (head, fileSize) = try await client.fetchRange(url: fmt.url, range: ByteRange(start: 0, end: max(32_767, probeEnd)), headers: headers)
+        guard let parsed = MP4Muxer.parseSidx(in: head), let last = parsed.segments.last else { return nil }
 
         let reqStart = section.start ?? 0
         let reqEnd = section.end ?? .infinity
+        if reqEnd > last.endTimeSec {
+            // An sidx can describe just one fragment. If there could be more media
+            // after its references, use the full-file path rather than truncate or reject a clip.
+            guard let size = fileSize else { return nil }
+            guard last.byteRange.end < size else { throw HTTPError.rangeUnsupported }
+            let next = last.byteRange.end + 1
+            if next < size {
+                let remaining = size - next
+                guard remaining >= 8 else { return nil }
+                let trailer: Data
+                if next + 7 < Int64(head.count) {
+                    trailer = head[Int(next)..<Int(next + 8)]
+                } else {
+                    trailer = try await client.fetchRangeBytes(url: fmt.url, range: ByteRange(start: next, end: next + 7), headers: headers)
+                }
+                // FFmpeg can put a movie fragment random access box after the last media.
+                guard trailer.fourCC(4) == "mfra", Int64(trailer.beU32(0)) == remaining else { return nil }
+            }
+        }
         let overlaps: (SidxSegment) -> Bool = { $0.endTimeSec > reqStart && $0.startTimeSec < reqEnd }
         guard let firstSeg = parsed.segments.first(where: overlaps),
               let lastSeg = parsed.segments.last(where: overlaps) else {
@@ -668,6 +695,9 @@ public final class DownloadEngine: @unchecked Sendable {
         let initBytes = head.prefix(Int(parsed.initEndOffset + 1))
         let bodyRange = ByteRange(start: firstSeg.byteRange.start, end: lastSeg.byteRange.end)
         let bodyBytes = try await client.fetchRangeBytes(url: fmt.url, range: bodyRange, headers: headers)
+        guard Int64(bodyBytes.count) - 1 == bodyRange.end - bodyRange.start else {
+            throw HTTPError.rangeUnsupported
+        }
 
         var combined = Data(capacity: initBytes.count + bodyBytes.count)
         combined.append(initBytes)

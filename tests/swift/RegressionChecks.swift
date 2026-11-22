@@ -201,9 +201,10 @@ final class FixtureProtocol: URLProtocol {
             data = Data(Bytes.clipInit(sampleTicks: mode == "hls-decimal" ? 200 : 1000))
         case ("media.invalid", let path) where path.hasPrefix("/clip-"):
             data = Data(Bytes.clipSegment(Int(path.dropFirst(6).dropLast(4)) ?? 0))
-        case ("media.invalid", "/indexed.mp4"):
-            let bytes = Bytes.indexedClip
-            if let range, let dash = range.firstIndex(of: "-"),
+        case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4"].contains(path):
+            var bytes = mode == "sidx-fragments" ? Bytes.fragmentIndexedClip : Bytes.indexedClip
+            if path.hasPrefix("/cut-") { bytes.removeLast(13 * Bytes.clipSegment(0).count) }
+            if path != "/cut-200.mp4", let range, let dash = range.firstIndex(of: "-"),
                let start = Int(range.dropFirst(6).prefix(while: { $0 != "-" })),
                let end = Int(range[range.index(after: dash)...]), start < bytes.count {
                 let last = min(end, bytes.count - 1)
@@ -328,6 +329,17 @@ enum Bytes {
         var index = be32(0) + be32(1) + be32(1000) + be32(0) + be32(0) + be32(UInt32(segments.count))
         for segment in segments { index += be32(UInt32(segment.count)) + be32(4000) + be32(0) }
         return clipInit(sampleTicks: 1000) + box("sidx", index) + segments.flatMap { $0 }
+    }()
+
+    static let fragmentIndexedClip: [UInt8] = {
+        var bytes = clipInit(sampleTicks: 1000)
+        for n in 0..<15 {
+            let fragment = clipSegment(n)
+            let prefix = be32(0) + be32(1) + be32(1000) + be32(UInt32(n * 4000))
+            let reference = be32(UInt32(fragment.count)) + be32(4000) + be32(0)
+            bytes += box("sidx", prefix + be32(0) + be32(1) + reference) + fragment
+        }
+        return bytes
     }()
 }
 
@@ -637,7 +649,7 @@ struct RegressionChecks {
                                                             destination: dest, section: SectionRange(start: 20, end: 26))
             let fetched = FixtureProtocol.requests().map(\.url.path).filter { $0.hasPrefix("/seg-") }.sorted()
             check(result.startTime == 16 && fetched == ["/seg-4.ts", "/seg-5.ts", "/seg-6.ts"],
-                  "a section of 0:20-0:26 fetches the three overlapping 4 s segments and reports that they start at 16 s; startTime=\(result.startTime), segments=\(fetched)")
+                  "the 20–26 s clip fetches two overlapping segments and one for preroll; startTime=\(result.startTime), segments=\(fetched)")
         case "hls-section-clip":
             // The whole engine (playlist, segments, demux, trim, mux) must save the samples of
             // stream seconds 20 to 25. Each sample is one byte: its second.
@@ -734,7 +746,7 @@ struct RegressionChecks {
             let file = try await DownloadEngine().downloadSingle(url: "https://media.invalid/page", preExtracted: info, settings: settings, options: options)
             let saved = String(decoding: try Data(contentsOf: file), as: UTF8.self)
             let expected = overHLS ? "/seg-4.ts/seg-5.ts/seg-6.ts" : "/seg-whole.mp3"
-            check(saved == expected, "a raw MP3 stream with --section is not trimmed (whole over HTTP, overlapping segments over HLS); saved=\(saved), expected=\(expected)")
+            check(saved == expected, "raw MP3 is not trimmed: HTTP saves the file and HLS saves the selected segments, including preroll; saved=\(saved), expected=\(expected)")
         case "hls-fallback", "hls-fallback-nowatch", "hls-fallback-watchlist", "hls-fallback-lateprofile":
             // Every range test fails. The HLS fallback needs player data (from the watch page, or from
             // a /player response that names a playlist and has no direct format) and a playlist (from
@@ -752,7 +764,7 @@ struct RegressionChecks {
                 : !formats.isEmpty && formats.allSatisfy { $0.hasSuffix(":hls") } && failure.isEmpty
             check(ok && umpPosts().isEmpty,
                   "after every range test fails, the HLS playlist is used when there is player data and a playlist; formats=\(formats), failure=\(failure), umpPosts=\(umpPosts().count)")
-        case "hls-decimal", "sidx-boundaries":
+        case "hls-decimal", "sidx-boundaries", "sidx-fragments":
             let hls = mode == "hls-decimal"
             let path = hls ? "/clip.m3u8" : "/indexed.mp4"
             let url = "https://media.invalid" + path
@@ -771,16 +783,17 @@ struct RegressionChecks {
                 check(false, "a section starting at EOF produced a file")
             } catch where error.localizedDescription.contains("outside the stream") {}
             let media = FixtureProtocol.requests().filter { $0.url.path == path || $0.url.path.hasPrefix("/clip-") }
-            let files = ((try? FileManager.default.contentsOfDirectory(atPath: out.path)) ?? []).filter { !$0.hasPrefix(".") }
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: out.path)) ?? []
             let onlyMetadata = hls ? !media.isEmpty && media.allSatisfy { $0.url.path == path }
                                    : media.count == 1 && media[0].range == "bytes=0-65535"
-            check(files.isEmpty && onlyMetadata,
-                  "at EOF only the playlist or index is fetched; paths=\(media.map(\.url.path)), files=\(files)")
+            check(files.isEmpty && (mode == "sidx-fragments" || onlyMetadata),
+                  "at EOF no file is saved; a complete index needs no media request; paths=\(media.map(\.url.path)), files=\(files)")
 
             let clips: [(Double, Double, [Int], [String])] = hls ? [
                 (8, 9.6, Array(40..<48), ["/clip-9.m4s", "/clip-10.m4s", "/clip-11.m4s"]),
                 (11.999999, 12, [59], ["/clip-14.m4s"])
-            ] : [(56, 60, Array(56..<60), [])]
+            ] : mode == "sidx-fragments" ? [(4, 8, Array(4..<8), []), (2, 6, Array(2..<6), [])]
+                                         : [(56, 60, Array(56..<60), [])]
             for (start, end, expected, parts) in clips {
                 let before = FixtureProtocol.requests().count
                 options.section = SectionRange(start: start, end: end)
@@ -790,6 +803,24 @@ struct RegressionChecks {
                 let fetched = FixtureProtocol.requests().dropFirst(before).map(\.url.path).filter { $0.hasSuffix(".m4s") }
                 check(samples == expected && fetched == parts, "section \(start)-\(end): samples=\(samples), parts=\(fetched)")
             }
+        case "sidx-cut":
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.section = SectionRange(start: 4, end: 10)
+            options.connections = 1
+            options.cookieSource = "none"
+            let out = AppPaths.appSupportDir.appendingPathComponent("out")
+            options.outputDir = out.path
+            for status in [200, 206] {
+                do {
+                    _ = try await DownloadEngine().downloadSingle(url: "https://media.invalid/cut-\(status).mp4", settings: settings, options: options)
+                    check(false, "a file cut between indexed fragments produced a clip")
+                } catch HTTPError.rangeUnsupported {}
+            }
+            let files = ((try? FileManager.default.contentsOfDirectory(atPath: out.path)) ?? []).filter { !$0.hasPrefix(".") }
+            check(files.isEmpty, "a short indexed media interval from a 200 or 206 response produces no clip")
         case "cancel-in-fallback":
             let (file, error) = await download(audioExt: "webm")
             let players = FixtureProtocol.playerRequests().count

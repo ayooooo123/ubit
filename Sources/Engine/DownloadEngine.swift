@@ -676,17 +676,20 @@ public final class DownloadEngine: @unchecked Sendable {
             // Without an edition, two reads can come from two different files. The index, the
             // initialization data, the media and the trailing box that ended the index must then
             // come from one response: the bytes already read when they reach far enough, else one
-            // read from byte 0 that must repeat those bytes.
+            // read from byte 0 that must repeat those bytes. When the end of the file decided
+            // that no media follows the index, that read must also report the same file size.
             let end = probed.map { $0.start + Int64($0.bytes.count) - 1 }.reduce(bodyRange.end, max)
             let whole: Data
             if Int64(head.count) > end {
                 whole = head
             } else {
-                whole = try await client.fetchRange(url: fmt.url, range: ByteRange(start: 0, end: end), headers: headers).data
-                guard Int64(whole.count) > end, whole.prefix(head.count) == head,
-                      probed.allSatisfy({ whole.subdata(in: Int($0.start)..<Int($0.start) + $0.bytes.count) == $0.bytes }) else {
+                let (data, size, _) = try await client.fetchRange(url: fmt.url, range: ByteRange(start: 0, end: end), headers: headers)
+                guard Int64(data.count) > end, data.prefix(head.count) == head,
+                      reqEnd <= last.endTimeSec || size == fileSize,
+                      probed.allSatisfy({ data.subdata(in: Int($0.start)..<Int($0.start) + $0.bytes.count) == $0.bytes }) else {
                     throw HTTPError.rangeUnsupported
                 }
+                whole = data
             }
             initBytes = whole.prefix(Int(parsed.initEndOffset + 1))
             bodyBytes = whole.subdata(in: Int(bodyRange.start)..<Int(bodyRange.end + 1))

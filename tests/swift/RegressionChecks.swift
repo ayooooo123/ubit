@@ -383,9 +383,12 @@ final class FixtureProtocol: URLProtocol {
             data = Data(Bytes.clipSegment(Int(path.dropFirst(6).dropLast(4)) ?? 0))
         case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4", "/cut-unknown.mp4", "/cut-later.mp4", "/cut-padding.mp4", "/cut-empty.mp4", "/cut-stale.mp4", "/cut-duration.mp4"].contains(path):
             // sidx-untagged-change: every read after the first comes from a second edition.
-            let changed = mode == "sidx-untagged-change" && Self.lock.withLock { Self.seen.contains { $0.url.path == path } }
+            // sidx-untagged-grow: every read after the first comes from a longer second edition.
+            let later = Self.lock.withLock { Self.seen.contains { $0.url.path == path } }
+            let changed = mode == "sidx-untagged-change" && later
+            let grown = mode == "sidx-untagged-grow" && later
             var bytes = mode == "sidx-fragments" || path == "/cut-later.mp4" || path == "/cut-padding.mp4" ? Bytes.fragmentIndexedClip
-                : (changed ? Bytes.changedIndexedClip : Bytes.indexedClip)
+                : (changed ? Bytes.changedIndexedClip : grown ? Bytes.grownIndexedClip : Bytes.indexedClip)
             if mode == "sidx-padding" { bytes += Bytes.box("free", Array(repeating: 0, count: 24)) }
             if ["/cut-empty.mp4", "/cut-stale.mp4", "/cut-duration.mp4"].contains(path) {
                 let table = MP4Muxer.parseSidx(in: Data(bytes))!.segments
@@ -708,6 +711,9 @@ enum Bytes {
     /// A second edition of `indexedClip` with the same size and box offsets, but a different
     /// track timescale and different sample bytes.
     static let changedIndexedClip: [UInt8] = makeIndexedClip(timescale: 2000, sampleBase: 100)
+    /// A second edition of `indexedClip` with the same first 64 KiB and index, different sample
+    /// bytes, and one more fragment after the last indexed one, as when the file grows.
+    static let grownIndexedClip: [UInt8] = makeIndexedClip(timescale: 1000, sampleBase: 100) + clipSegment(15, sampleBase: 100)
 
     static func makeIndexedClip(timescale: UInt32, sampleBase: Int) -> [UInt8] {
         let segments = (0..<15).map { clipSegment($0, sampleBase: sampleBase) }
@@ -1511,9 +1517,11 @@ struct RegressionChecks {
                 let fetched = FixtureProtocol.requests().dropFirst(before).map(\.url.path).filter { $0.hasSuffix(".m4s") }
                 check(samples == expected && fetched == parts, "section \(start)-\(end): samples=\(samples), parts=\(fetched)")
             }
-        case "sidx-untagged-change":
+        case "sidx-untagged-change", "sidx-untagged-grow":
             // The server names no edition and changes the file after the first read. The saved
             // clip must come from one edition (timescale and samples agree), or no file is saved.
+            // When the file grows, an open-ended clip must not stop at the end of the first edition.
+            let grow = mode == "sidx-untagged-grow"
             var settings = Settings()
             settings.embedMetadata = false
             settings.saveThumbnail = false
@@ -1522,7 +1530,7 @@ struct RegressionChecks {
             options.connections = 1
             let out = AppPaths.appSupportDir.appendingPathComponent("out")
             options.outputDir = out.path
-            options.section = SectionRange(start: 8, end: 12)
+            options.section = grow ? SectionRange(start: 56, end: nil) : SectionRange(start: 8, end: 12)
             var file: URL?
             var failure: Error?
             do {
@@ -1533,7 +1541,8 @@ struct RegressionChecks {
                 let data = try Data(contentsOf: file)
                 let samples = data.range(of: Data("mdat".utf8)).map { data[$0.upperBound...].map(Int.init) } ?? []
                 let timescale = try MP4Muxer.readTracks(from: file).first?.timescale
-                let oneEdition = (timescale == 1000 && samples == Array(8..<12)) || (timescale == 2000 && samples.allSatisfy { $0 >= 100 })
+                let oneEdition = grow ? (samples == Array(56..<60) || samples == Array(156..<164))
+                    : (timescale == 1000 && samples == Array(8..<12)) || (timescale == 2000 && samples.allSatisfy { $0 >= 100 })
                 check(oneEdition, "a saved clip comes from one edition: timescale=\(String(describing: timescale)), samples=\(samples)")
             } else {
                 check(files.isEmpty, "a changed edition fails without a file: error=\(String(describing: failure)), files=\(files)")

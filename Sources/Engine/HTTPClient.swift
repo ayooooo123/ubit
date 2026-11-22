@@ -384,11 +384,13 @@ public final class HTTPClient: @unchecked Sendable {
         try await fetchRange(url: url, range: range, headers: headers).data
     }
 
-    func fetchRange(url: String, range: ByteRange, headers: [String: String]?) async throws -> (data: Data, fileSize: Int64?) {
+    func fetchRange(url: String, range: ByteRange, headers: [String: String]?, matchingTag: String? = nil) async throws -> (data: Data, fileSize: Int64?) {
         guard range.start >= 0, range.end >= range.start else { throw HTTPError.rangeUnsupported }
         var hdrs = headers ?? [:]
         hdrs["Range"] = "bytes=\(range.start)-\(range.end)"
+        if let matchingTag { hdrs["If-Match"] = matchingTag }
         let (data, http) = try await fetchData(url: url, headers: hdrs)
+        if let matchingTag, Self.strongTag(http) != matchingTag { throw HTTPError.rangeUnsupported }
         if http.statusCode == 206 {
             guard let value = http.value(forHTTPHeaderField: "Content-Range"),
                   let content = Self.parseContentRange(value),
@@ -450,7 +452,7 @@ public final class HTTPClient: @unchecked Sendable {
     }
 
     /// Probes total file size and range support using a tiny `Range: bytes=0-0` request.
-    private func probeRemote(url: String, headers: [String: String]?) async throws -> (totalSize: Int64?, acceptsRanges: Bool, etag: String?) {
+    func probeRemote(url: String, headers: [String: String]?) async throws -> (totalSize: Int64?, acceptsRanges: Bool, etag: String?) {
         var hdrs = headers ?? [:]
         hdrs["Range"] = "bytes=0-0"
         let req = try makeRequest(url: url, headers: hdrs)

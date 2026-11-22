@@ -44,9 +44,11 @@ On the native macOS Swift CLI, for indexed MP4/M4A input, `ubit` requests the st
 
 For an indexed MP4 or M4A clip, the selected samples must cover the interval that each index reference declares. Padding cannot stand in for the second half of a reference. If the client downloads the whole file, it checks every top-level segment index, including those after the requested clip. A reference to padding or missing bytes causes the command to fail without saving the clip.
 
+If an indexed fragment has reordered pictures and variable decode durations, the Swift client can fetch the whole file. It uses the next fragment to establish the boundary between displayed pictures. A decode duration is not a display duration.
+
 The Swift muxer can copy or shorten a track with a single normal-speed edit. A frame that the player needs for decoding can remain in the file without being displayed. Reopening the clip does not extend its displayed interval. The muxer rejects multiple edits and nonstandard playback rates rather than silently changing their timeline.
 
-For an explicit HLS byte range, both the initialization data and the media must include every requested byte. An early end of file is an error, even if the server returns HTTP 200 or 206.
+For an explicit HLS byte range, both the initialization data and the media must include every requested byte. An early end of file is an error, even if the server returns HTTP 200 or 206. When multiple entries use ranges of one URI, the client checks the same strong ETag for those reads. Without a strong ETag, it can download the complete object to a temporary file and take the ranges from that copy.
 
 On that path, for HLS, at least one segment must contain media inside the requested interval. A section that starts at or beyond the end of the playlist fails without fetching a media segment. At an exact segment boundary, `ubit` also keeps the previous segment, if present, for keyframe preroll. WebM and raw MP3, Opus, FLAC or WAV do not go through the MP4 trimmer: `ubit` saves the whole file over plain HTTP, or the selected segments over HLS.
 

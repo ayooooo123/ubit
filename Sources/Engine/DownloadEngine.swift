@@ -673,7 +673,11 @@ public final class DownloadEngine: @unchecked Sendable {
         let context = try MP4Muxer.fragmentContext(initBytes, moov: moov, fileURL: destination)
         for segment in parsed.segments where segment.byteRange.start >= bodyRange.start && segment.byteRange.end <= bodyRange.end {
             let local = ByteRange(start: segment.byteRange.start - bodyRange.start, end: segment.byteRange.end - bodyRange.start)
-            guard MP4Muxer.indexReferenceContainsMedia(in: bodyBytes, range: local, segment: segment, context: context) else { throw HTTPError.rangeUnsupported }
+            switch MP4Muxer.validateReference(in: bodyBytes, range: local, segment: segment, context: context) {
+            case .valid: break
+            case .invalid: throw HTTPError.rangeUnsupported
+            case .needsWholeFile: return .wholeFile(lastIndexedByte: last.byteRange.end)
+            }
         }
         var combined = Data(capacity: initBytes.count + bodyBytes.count)
         combined.append(initBytes)

@@ -283,7 +283,8 @@ public struct YouTubeExtractor: SiteExtractor {
             if isChallenge(text) && (instruction.hasPrefix("verify your age") || instruction.hasPrefix("verify your identity")
                 || instruction.hasPrefix("confirm your age") || (instruction.hasPrefix("confirm ") && instruction.contains("not a bot"))
                 || text.contains("playback is blocked") || text.contains("until verification is complete")
-                || text.contains("sign in to confirm") || text.contains("detected unusual traffic")) {
+                || text.contains("sign in to confirm") || text.contains("detected unusual traffic")
+                || text == "unusual traffic" || text == "not a bot") {
                 throw ExtractorError.botGate("YouTube")
             }
         }
@@ -291,7 +292,7 @@ public struct YouTubeExtractor: SiteExtractor {
             try checkPlaybackDecision(response)
             return response
         }
-        if isChallenge(html) { throw ExtractorError.botGate("YouTube") }
+        // Missing player metadata is not itself a playback decision.
         return nil
     }
 

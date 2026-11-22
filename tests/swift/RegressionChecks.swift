@@ -114,6 +114,26 @@ final class FixtureProtocol: URLProtocol {
             status = 403
         case ("metadata.invalid", _), ("sponsor.ajay.app", _):
             status = 403
+        case ("media.invalid", "/live-editions.m3u8"):
+            let seq = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            let segment = seq == 0 ? "#EXT-X-BYTERANGE:2@0\npack.ts" : (seq == 1 ? "other.ts" : "#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST")
+            data = Data("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:\(seq)\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n\(segment)\n".utf8)
+        case ("media.invalid", "/other.ts"): data = Data("xx".utf8)
+        case ("media.invalid", "/editions.m3u8"):
+            data = Data("#EXTM3U\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@0\npack.ts\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/pack.ts"):
+            let changed = range == "bytes=2-3" || (mode == "hls-live-changed" && Self.lock.withLock {
+                Self.seen.contains { $0.url.path == url.path && $0.range == nil }
+            })
+            let edition = Data((changed ? "BBBB" : "AAAA").utf8)
+            if mode != "hls-untagged-edition" && !mode.hasPrefix("hls-live-") { headers["ETag"] = changed ? "\"B\"" : "\"A\"" }
+            if let range {
+                let bounds = range.dropFirst(6).split(separator: "-").compactMap { Int($0) }
+                guard bounds.count == 2 else { status = 400; break }
+                status = 206
+                headers["Content-Range"] = "bytes \(bounds[0])-\(bounds[1])/4"
+                data = edition.subdata(in: bounds[0]..<(bounds[1]+1))
+            } else { data = edition }
         case ("media.invalid", "/parallel.bin"):
             if mode == "parallel-unvalidated", range == nil { data = Self.parallelBytes; break }
             if mode != "parallel-unvalidated" { headers["ETag"] = "\"stable-fixture\"" }
@@ -177,8 +197,8 @@ final class FixtureProtocol: URLProtocol {
                 switch mode {
                 case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age":
                     data = Self.wallPage(player: player, mode: mode)
-                case "watch-inert-text":
-                    data = Self.inertTextPage(player: player, visitor: visitor)
+                case "watch-inert-text", "watch-lesson-no-state":
+                    data = Self.inertTextPage(player: mode == "watch-lesson-no-state" ? nil : player, visitor: visitor)
                 default:
                     data = Self.watchPage(player: player, visitor: visitor)
                 }
@@ -712,7 +732,7 @@ struct RegressionChecks {
             let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
             check(closedByBotGate(error) && paths == ["/watch"] && savedOutputs().isEmpty,
                   "a visible verification notice stops after the first response, even when the page embeds ordinary player metadata; error=\(String(describing: error)), paths=\(paths), saved=\(savedOutputs())")
-        case "watch-inert-text":
+        case "watch-inert-text", "watch-lesson-no-state":
             let (file, error) = await download(audioExt: "webm")
             let bytes = file.flatMap { try? Data(contentsOf: $0) }
             let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
@@ -1172,6 +1192,13 @@ struct RegressionChecks {
             if mode == "trim-keyframe" {
                 let got = samples(scale: 1, ticks: 1, count: 12, group: 4, base: 0, start: 7.9995, end: 7.9999)
                 check(got == [4, 5, 6, 7], "a section before a sync frame uses the preceding keyframe: \(got)")
+                let vfr = MP4Track(trackID: 1, kind: .video, timescale: 10, stsdPayload: Data(), samples: [
+                    MP4Sample(offset: 0, size: 1, duration: 1, isSync: true),
+                    MP4Sample(offset: 1, size: 1, duration: 3, ctsOffset: 2, isSync: false),
+                    MP4Sample(offset: 2, size: 1, duration: 1, isSync: true),
+                ])
+                let cut = MP4Muxer.trimTracks([vfr], section: SectionRange(start: 0.4, end: 0.5))
+                check(cut.first?.samples.map(\.offset) == [2], "the preceding picture ends at the next displayed sync picture, not at its decode duration")
                 return
             }
             for (end, frames) in [(1.701699, 21), (1.7017, 21), (1.701701, 22)] {
@@ -1271,6 +1298,26 @@ struct RegressionChecks {
             try await transfer("allowed")
             let bytes = try Data(contentsOf: file)
             check(String(decoding: bytes, as: UTF8.self) == "/allowed/piece-1.m4s/allowed/piece-2.m4s/allowed/piece-3.m4s", "a later operation assembles only its own three segments")
+        case "hls-live-stable", "hls-live-changed":
+            let file = AppPaths.appSupportDir.appendingPathComponent("live.ts")
+            // The CLI creates the output folder before a live recording starts.
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            var rejected = false
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/live-editions.m3u8", destination: file)
+            } catch HTTPError.rangeUnsupported { rejected = true }
+            let saved = try? Data(contentsOf: file)
+            check(mode == "hls-live-changed" ? rejected && saved == nil : saved == Data("AAxxAA".utf8),
+                  "a returning untagged URI contributes the original bytes or stops the recording")
+        case "hls-changed-edition", "hls-untagged-edition":
+            let file = AppPaths.appSupportDir.appendingPathComponent("clip.ts")
+            var rejected = false
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/editions.m3u8", destination: file, connections: 2)
+            } catch HTTPError.rangeUnsupported { rejected = true }
+            let saved = try? Data(contentsOf: file)
+            check(mode == "hls-changed-edition" ? rejected && saved == nil : saved == Data("AAAA".utf8),
+                  "two playlist ranges must not publish bytes from different editions")
         case "hls-short-range":
             let folder = AppPaths.appSupportDir.appendingPathComponent("out")
             var options = DownloadRequestOptions()

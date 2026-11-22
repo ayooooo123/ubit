@@ -1,5 +1,6 @@
 import Foundation
 import CommonCrypto
+import CryptoKit
 
 public struct HLSVals {
     public struct Segment: Sendable {
@@ -253,12 +254,47 @@ public enum HLSEngine {
         )
     }
 
-    /// Unlike a probe, a playlist byte range describes the complete resource to append.
-    private static func fetchPart(_ url: String, range: ByteRange?, client: HTTPClient, headers: [String: String]?) async throws -> Data {
-        guard let range else { return try await client.fetchData(url: url, headers: headers).0 }
-        let bytes = try await client.fetchRangeBytes(url: url, range: range, headers: headers)
-        guard !bytes.isEmpty, Int64(bytes.count - 1) == range.end - range.start else { throw HTTPError.rangeUnsupported }
-        return bytes
+    /// Multiple playlist entries for one URI must read one edition of the object.
+    private enum RangeSource: Sendable {
+        case tagged(String)
+        case snapshot(Data)
+
+        static func open(_ url: String, client: HTTPClient, headers: [String: String]?) async throws -> Self {
+            if let tag = try await client.probeRemote(url: url, headers: headers).etag { return .tagged(tag) }
+            return .snapshot(try await snapshotOf(url, client: client, headers: headers))
+        }
+
+        static func snapshotOf(_ url: String, client: HTTPClient, headers: [String: String]?) async throws -> Data {
+            // The origin cannot validate separate reads. Stream one response to disk, then
+            // map it so that we do not hold a potentially large copy on the Swift heap.
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+            let file = dir.appendingPathComponent("object")
+            defer { try? FileManager.default.removeItem(at: dir) }
+            try await client.downloadFile(url: url, destination: file, headers: headers, connections: 1)
+            return try Data(contentsOf: file, options: .alwaysMapped)
+        }
+    }
+
+    private static func fetchPart(_ url: String, range: ByteRange?, client: HTTPClient, headers: [String: String]?, source: RangeSource? = nil) async throws -> Data {
+        var tag: String?
+        switch source {
+        case .snapshot(let data):
+            guard let range else { return data }
+            guard range.start >= 0, range.end >= range.start, range.end < Int64(data.count) else { throw HTTPError.rangeUnsupported }
+            return data.subdata(in: Int(range.start)..<(Int(range.end) + 1))
+        case .tagged(let value): tag = value
+        case nil: break
+        }
+        if let range {
+            let bytes = try await client.fetchRange(url: url, range: range, headers: headers, matchingTag: tag).data
+            guard !bytes.isEmpty, Int64(bytes.count - 1) == range.end - range.start else { throw HTTPError.rangeUnsupported }
+            return bytes
+        }
+        var fields = headers ?? [:]
+        if let tag { fields["If-Match"] = tag }
+        let (data, response) = try await client.fetchData(url: url, headers: fields)
+        if let tag, response.value(forHTTPHeaderField: "ETag") != tag { throw HTTPError.rangeUnsupported }
+        return data
     }
 
     private static func hexDecode(_ hex: String) -> Data? {
@@ -389,10 +425,31 @@ public enum HLSEngine {
         try FileManager.default.createDirectory(at: segWorkDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: segWorkDir) }
 
+        // Ordinary multi-file playlists need no version table. Only pin a URI that
+        // is used more than once and that contributes at least one byte range.
+        var shared = Set<String>()
+        if pl.initByteRange != nil || selected.contains(where: { $0.byteRange != nil }) {
+            var seen = Set<String>(), repeated = Set<String>(), ranged = Set<String>()
+            if let url = pl.initURL {
+                seen.insert(url)
+                if pl.initByteRange != nil { ranged.insert(url) }
+            }
+            for seg in selected {
+                if !seen.insert(seg.url).inserted { repeated.insert(seg.url) }
+                if seg.byteRange != nil { ranged.insert(seg.url) }
+            }
+            shared = repeated.intersection(ranged)
+        }
+        var sources: [String: RangeSource] = [:]
         var initData: Data?
         if let initU = pl.initURL {
-            initData = try await fetchPart(initU, range: pl.initByteRange, client: client, headers: headers)
+            if shared.remove(initU) != nil {
+                sources[initU] = try await RangeSource.open(initU, client: client, headers: headers)
+            }
+            initData = try await fetchPart(initU, range: pl.initByteRange, client: client, headers: headers, source: sources[initU])
         }
+        for url in shared { sources[url] = try await RangeSource.open(url, client: client, headers: headers) }
+        let pinned = sources
 
         actor KeyStore {
             var cache: [String: Data] = [:]
@@ -443,7 +500,7 @@ public enum HLSEngine {
                         try Task.checkCancellation()
                         let seg = selected[pos]
                         let segFile = segWorkDir.appendingPathComponent(String(format: "%06d.seg", pos))
-                        var raw = try await fetchPart(seg.url, range: seg.byteRange, client: client, headers: headers)
+                        var raw = try await fetchPart(seg.url, range: seg.byteRange, client: client, headers: headers, source: pinned[seg.url])
                         if let kurl = seg.keyURL {
                             try Task.checkCancellation()
                             let key = try await keyStore.get(kurl, client: client, headers: headers)
@@ -510,6 +567,21 @@ public enum HLSEngine {
         var recordedSec: Double = 0
         var keyCache: [String: Data] = [:]
 
+        var liveSources: [String: RangeSource] = [:]
+        var retired: [String: SHA256.Digest] = [:]
+        func livePart(_ url: String, range: ByteRange?) async throws -> Data {
+            if let digest = retired[url] {
+                // A previously untagged URI returned to the live window. Compare one
+                // complete response rather than append bytes from a different edition.
+                let fresh = try await RangeSource.snapshotOf(url, client: client, headers: headers)
+                guard SHA256.hash(data: fresh) == digest else { throw HTTPError.rangeUnsupported }
+                liveSources[url] = .snapshot(fresh)
+                retired.removeValue(forKey: url)
+            } else if range != nil && liveSources[url] == nil {
+                liveSources[url] = try await RangeSource.open(url, client: client, headers: headers)
+            }
+            return try await fetchPart(url, range: range, client: client, headers: headers, source: liveSources[url])
+        }
         var currentPL = initialPlaylist
         var firstIteration = true
 
@@ -517,11 +589,21 @@ public enum HLSEngine {
             if !firstIteration {
                 let (txt, u) = try await client.fetchText(url: playlistURL, headers: headers)
                 currentPL = parseMediaPlaylist(txt, baseURL: u)
+                if !liveSources.isEmpty {
+                    var active = Set(currentPL.segments.map(\.url))
+                    if let url = currentPL.initURL { active.insert(url) }
+                    for (url, source) in liveSources where !active.contains(url) {
+                        if case .snapshot(let bytes) = source {
+                            retired[url] = SHA256.hash(data: bytes)
+                            liveSources.removeValue(forKey: url)
+                        }
+                    }
+                }
             }
             firstIteration = false
 
             if !wroteInit, let initU = currentPL.initURL {
-                let d = try await fetchPart(initU, range: currentPL.initByteRange, client: client, headers: headers)
+                let d = try await livePart(initU, range: currentPL.initByteRange)
                 try fh.write(contentsOf: d)
                 recordedBytes += Int64(d.count)
                 wroteInit = true
@@ -532,7 +614,7 @@ public enum HLSEngine {
             for seg in candidates {
                 if shouldStop?() == true || Task.isCancelled { break }
                 if !seenSeq.insert(seg.mediaSequence).inserted { continue }
-                var d = try await fetchPart(seg.url, range: seg.byteRange, client: client, headers: headers)
+                var d = try await livePart(seg.url, range: seg.byteRange)
                 if let kurl = seg.keyURL {
                     let key: Data
                     if let cached = keyCache[kurl] { key = cached }

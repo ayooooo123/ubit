@@ -34,7 +34,7 @@ VIDEO_PATH="$(ubit get -q 720 --no-library --quiet -o /tmp/work 'https://www.you
 ```
 
 ### Pattern B: Fast Byte-Range Clip Extraction (`--section`) for Multimodal / VLM Inspection
-When an agent only needs to inspect or verify a specific timestamp window (e.g., `1:15` to `1:30` of a 2-hour video), `--section` reads the remote MP4 `sidx` Segment Index in the first 64 KB and fetches **only** the `init` box plus the overlapping byte ranges, cutting cleanly on the preceding sync keyframe:
+When an agent only needs to inspect or verify a specific timestamp window (e.g., `1:15` to `1:30` of a 2-hour video), `--section` cuts on the preceding sync keyframe. The transfer is small only when the stream allows it: for an MP4 or M4A stream, `ubit` reads the `sidx` Segment Index in the first 64 KB and fetches only the `init` box plus the overlapping byte ranges; for HLS it fetches only the overlapping segments. When the stream has no `sidx` index, is DASH, or falls back to YouTube UMP, the whole stream is downloaded and then trimmed:
 
 ```sh
 ubit get -q 720 --section 1:15-1:30 --no-library --quiet -o /tmp/clips "$URL"

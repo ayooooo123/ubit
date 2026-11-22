@@ -48,7 +48,7 @@ Every command supports `--json`, and `ubit --llms` prints the complete machine-r
 ```sh
 ubit --llms                                                    # full agent CLI + NDJSON schema
 ubit info --json "https://www.youtube.com/watch?v=aqz-KE-bpKQ" # probe formats, subs, chapters
-ubit get -q 720 --section 0:30-1:00 --no-library --quiet <url> # fetch 30s keyframe clip via sidx byte ranges
+ubit get -q 720 --section 0:30-1:00 --no-library --quiet <url> # 30s keyframe clip; sidx byte ranges when the stream has an index
 ubit get -a --to wav --no-library --quiet <url>                # zero-FFmpeg 16-bit 44.1 kHz PCM WAV for ASR
 ubit get --json <url>                                          # stream NDJSON events: start, info, progress, process, done
 ```
@@ -85,7 +85,7 @@ ubit browse <url>                       # open in the WebKit media-sniffer brows
 - **Pure-Swift ISO-BMFF & MPEG-TS Muxer (`Sources/Mux/MP4Box.swift`, `TSDemuxer.swift`)**:
   - Reads progressive MP4 (`stbl`), fragmented DASH/HLS fMP4 (`moof`/`traf`/`trun`), and 188-byte MPEG-TS (`PAT`/`PMT`/`PES` H.264 Annex-B + ADTS AAC).
   - Writes fast-start (`moov` before `mdat`) MP4 and M4A containers with `tx3g` timed-text subtitles, QuickTime `chap` + Nero `chpl` chapters, iTunes metadata (`©nam`, `©ART`, `©day`, `©cmt`, `desc`, `covr` JPEG cover art), and macOS Finder `com.apple.metadata:kMDItemWhereFroms`.
-  - Uses `sidx` Segment Index boxes so `--section start-end` fetches only the `init` box and overlapping segment byte ranges.
+  - Uses `sidx` Segment Index boxes so `--section start-end` fetches only the `init` box and overlapping segment byte ranges of an indexed MP4/M4A stream (HLS fetches only the overlapping segments). Other streams are downloaded whole and then trimmed.
 - **Built-in Media-Sniffer Browser (`Sources/UI/BrowserWindow.swift`)**: `WKWebView` (`⌘B`) with document-start `fetch` / `XMLHttpRequest` / `<video>` inspection across all frames, `WKContentRuleList` ad/tracker blocking, and automatic cookie export to `~/Library/Application Support/uBit/cookies.txt`.
 
 ## Build from Source

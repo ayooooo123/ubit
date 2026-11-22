@@ -496,7 +496,9 @@ public final class HTTPClient: @unchecked Sendable {
 
         // Hash the URL: a signed query string must not be stored in a resume file.
         let resource = Data(SHA256.hash(data: Data(url.utf8)))
-        guard let total = totalSize, total > 512 * 1024, probe.acceptsRanges, connections > 1 else {
+        // Separate range replies can describe different bytes at the same URL and length.
+        guard let total = totalSize, total > 512 * 1024, probe.acceptsRanges, connections > 1,
+              let tag = probe.etag else {
             do {
                 try await singleStreamDownload(
                     url: url,
@@ -523,7 +525,7 @@ public final class HTTPClient: @unchecked Sendable {
            let stateData = try? Data(contentsOf: stateURL),
            let saved = try? JSONDecoder().decode(ChunkStateFile.self, from: stateData),
            Self.isValidResumeState(saved, total: total),
-           saved.resourceDigest == resource, probe.etag != nil, saved.etag == probe.etag {
+           saved.resourceDigest == resource, saved.etag == tag {
             chunkState = saved
         } else {
             try? FileManager.default.removeItem(at: stateURL)
@@ -551,7 +553,7 @@ public final class HTTPClient: @unchecked Sendable {
         defer { close(fd) }
 
         var rangeHeaders = headers ?? [:]
-        rangeHeaders["If-Range"] = probe.etag
+        rangeHeaders["If-Range"] = tag
         let workerHeaders = rangeHeaders
         let numWorkers = max(1, min(32, connections))
         let workQueue = WorkStealingQueue(state: chunkState, stateURL: stateURL, initialSplits: numWorkers * 2)
@@ -660,6 +662,7 @@ public final class HTTPClient: @unchecked Sendable {
                     throw HTTPError.status(http.statusCode, url)
                 }
                 guard http.statusCode == 206,
+                      http.value(forHTTPHeaderField: "ETag") == nil || Self.strongTag(http) == hdrs["If-Range"],
                       let value = http.value(forHTTPHeaderField: "Content-Range"),
                       let content = Self.parseContentRange(value),
                       content.first == curStart,

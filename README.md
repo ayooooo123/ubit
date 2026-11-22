@@ -87,7 +87,7 @@ ubit browse <url>                       # open in the WebKit media-sniffer brows
 
 ## Engine Highlights
 
-- **Dynamic Work-Stealing Range Downloader (`Sources/Engine/HTTPClient.swift`)**: Splits files across up to 32 parallel HTTP `Range` connections, saves completed ranges in `.part.json` and resumes a `.part` file only when the same URL still has the same strong ETag, and dynamically bisects the slowest worker's remaining byte span when fast workers finish early.
+- **Dynamic Work-Stealing Range Downloader (`Sources/Engine/HTTPClient.swift`)**: Uses one connection when there is no strong ETag. Otherwise it can split a file across up to 32 conditional HTTP `Range` connections. It saves completed ranges in `.part.json` and resumes a `.part` file only when the same URL still has the same strong ETag, and dynamically bisects the slowest worker's remaining byte span when fast workers finish early.
 - **Pure-Swift ISO-BMFF & MPEG-TS Muxer (`Sources/Mux/MP4Box.swift`, `TSDemuxer.swift`)**:
   - Reads progressive MP4 (`stbl`), fragmented DASH/HLS fMP4 (`moof`/`traf`/`trun`), and 188-byte MPEG-TS (`PAT`/`PMT`/`PES` H.264 Annex-B + ADTS AAC).
   - Writes fast-start (`moov` before `mdat`) MP4 and M4A containers with `tx3g` timed-text subtitles, QuickTime `chap` + Nero `chpl` chapters, iTunes metadata (`©nam`, `©ART`, `©day`, `©cmt`, `desc`, `covr` JPEG cover art), and macOS Finder `com.apple.metadata:kMDItemWhereFroms`.

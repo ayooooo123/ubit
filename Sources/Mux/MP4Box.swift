@@ -242,6 +242,7 @@ public struct SidxSegment: Sendable {
     public var endTimeSec: Double
     /// Start presentation time in the `sidx` timescale, kept exactly for trimming.
     public var startTicks: UInt64
+    var endTicks: UInt64
     public var timescale: UInt32
 }
 
@@ -314,39 +315,49 @@ public enum MP4Muxer {
         let boxes = listBoxes(in: data, from: Int(range.start), to: end)
         guard boxes.last?.endOffset == end else { return false }
         let payloads = boxes.filter { $0.type == "mdat" && $0.payloadSize > 0 }
-        var found = false
+        var nextMediaTime: Int64?
         for moof in boxes where moof.type == "moof" {
             var tracks = [segment.trackID: track]
             tracks[segment.trackID]?.samples.removeAll()
             parseMoof(data: data, moof: moof, trexDefaults: context.defaults, sourceIndex: 0, tracks: &tracks)
             guard let samples = tracks[segment.trackID]?.samples, !samples.isEmpty else { return false }
-            var elapsed: Int64 = 0, earliest = Int64.max
+            var elapsed: Int64 = 0, earliest = Int64.max, latest = Int64.min
             for sample in samples {
                 guard sample.size > 0, payloads.contains(where: {
                     sample.offset >= UInt64($0.payloadOffset) && sample.offset <= UInt64($0.endOffset) &&
                         UInt64(sample.size) <= UInt64($0.endOffset) - sample.offset
                 }) else { return false }
-                earliest = min(earliest, elapsed + Int64(sample.ctsOffset))
+                guard sample.duration > 0 else { return false }
+                let pts = elapsed + Int64(sample.ctsOffset)
+                earliest = min(earliest, pts)
+                latest = max(latest, pts + Int64(sample.duration))
                 elapsed += Int64(sample.duration)
             }
-            if !found {
-                for traf in listBoxes(in: data, from: moof.payloadOffset, to: moof.endOffset) where traf.type == "traf" {
-                    let children = listBoxes(in: data, from: traf.payloadOffset, to: traf.endOffset)
-                    guard let tfhd = children.first(where: { $0.type == "tfhd" }), tfhd.payloadSize >= 8,
-                          data.beU32(tfhd.payloadOffset + 4) == segment.trackID else { continue }
-                    guard let tfdt = children.first(where: { $0.type == "tfdt" }) else { return false }
-                    let p = tfdt.payloadOffset
-                    guard tfdt.payloadSize >= 8, data[p] <= 1, data[p] == 0 || tfdt.payloadSize >= 12 else { return false }
-                    let time = data[p] == 0 ? UInt64(data.beU32(p + 4)) : data.beU64(p + 4)
-                    guard let base = Int64(exactly: time) else { return false }
-                    let (pts, overflow) = base.addingReportingOverflow(earliest)
-                    let (start, underflow) = pts.subtractingReportingOverflow(track.editMediaTimeTicks ?? 0)
-                    guard !overflow, !underflow, rescale(UInt64(max(0, start)), from: track.timescale, to: segment.timescale) == segment.startTicks else { return false }
-                }
+            // Validate each fragment, including the tail of a multi-fragment reference.
+            // Do not count padding, or two copies of the same time interval, as coverage.
+            var decodeTime: UInt64?
+            for traf in listBoxes(in: data, from: moof.payloadOffset, to: moof.endOffset) where traf.type == "traf" {
+                let children = listBoxes(in: data, from: traf.payloadOffset, to: traf.endOffset)
+                guard let tfhd = children.first(where: { $0.type == "tfhd" }), tfhd.payloadSize >= 8,
+                      data.beU32(tfhd.payloadOffset + 4) == segment.trackID else { continue }
+                guard decodeTime == nil, let tfdt = children.first(where: { $0.type == "tfdt" }), tfdt.payloadSize >= 8 else { return false }
+                let p = tfdt.payloadOffset
+                guard data[p] <= 1, data[p] == 0 || tfdt.payloadSize >= 12 else { return false }
+                decodeTime = data[p] == 0 ? UInt64(data.beU32(p + 4)) : data.beU64(p + 4)
             }
-            found = true
+            guard let decodeTime, let base = Int64(exactly: decodeTime) else { return false }
+            let (origin, overflow) = base.subtractingReportingOverflow(track.editMediaTimeTicks ?? 0)
+            let (start, startOverflow) = origin.addingReportingOverflow(earliest)
+            let (finish, endOverflow) = origin.addingReportingOverflow(latest)
+            guard !overflow, !startOverflow, !endOverflow, finish > start,
+                  latest - earliest == elapsed else { return false }
+            if let nextMediaTime {
+                guard nextMediaTime == start else { return false }
+            } else if rescale(UInt64(max(0, start)), from: track.timescale, to: segment.timescale) != segment.startTicks { return false }
+            nextMediaTime = finish
         }
-        return found
+        guard let nextMediaTime, nextMediaTime >= 0 else { return false }
+        return rescale(UInt64(nextMediaTime), from: track.timescale, to: segment.timescale) == segment.endTicks
     }
 
     private static func endOfReferences(in headerData: Data, box sidx: MP4BoxRef,
@@ -396,6 +407,7 @@ public enum MP4Muxer {
                     startTimeSec: startSec,
                     endTimeSec: Double(curTicks) / Double(timescale),
                     startTicks: segmentStartTicks,
+                    endTicks: curTicks,
                     timescale: timescale
                 ))
                 curByte += refSize

@@ -115,13 +115,17 @@ final class FixtureProtocol: URLProtocol {
         case ("metadata.invalid", _), ("sponsor.ajay.app", _):
             status = 403
         case ("media.invalid", "/parallel.bin"):
+            if mode == "parallel-unvalidated", range == nil { data = Self.parallelBytes; break }
+            if mode != "parallel-unvalidated" { headers["ETag"] = "\"stable-fixture\"" }
             guard let bounds = range?.dropFirst(6).split(separator: "-"), bounds.count == 2,
                   let low = Int(bounds[0]), let requested = Int(bounds[1]) else { status = 400; break }
             if mode == "parallel-cancel" && requested > 0 { failure = URLError(.cancelled); break }
             let high = mode == "parallel-short" ? min(low + 65_535, requested) : requested
             status = 206
             headers["Content-Range"] = "bytes \(low)-\(high)/\(Self.parallelBytes.count)"
-            data = Self.parallelBytes.subdata(in: low..<(high + 1))
+            if mode == "parallel-unvalidated" && low > 0 {
+                data = Data(repeating: 0, count: high - low + 1)
+            } else { data = Self.parallelBytes.subdata(in: low..<(high + 1)) }
         case ("segments.invalid", let path) where path.hasSuffix(".mpd"):
             data = Data(#"<MPD mediaPresentationDuration="PT3S"><Period><AdaptationSet mimeType="video/mp4"><Representation id="v"><SegmentTemplate duration="1" timescale="1" media="piece-$Number$.m4s"/></Representation></AdaptationSet></Period></MPD>"#.utf8)
         case ("segments.invalid", "/denied/piece-2.m4s"):
@@ -149,7 +153,7 @@ final class FixtureProtocol: URLProtocol {
                     player = Self.challengePlayer(1, title: title)
                 case "watch-wall-text":
                     player = nil
-                case "watch-wall-metadata":
+                case "watch-wall-metadata", "watch-human-notice", "watch-age-notice":
                     player = Self.playerPayload(status: "OK", streaming: Self.directStreaming(1, hls: true), title: title)
                 case "hls-fallback-watchlist":
                     player = Self.hlsOnlyPlayer(title: title)
@@ -171,8 +175,8 @@ final class FixtureProtocol: URLProtocol {
                         "watch-wall-text", "watch-wall-metadata"].contains(mode)
                 let visitor = omitVisitor ? nil : (mode == "visitor-reuse" ? Self.secondVisitor : Self.firstVisitor)
                 switch mode {
-                case "watch-wall-text", "watch-wall-metadata":
-                    data = Self.wallPage(player: player)
+                case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice":
+                    data = Self.wallPage(player: player, mode: mode)
                 case "watch-inert-text":
                     data = Self.inertTextPage(player: player, visitor: visitor)
                 default:
@@ -266,21 +270,27 @@ final class FixtureProtocol: URLProtocol {
             let count = mode == "hls-ntsc" ? 7 : 15
             let segments = (0..<count).map { "#EXTINF:\(duration),\nclip-\($0).m4s" }.joined(separator: "\n")
             data = Data("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"clip-init.mp4\"\n\(segments)\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/short-map.m3u8"), ("media.invalid", "/short-segment.m3u8"):
+            let map = Bytes.clipInit(sampleTicks: 1000).count + 1
+            let segment = Bytes.clipSegment(0).count + 1
+            let mapRange = url.path == "/short-map.m3u8" ? ",BYTERANGE=\"\(map)@0\"" : ""
+            let mediaRange = mapRange.isEmpty ? "#EXT-X-BYTERANGE:\(segment)@0\n" : ""
+            data = Data("#EXTM3U\n#EXT-X-MAP:URI=\"clip-init.mp4\"\(mapRange)\n#EXTINF:4,\n\(mediaRange)clip-0.m4s\n#EXT-X-ENDLIST\n".utf8)
         case ("media.invalid", "/clip-init.mp4"):
             data = Data(Bytes.clipInit(sampleTicks: mode == "hls-decimal" ? 200 : 1000))
         case ("media.invalid", let path) where path.hasPrefix("/clip-"):
             data = Data(Bytes.clipSegment(Int(path.dropFirst(6).dropLast(4)) ?? 0))
-        case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4", "/cut-unknown.mp4", "/cut-later.mp4", "/cut-padding.mp4", "/cut-empty.mp4", "/cut-stale.mp4"].contains(path):
+        case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4", "/cut-unknown.mp4", "/cut-later.mp4", "/cut-padding.mp4", "/cut-empty.mp4", "/cut-stale.mp4", "/cut-duration.mp4"].contains(path):
             var bytes = mode == "sidx-fragments" || path == "/cut-later.mp4" || path == "/cut-padding.mp4" ? Bytes.fragmentIndexedClip : Bytes.indexedClip
             if mode == "sidx-padding" { bytes += Bytes.box("free", Array(repeating: 0, count: 24)) }
-            if path == "/cut-empty.mp4" || path == "/cut-stale.mp4" {
+            if ["/cut-empty.mp4", "/cut-stale.mp4", "/cut-duration.mp4"].contains(path) {
                 let table = MP4Muxer.parseSidx(in: Data(bytes))!.segments
                 let offset = Int(table[1].byteRange.start)
                 if path == "/cut-stale.mp4" {
                     bytes.replaceSubrange(offset..<(offset + Bytes.clipSegment(1).count), with: Bytes.clipSegment(2))
                 } else {
                     let count = bytes[offset...].firstRange(of: Array("trun".utf8))!.upperBound + 4
-                    bytes.replaceSubrange(count..<count + 4, with: Bytes.be32(0))
+                    bytes.replaceSubrange(count..<count + 4, with: Bytes.be32(path == "/cut-duration.mp4" ? 2 : 0))
                 }
             } else if path == "/cut-later.mp4" || path == "/cut-padding.mp4" {
                 let data = Data(bytes)
@@ -405,9 +415,13 @@ final class FixtureProtocol: URLProtocol {
 
     /// A verification wall whose only signal is visible page text. `player` is optional, so one
     /// variant also carries embedded metadata that reports ordinary playback.
-    static func wallPage(player: [String: Any]?) -> Data {
+    static func wallPage(player: [String: Any]?, mode: String) -> Data {
         var html = "<html><head><title>Verification required</title></head><body>"
-        html += "<main>Verify your identity before playback can continue. Playback is blocked.</main>"
+        switch mode {
+        case "watch-human-notice": html += "<h1>Confirm you're not a bot</h1>"
+        case "watch-age-notice": html += "<p>Please verify your age to play this video.</p>"
+        default: html += "<main>Verify your identity before playback can continue. Playback is blocked.</main>"
+        }
         if let player {
             let json = String(data: try! JSONSerialization.data(withJSONObject: player), encoding: .utf8)!
             html += "<script>var ytInitialPlayerResponse = \(json);</script>"
@@ -434,7 +448,7 @@ final class FixtureProtocol: URLProtocol {
         html += "</head><body>"
         html += "<!-- Confirm your age appears only in this comment. -->"
         html += "<script>var notice = \"Verify your identity before playback can continue\";</script>"
-        html += "<main>Fixture player</main></body></html>"
+        html += "<h1>Verify your audio settings</h1></body></html>"
         return Data(html.utf8)
     }
 
@@ -691,7 +705,7 @@ struct RegressionChecks {
             check(closedByBotGate(error) && paths == ["/watch"],
                   "a watch-page bot gate with streaming data stops before visitor and /player; error=\(String(describing: error)), paths=\(paths)")
         // Finding 2: a visible notice outranks embedded metadata; inert text is not a notice.
-        case "watch-wall-text", "watch-wall-metadata":
+        case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice":
             let before = FixtureProtocol.requests().count
             let error = await extractError()
             let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
@@ -1229,7 +1243,7 @@ struct RegressionChecks {
                 let fetched = FixtureProtocol.requests().dropFirst(before).map(\.url.path).filter { $0.hasSuffix(".m4s") }
                 check(samples == expected && fetched == parts, "section \(start)-\(end): samples=\(samples), parts=\(fetched)")
             }
-        case "parallel-cancel", "parallel-short", "parallel-intact":
+        case "parallel-cancel", "parallel-short", "parallel-intact", "parallel-unvalidated":
             let file = AppPaths.appSupportDir.appendingPathComponent("result.bin")
             var failure: Error?
             do {
@@ -1238,7 +1252,7 @@ struct RegressionChecks {
             let ranges = FixtureProtocol.requests().filter { $0.url.path == "/parallel.bin" && $0.range != "bytes=0-0" }.compactMap(\.range)
             let saved = try? Data(contentsOf: file)
             switch mode {
-            case "parallel-intact": check(failure == nil && saved == FixtureProtocol.parallelBytes, "all source bytes are present")
+            case "parallel-intact", "parallel-unvalidated": check(failure == nil && saved == FixtureProtocol.parallelBytes, "all source bytes are present")
             case "parallel-cancel": check((failure as? URLError)?.code == .cancelled && saved == nil && !ranges.isEmpty && Set(ranges).count == ranges.count, "a cancelled range is not retried: \(ranges)")
             default: check(failure != nil && saved == nil && !ranges.isEmpty, "a short range cannot publish a preallocated file")
             }
@@ -1256,6 +1270,19 @@ struct RegressionChecks {
             try await transfer("allowed")
             let bytes = try Data(contentsOf: file)
             check(String(decoding: bytes, as: UTF8.self) == "/allowed/piece-1.m4s/allowed/piece-2.m4s/allowed/piece-3.m4s", "a later operation assembles only its own three segments")
+        case "hls-short-range":
+            let folder = AppPaths.appSupportDir.appendingPathComponent("out")
+            var options = DownloadRequestOptions()
+            options.outputDir = folder.path
+            options.cookieSource = "none"
+            for path in ["short-map", "short-segment"] {
+                do {
+                    _ = try await DownloadEngine().downloadSingle(url: "https://media.invalid/\(path).m3u8", settings: Settings(), options: options)
+                    check(false, "an incomplete HLS range must not publish a clip")
+                } catch HTTPError.rangeUnsupported {}
+            }
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+            check(names.isEmpty, "a short segment or map leaves no media or temporary files: \(names)")
         case "sidx-cut":
             var settings = Settings()
             settings.embedMetadata = false
@@ -1266,7 +1293,7 @@ struct RegressionChecks {
             options.cookieSource = "none"
             let out = AppPaths.appSupportDir.appendingPathComponent("out")
             options.outputDir = out.path
-            let scenarios: [(String, Double?)] = [("200", 10), ("206", 10), ("206", 61), ("unknown", 61), ("unknown", nil), ("later", 12), ("padding", 12), ("empty", 8), ("stale", 8)]
+            let scenarios: [(String, Double?)] = [("200", 10), ("206", 10), ("206", 61), ("unknown", 61), ("unknown", nil), ("later", 12), ("padding", 12), ("empty", 8), ("stale", 8), ("duration", 8)]
             for (status, end) in scenarios {
                 options.section = SectionRange(start: start, end: end)
                 do {

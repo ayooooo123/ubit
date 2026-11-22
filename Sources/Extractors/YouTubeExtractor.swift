@@ -279,7 +279,9 @@ public struct YouTubeExtractor: SiteExtractor {
                 let nodes = try block.nodes(forXPath: ".//text()[not(ancestor::*[local-name()='script' or local-name()='style' or local-name()='template'])]")
                 let text = nodes.compactMap(\.stringValue).joined(separator: " ").lowercased()
                     .split(whereSeparator: \.isWhitespace).joined(separator: " ")
-                if isChallenge(text) && (text.hasPrefix("verify your") || text.hasPrefix("confirm your age")
+                let instruction = text.hasPrefix("please ") ? String(text.dropFirst(7)) : text
+                if isChallenge(text) && (instruction.hasPrefix("verify your age") || instruction.hasPrefix("verify your identity")
+                    || instruction.hasPrefix("confirm your age") || (instruction.hasPrefix("confirm ") && instruction.contains("not a bot"))
                     || text.contains("playback is blocked") || text.contains("until verification is complete")
                     || text.contains("sign in to confirm") || text.contains("detected unusual traffic")) {
                     throw ExtractorError.botGate("YouTube")

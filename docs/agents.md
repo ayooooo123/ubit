@@ -42,9 +42,11 @@ On the native macOS Swift CLI, `ubit` trims tracks on the native MP4 path before
 
 On the native macOS Swift CLI, for indexed MP4/M4A input, `ubit` requests the start of the file through the index (at least 32 KiB, or 64 KiB if the position is unknown). It takes the initialization data from that response and requests the overlapping media bytes. If a section extends beyond the index, `ubit` checks whether further media can follow. When the references reach the known file end or leave only a single recognized random-access or padding box, it needs no further media bytes to reject a section outside the stream. Otherwise it can fetch the whole file, for example to trim a later fragment. The downloaded file must contain the bytes that the index references, even when the first response did not give the total file size. Without a usable index, or for DASH, the transfer can also include the whole stream. If the server ignores byte ranges, it can send the whole file for each request.
 
-For an indexed MP4 or M4A clip, each selected reference must contain a media fragment, not just padding. If the client downloads the whole file, it checks every top-level segment index, including those after the requested clip. A reference to padding or missing bytes causes the command to fail without saving the clip.
+For an indexed MP4 or M4A clip, the selected samples must cover the interval that each index reference declares. Padding cannot stand in for the second half of a reference. If the client downloads the whole file, it checks every top-level segment index, including those after the requested clip. A reference to padding or missing bytes causes the command to fail without saving the clip.
 
 The Swift muxer can copy or shorten a track with a single normal-speed edit. A frame that the player needs for decoding can remain in the file without being displayed. Reopening the clip does not extend its displayed interval. The muxer rejects multiple edits and nonstandard playback rates rather than silently changing their timeline.
+
+For an explicit HLS byte range, both the initialization data and the media must include every requested byte. An early end of file is an error, even if the server returns HTTP 200 or 206.
 
 On that path, for HLS, at least one segment must contain media inside the requested interval. A section that starts at or beyond the end of the playlist fails without fetching a media segment. At an exact segment boundary, `ubit` also keeps the previous segment, if present, for keyframe preroll. WebM and raw MP3, Opus, FLAC or WAV do not go through the MP4 trimmer: `ubit` saves the whole file over plain HTTP, or the selected segments over HLS.
 
@@ -122,7 +124,7 @@ When `--json` is passed to `ubit get`, `stdout` emits strictly valid newline-del
 | `0` | All URLs succeeded | Read output path from `done.path` or `--quiet` stdout |
 | `1` | Extraction, auth, DRM, network, provider refusal, or challenge error | Inspect `error`. A provider refusal or challenge is terminal for that URL: do not retry with another identity or route. For ordinary auth-gated content, pass `--cookies` / `--cookies-from-browser firefox` or ask the user to sign in via `ubit browse <url>` |
 | `2` | Invalid CLI usage / flag syntax | Fix invocation flags (check `ubit get --help`) |
-| `130` | Interrupted (`SIGINT`) | Run the same command again. The Swift client resumes HTTP media only when the URL and its strong ETag match the saved partial file. Otherwise it starts from byte zero. |
+| `130` | Interrupted (`SIGINT`) | Run the same command again. The Swift client resumes HTTP media only when the URL and its strong ETag match the saved partial file. Otherwise it starts from byte zero. Without a strong ETag it also uses one HTTP connection, even when `--connections` is larger. |
 
 ---
 

@@ -253,6 +253,14 @@ public enum HLSEngine {
         )
     }
 
+    /// Unlike a probe, a playlist byte range describes the complete resource to append.
+    private static func fetchPart(_ url: String, range: ByteRange?, client: HTTPClient, headers: [String: String]?) async throws -> Data {
+        guard let range else { return try await client.fetchData(url: url, headers: headers).0 }
+        let bytes = try await client.fetchRangeBytes(url: url, range: range, headers: headers)
+        guard !bytes.isEmpty, Int64(bytes.count - 1) == range.end - range.start else { throw HTTPError.rangeUnsupported }
+        return bytes
+    }
+
     private static func hexDecode(_ hex: String) -> Data? {
         var padded = hex
         if padded.count % 2 != 0 { padded = "0" + padded }
@@ -383,11 +391,7 @@ public enum HLSEngine {
 
         var initData: Data?
         if let initU = pl.initURL {
-            if let br = pl.initByteRange {
-                initData = try await client.fetchRangeBytes(url: initU, range: br, headers: headers)
-            } else {
-                initData = try await client.fetchData(url: initU, headers: headers).0
-            }
+            initData = try await fetchPart(initU, range: pl.initByteRange, client: client, headers: headers)
         }
 
         actor KeyStore {
@@ -439,12 +443,7 @@ public enum HLSEngine {
                         try Task.checkCancellation()
                         let seg = selected[pos]
                         let segFile = segWorkDir.appendingPathComponent(String(format: "%06d.seg", pos))
-                        var raw: Data
-                        if let br = seg.byteRange {
-                            raw = try await client.fetchRangeBytes(url: seg.url, range: br, headers: headers)
-                        } else {
-                            raw = try await client.fetchData(url: seg.url, headers: headers).0
-                        }
+                        var raw = try await fetchPart(seg.url, range: seg.byteRange, client: client, headers: headers)
                         if let kurl = seg.keyURL {
                             try Task.checkCancellation()
                             let key = try await keyStore.get(kurl, client: client, headers: headers)
@@ -522,7 +521,7 @@ public enum HLSEngine {
             firstIteration = false
 
             if !wroteInit, let initU = currentPL.initURL {
-                let d = try await client.fetchData(url: initU, headers: headers).0
+                let d = try await fetchPart(initU, range: currentPL.initByteRange, client: client, headers: headers)
                 try fh.write(contentsOf: d)
                 recordedBytes += Int64(d.count)
                 wroteInit = true
@@ -533,7 +532,7 @@ public enum HLSEngine {
             for seg in candidates {
                 if shouldStop?() == true || Task.isCancelled { break }
                 if !seenSeq.insert(seg.mediaSequence).inserted { continue }
-                var d = try await client.fetchData(url: seg.url, headers: headers).0
+                var d = try await fetchPart(seg.url, range: seg.byteRange, client: client, headers: headers)
                 if let kurl = seg.keyURL {
                     let key: Data
                     if let cached = keyCache[kurl] { key = cached }

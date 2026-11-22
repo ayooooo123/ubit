@@ -421,6 +421,8 @@ public final class DownloadEngine: @unchecked Sendable {
                         mp4 = try await UMP.pull(mediaURL: fmt.url, userAgent: ua, expectedSize: fmt.filesize, client: client)
                     } catch is CancellationError {
                         throw CancellationError()
+                    } catch let error as URLError where error.code == .cancelled {
+                        throw error
                     } catch {
                         throw HTTPError.staleLink(refusal)
                     }
@@ -656,10 +658,12 @@ public final class DownloadEngine: @unchecked Sendable {
 
         let reqStart = section.start ?? 0
         let reqEnd = section.end ?? .infinity
-        let matching = parsed.segments.filter { seg in
-            (seg.startTimeSec + seg.durationSec) > reqStart && seg.startTimeSec < reqEnd
+        let overlaps: (SidxSegment) -> Bool = { $0.endTimeSec > reqStart && $0.startTimeSec < reqEnd }
+        guard let firstSeg = parsed.segments.first(where: overlaps),
+              let lastSeg = parsed.segments.last(where: overlaps) else {
+            throw NSError(domain: "DownloadEngine", code: 1, userInfo: [NSLocalizedDescriptionKey:
+                "The --section range is outside the stream"])
         }
-        guard let firstSeg = matching.first, let lastSeg = matching.last else { return nil }
 
         let initBytes = head.prefix(Int(parsed.initEndOffset + 1))
         let bodyRange = ByteRange(start: firstSeg.byteRange.start, end: lastSeg.byteRange.end)

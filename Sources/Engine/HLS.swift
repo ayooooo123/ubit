@@ -5,7 +5,8 @@ public struct HLSVals {
     public struct Segment: Sendable {
         public var index: Int
         public var url: String
-        public var duration: Double
+        fileprivate var playlistDuration: Decimal
+        public var duration: Double { (playlistDuration as NSDecimalNumber).doubleValue }
         public var byteRange: ByteRange?
         public var keyURL: String?
         public var iv: Data?
@@ -186,7 +187,7 @@ public enum HLSEngine {
         var initURL: String?
         var initByteRange: ByteRange?
         var segments: [HLSVals.Segment] = []
-        var curDur: Double = 0
+        var curDur: Decimal = 0
         var curRange: ByteRange?
         var prevRangeEnd: Int64 = 0
         var curKeyURL: String?
@@ -226,13 +227,13 @@ public enum HLSEngine {
             } else if line.hasPrefix("#EXTINF:") {
                 let body = line.dropFirst("#EXTINF:".count)
                 let comma = body.firstIndex(of: ",") ?? body.endIndex
-                curDur = Double(body[..<comma]) ?? 0
+                curDur = Decimal(string: String(body[..<comma]), locale: Locale(identifier: "en_US_POSIX")) ?? 0
             } else if !line.hasPrefix("#") {
                 let segSeq = mediaSeq + UInt64(segments.count)
                 segments.append(HLSVals.Segment(
                     index: segments.count,
                     url: resolve(line, base: baseURL),
-                    duration: curDur,
+                    playlistDuration: curDur,
                     byteRange: curRange,
                     keyURL: curKeyURL,
                     iv: curIV,
@@ -343,12 +344,17 @@ public enum HLSEngine {
         if let sec = section {
             let start = sec.start ?? 0
             let end = sec.end ?? .infinity
-            var acc: Double = 0
+            // Accumulate EXTINF in its original decimal units. Convert each boundary
+            // only once, rather than adding already rounded binary durations.
+            var elapsed: Decimal = 0
+            var segEnd = 0.0
+            var previousStart = 0.0
             var filtered: [HLSVals.Segment] = []
             for (index, seg) in pl.segments.enumerated() {
-                let segStart = acc
-                let segEnd = acc + seg.duration
-                acc = segEnd
+                let segStart = segEnd
+                elapsed += seg.playlistDuration
+                segEnd = (elapsed as NSDecimalNumber).doubleValue
+                defer { previousStart = segStart }
                 if segStart >= end { break }
                 guard max(start, segStart) < min(end, segEnd) else { continue }
                 if filtered.isEmpty {
@@ -356,9 +362,8 @@ public enum HLSEngine {
                     // Keep the previous segment for keyframe preroll at an exact boundary,
                     // but only after finding a segment with media inside the section.
                     if segStart == start, index > 0 {
-                        let previous = pl.segments[index - 1]
-                        filtered.append(previous)
-                        startTime -= previous.duration
+                        filtered.append(pl.segments[index - 1])
+                        startTime = previousStart
                     }
                 }
                 filtered.append(seg)

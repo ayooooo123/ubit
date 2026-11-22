@@ -304,6 +304,8 @@ public final class HTTPClient: @unchecked Sendable {
                 throw HTTPError.status(http.statusCode, url)
             } catch is CancellationError {
                 throw CancellationError()
+            } catch let error as URLError where error.code == .cancelled {
+                throw error
             } catch {
                 lastErr = error
                 if attempt + 1 < retries, (error as? URLError) != nil {

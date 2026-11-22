@@ -144,7 +144,9 @@ final class FixtureProtocol: URLProtocol {
             // The first URL breaks only in the download phase; extraction's tail probe still works.
             // ump-cold refuses every ranged GET from the start.
             let broken = (phase && mediaNumber == 1) || mode == "ump-cold"
-            if broken && ["stale", "section", "stale-embed"].contains(mode) {
+            if mode == "cancel-in-fallback" && phase {
+                if method == "POST" { failure = URLError(.cancelled) } else { status = 403 }
+            } else if broken && ["stale", "section", "stale-embed"].contains(mode) {
                 status = 403
             } else if Self.hlsFallbackModes.contains(mode) {
                 status = 403   // every range test fails from the start
@@ -192,12 +194,23 @@ final class FixtureProtocol: URLProtocol {
             // An HLS playlist of 15 fragmented MP4 segments, 4 s each, with four 1 s samples in each
             // segment. The boxes are the smallest tree that uBit's reader accepts, not a file that
             // a standard player can read (the stsd box is empty, and mvhd, tkhd, mfhd and tfdt are missing).
-            let segments = (0..<15).map { "#EXTINF:4.0,\nclip-\($0).m4s" }.joined(separator: "\n")
+            let duration = mode == "hls-decimal" ? "0.800000" : "4.0"
+            let segments = (0..<15).map { "#EXTINF:\(duration),\nclip-\($0).m4s" }.joined(separator: "\n")
             data = Data("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"clip-init.mp4\"\n\(segments)\n#EXT-X-ENDLIST\n".utf8)
         case ("media.invalid", "/clip-init.mp4"):
-            data = Data(Bytes.clipInit)
+            data = Data(Bytes.clipInit(sampleTicks: mode == "hls-decimal" ? 200 : 1000))
         case ("media.invalid", let path) where path.hasPrefix("/clip-"):
             data = Data(Bytes.clipSegment(Int(path.dropFirst(6).dropLast(4)) ?? 0))
+        case ("media.invalid", "/indexed.mp4"):
+            let bytes = Bytes.indexedClip
+            if let range, let dash = range.firstIndex(of: "-"),
+               let start = Int(range.dropFirst(6).prefix(while: { $0 != "-" })),
+               let end = Int(range[range.index(after: dash)...]), start < bytes.count {
+                let last = min(end, bytes.count - 1)
+                status = 206
+                headers["Content-Range"] = "bytes \(start)-\(last)/\(bytes.count)"
+                data = Data(bytes[start...last])
+            } else { data = Data(bytes) }
         default:
             status = 404   // never forward an unexpected request
         }
@@ -292,16 +305,15 @@ enum Bytes {
 
     static func box(_ type: String, _ payload: [UInt8]) -> [UInt8] { be32(UInt32(8 + payload.count)) + Array(type.utf8) + payload }
 
-    /// Init segment of one audio track: timescale 1000, default sample duration 1000 (1 s), default
-    /// sample size 1 byte. Only uBit's reader needs to accept it.
-    static let clipInit: [UInt8] = {
+    /// The track uses 1000 ticks per second and one byte per sample.
+    static func clipInit(sampleTicks: UInt32) -> [UInt8] {
         let mdhd = box("mdhd", be32(0) + be32(0) + be32(0) + be32(1000) + be32(0) + be32(0))
         let hdlr = box("hdlr", be32(0) + be32(0) + Array("soun".utf8) + [UInt8](repeating: 0, count: 13))
         let stbl = box("stbl", box("stsd", be32(0) + be32(0)))
         let trak = box("trak", box("mdia", mdhd + hdlr + box("minf", stbl)))
-        let trex = box("trex", be32(0) + be32(1) + be32(1) + be32(1000) + be32(1) + be32(0))
+        let trex = box("trex", be32(0) + be32(1) + be32(1) + be32(sampleTicks) + be32(1) + be32(0))
         return ftyp + box("moov", trak + box("mvex", trex))
-    }()
+    }
 
     /// Media segment `n`: one `moof` with four samples, and an `mdat` whose four bytes are the
     /// stream seconds 4n to 4n+3. The data offset 60 is the `moof` (52 bytes) plus the `mdat` header.
@@ -310,6 +322,13 @@ enum Bytes {
         let trun = box("trun", be32(0x000001) + be32(4) + be32(60))
         return box("moof", box("traf", tfhd + trun)) + box("mdat", (0..<4).map { UInt8(4 * n + $0) })
     }
+
+    static let indexedClip: [UInt8] = {
+        let segments = (0..<15).map(clipSegment)
+        var index = be32(0) + be32(1) + be32(1000) + be32(0) + be32(0) + be32(UInt32(segments.count))
+        for segment in segments { index += be32(UInt32(segment.count)) + be32(4000) + be32(0) }
+        return clipInit(sampleTicks: 1000) + box("sidx", index) + segments.flatMap { $0 }
+    }()
 }
 
 // MARK: - Cases
@@ -446,29 +465,24 @@ struct RegressionChecks {
             let waited = now() - before
             check(waited < 6, "three cancelled waiters give back their slots; the next caller waited \(waited) s (about 2.7 s expected, about 11.7 s if no slot came back)")
         case "cancel-middle":
-            // A cancelled waiter with a later caller queued behind it must not free its slot,
-            // or two later waits would end in one slot.
+            // The waiter that reserved before cancellation must precede the newcomer.
             let pacer = YouTubeExtractor.YTGuard()
-            let log = TimeLog()
             let start = now()
             try await pacer.pace()
-            log.add(now())
-            var waiters: [Task<Void, Error>] = []
+            var waiters: [Task<TimeInterval, Error>] = []
             for _ in 0..<3 {
-                waiters.append(Task { try await pacer.pace(); log.add(now()) })
+                waiters.append(Task { try await pacer.pace(); return now() })
                 try await Task.sleep(nanoseconds: 100_000_000)   // reserve the slots in this order
             }
             waiters[1].cancel()
             _ = await waiters[1].result
-            for _ in 0..<2 {
-                try await pacer.pace()
-                log.add(now())
-            }
-            _ = await waiters[0].result
-            _ = await waiters[2].result
-            let offsets = log.all().map { $0 - start }.sorted()
-            check(offsets.count == 5 && keepsSlots(offsets),
-                  "after a middle waiter is cancelled, every wait still ends in its own 3 s slot; offsets from the start=\(offsets)")
+            try await pacer.pace()
+            let newcomer = now()
+            let first = try await waiters[0].value
+            let older = try await waiters[2].value
+            let offsets = [start, first, older, newcomer].map { $0 - start }
+            check(first < older && older < newcomer && keepsSlots(offsets),
+                  "the older waiter receives its permit before the newcomer; offsets in reservation order=\(offsets)")
         case "pace-late-wake":
             // Delay the waiters for the 3 s and 6 s slots until both can resume.
             // Record when each caller returns from pace(), not when HTTP starts.
@@ -738,6 +752,50 @@ struct RegressionChecks {
                 : !formats.isEmpty && formats.allSatisfy { $0.hasSuffix(":hls") } && failure.isEmpty
             check(ok && umpPosts().isEmpty,
                   "after every range test fails, the HLS playlist is used when there is player data and a playlist; formats=\(formats), failure=\(failure), umpPosts=\(umpPosts().count)")
+        case "hls-decimal", "sidx-boundaries":
+            let hls = mode == "hls-decimal"
+            let path = hls ? "/clip.m3u8" : "/indexed.mp4"
+            let url = "https://media.invalid" + path
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.cookieSource = "none"
+            options.connections = 1
+            let out = AppPaths.appSupportDir.appendingPathComponent("out")
+            options.outputDir = out.path
+            let eof = hls ? 12.0 : 60.0
+            options.section = SectionRange(start: eof, end: eof + 1)
+            do {
+                _ = try await DownloadEngine().downloadSingle(url: url, settings: settings, options: options)
+                check(false, "a section starting at EOF produced a file")
+            } catch where error.localizedDescription.contains("outside the stream") {}
+            let media = FixtureProtocol.requests().filter { $0.url.path == path || $0.url.path.hasPrefix("/clip-") }
+            let files = ((try? FileManager.default.contentsOfDirectory(atPath: out.path)) ?? []).filter { !$0.hasPrefix(".") }
+            let onlyMetadata = hls ? !media.isEmpty && media.allSatisfy { $0.url.path == path }
+                                   : media.count == 1 && media[0].range == "bytes=0-65535"
+            check(files.isEmpty && onlyMetadata,
+                  "at EOF only the playlist or index is fetched; paths=\(media.map(\.url.path)), files=\(files)")
+
+            let clips: [(Double, Double, [Int], [String])] = hls ? [
+                (8, 9.6, Array(40..<48), ["/clip-9.m4s", "/clip-10.m4s", "/clip-11.m4s"]),
+                (11.999999, 12, [59], ["/clip-14.m4s"])
+            ] : [(56, 60, Array(56..<60), [])]
+            for (start, end, expected, parts) in clips {
+                let before = FixtureProtocol.requests().count
+                options.section = SectionRange(start: start, end: end)
+                let file = try await DownloadEngine().downloadSingle(url: url, settings: settings, options: options)
+                let data = try Data(contentsOf: file)
+                let samples = data.range(of: Data("mdat".utf8)).map { data[$0.upperBound...].map(Int.init) } ?? []
+                let fetched = FixtureProtocol.requests().dropFirst(before).map(\.url.path).filter { $0.hasSuffix(".m4s") }
+                check(samples == expected && fetched == parts, "section \(start)-\(end): samples=\(samples), parts=\(fetched)")
+            }
+        case "cancel-in-fallback":
+            let (file, error) = await download(audioExt: "webm")
+            let players = FixtureProtocol.playerRequests().count
+            let posts = umpPosts().count
+            check((error as? URLError)?.code == .cancelled && file == nil && players == 1 && posts == 1,
+                  "transport cancellation stops the download; players=\(players), attempts=\(posts), error=\(String(describing: error))")
         case "non-http-error":
             let (_, error) = await download(audioExt: "webm")
             check((error as? URLError)?.code == .cancelled && umpPosts().isEmpty,

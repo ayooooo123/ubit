@@ -209,7 +209,7 @@ public struct MP4Metadata: Sendable {
 public struct SidxSegment: Sendable {
     public var byteRange: ByteRange
     public var startTimeSec: Double
-    public var durationSec: Double
+    public var endTimeSec: Double
 }
 
 // MARK: - ISO-BMFF Parser, Planner, Trimmer & Fast-Start Writer
@@ -276,21 +276,20 @@ public enum MP4Muxer {
         var segs: [SidxSegment] = []
 
         for _ in 0..<refCount {
-            guard off + 12 <= sidx.endOffset else { break }
+            guard off + 12 <= sidx.endOffset else { return nil }
             let sizeWord = headerData.beU32(off)
             let refSize = Int64(sizeWord & 0x7fffffff)
             let subsegDur = UInt64(headerData.beU32(off + 4))
             off += 12
             if refSize > 0 {
                 let startSec = Double(curTicks) / Double(timescale)
-                let durSec = Double(subsegDur) / Double(timescale)
+                curTicks += subsegDur
                 segs.append(SidxSegment(
                     byteRange: ByteRange(start: curByte, end: curByte + refSize - 1),
                     startTimeSec: startSec,
-                    durationSec: durSec
+                    endTimeSec: Double(curTicks) / Double(timescale)
                 ))
                 curByte += refSize
-                curTicks += subsegDur
             }
         }
         guard !segs.isEmpty else { return nil }
@@ -659,8 +658,15 @@ public enum MP4Muxer {
     // MARK: - Keyframe Trimming & SponsorBlock Excising
 
     public static func trimTracks(_ tracks: [MP4Track], section: SectionRange, baseStartTimeSec: Double = 0) -> [MP4Track] {
-        let targetStart = max(0, (section.start ?? 0) - baseStartTimeSec)
-        let targetEnd = section.end.map { max(targetStart, $0 - baseStartTimeSec) }
+        // Section and playlist times are decimal seconds. Subtract in those units
+        // so that, for example, 8.0 - 7.2 does not select the sample just before 0.8.
+        let base = baseStartTimeSec == 0 ? nil : Decimal(string: String(baseStartTimeSec))
+        func relativeTime(_ value: Double) -> Double {
+            guard let base, let absolute = Decimal(string: String(value)) else { return value - baseStartTimeSec }
+            return ((absolute - base) as NSDecimalNumber).doubleValue
+        }
+        let targetStart = max(0, relativeTime(section.start ?? 0))
+        let targetEnd = section.end.map { max(targetStart, relativeTime($0)) }
 
         // Find exact keyframe-aligned start time on the primary video track (if present)
         var effectiveStart = targetStart

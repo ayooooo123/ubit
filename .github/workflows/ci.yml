@@ -57,7 +57,13 @@ jobs:
           ./tests/home-paths.sh /tmp/test-amd64/ubit /tmp/test-arm64/ubit /tmp/test-android/ubit
       - name: Rust SDK rlibs hold no home-directory path
         run: |
-          sdk/cargo.sh build --locked
+          cargo fetch --locked
+          mkdir -p "$HOME/sdk build/source"
+          git archive HEAD | tar -x -C "$HOME/sdk build/source"
+          ln -s "$HOME" "$RUNNER_TEMP/build home"
+          export HOME="$RUNNER_TEMP/build home"
+          cd "$HOME/sdk build/source"
+          CARGO_ENCODED_RUSTFLAGS=-Cdebuginfo=2 sdk/cargo.sh build --locked --offline
           find target -name '*.rlib' -print0 | xargs -0 ./tests/home-paths.sh
       - name: Upload Linux & Android release archives
         uses: actions/upload-artifact@v4

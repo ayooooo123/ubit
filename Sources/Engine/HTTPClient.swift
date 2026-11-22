@@ -343,6 +343,7 @@ public final class HTTPClient: @unchecked Sendable {
     /// so a caller never takes the start of the file for the requested bytes. A 206 answer whose
     /// `Content-Range` starts at another offset is refused.
     public func fetchRangeBytes(url: String, range: ByteRange, headers: [String: String]? = nil) async throws -> Data {
+        guard range.start >= 0, range.end >= range.start else { throw HTTPError.rangeUnsupported }
         var hdrs = headers ?? [:]
         hdrs["Range"] = "bytes=\(range.start)-\(range.end)"
         let (data, http) = try await fetchData(url: url, headers: hdrs)
@@ -355,8 +356,8 @@ public final class HTTPClient: @unchecked Sendable {
             return data
         }
         guard Int64(data.count) > range.start else { throw HTTPError.rangeUnsupported }
-        let end = min(Int64(data.count), range.end + 1)
-        return data.subdata(in: Int(range.start)..<Int(end))
+        let last = min(range.end, Int64(data.count - 1))
+        return data.subdata(in: Int(range.start)..<(Int(last) + 1))
     }
 
     /// Probes total file size and range support using a tiny `Range: bytes=0-0` request.

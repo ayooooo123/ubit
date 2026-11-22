@@ -46,7 +46,9 @@ ubit get -q 720 --no-library --json -o /tmp/ubit-out "<url>"
 
 ### 3. Extract Only a Specific Time Window (`--section`)
 
-Never download a multi-gigabyte video when only a short segment is needed. For an MP4 or M4A stream with a `sidx` index and a server that accepts byte ranges, `--section` first requests the start of the file to read the index (64 KB when the index position is not known), and then fetches only the `init` box and the overlapping segment bytes; for HLS it fetches only the overlapping segments, and a section that no segment overlaps is an error. A server that ignores byte ranges sends the whole file for each request. Without a `sidx` index, for DASH, and after the YouTube UMP fallback, the whole stream is downloaded, so a short clip does not guarantee a small transfer. The clip is cut on the preceding sync keyframe when the output goes through the MP4 muxer (MP4 or M4A output from a progressive, HLS or DASH stream). A WebM stream or a raw MP3, Opus, FLAC or WAV audio stream is not trimmed: over plain HTTP it is saved whole, and over HLS the segments that overlap the section are saved as they are, so the file can start and end up to one segment outside the section.
+A short clip does not guarantee a small transfer. For indexed MP4/M4A, `ubit` requests the start of the file to read the index (64 KiB if its position is unknown), then requests the overlapping media bytes. A server that ignores byte ranges can send the whole file each time. Without a usable index, for DASH, or after a YouTube UMP fallback, the transfer can include the whole stream.
+
+For HLS, `ubit` fetches segments with media inside the section. If the section starts on a segment boundary, it also keeps the previous segment for preroll, if present. A section starting at or after the end of the playlist fails. MP4/M4A output is trimmed on the preceding sync keyframe. WebM and raw MP3, Opus, FLAC or WAV are not trimmed: `ubit` saves the whole file over plain HTTP or the selected segments over HLS.
 
 ```sh
 ubit get -q 720 --section 1:30-2:00 --no-library --quiet -o /tmp/ubit-out "<url>"

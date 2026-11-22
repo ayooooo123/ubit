@@ -341,26 +341,35 @@ public enum HLSEngine {
         var selected = pl.segments
         var startTime: Double = 0
         if let sec = section {
+            let start = sec.start ?? 0
+            let end = sec.end ?? .infinity
             var acc: Double = 0
             var filtered: [HLSVals.Segment] = []
-            var firstStart: Double = 0
-            for seg in pl.segments {
+            for (index, seg) in pl.segments.enumerated() {
                 let segStart = acc
                 let segEnd = acc + seg.duration
                 acc = segEnd
-                if let s = sec.start, segEnd < s { continue }
-                if let e = sec.end, segStart > e { break }
-                if filtered.isEmpty { firstStart = segStart }
+                if segStart >= end { break }
+                guard max(start, segStart) < min(end, segEnd) else { continue }
+                if filtered.isEmpty {
+                    startTime = segStart
+                    // Keep the previous segment for keyframe preroll at an exact boundary,
+                    // but only after finding a segment with media inside the section.
+                    if segStart == start, index > 0 {
+                        let previous = pl.segments[index - 1]
+                        filtered.append(previous)
+                        startTime -= previous.duration
+                    }
+                }
                 filtered.append(seg)
             }
             // A section that no segment overlaps (for example one after the end) is an error: the
             // whole playlist must not be saved as if it were the clip.
             guard !filtered.isEmpty else {
                 throw NSError(domain: "HLSEngine", code: 1, userInfo: [NSLocalizedDescriptionKey:
-                    "The --section range is outside the stream (\(Int(acc.rounded())) s long)"])
+                    "The --section range is outside the stream"])
             }
             selected = filtered
-            startTime = firstStart
         }
 
         let segWorkDir = destination.deletingLastPathComponent().appendingPathComponent(".\(destination.lastPathComponent).segs", isDirectory: true)

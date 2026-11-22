@@ -635,17 +635,19 @@ struct RegressionChecks {
             options.connections = 1
             let outDir = AppPaths.appSupportDir.appendingPathComponent("out")
             options.outputDir = outDir.path
-            options.section = SectionRange(start: 65, end: 70)
-            var failure = ""
-            do {
-                _ = try await DownloadEngine().downloadSingle(url: "https://media.invalid/clip.m3u8", settings: settings, options: options)
-            } catch {
-                failure = error.localizedDescription
+            var rejected: [Int] = []
+            for start in [60, 65] {
+                options.section = SectionRange(start: Double(start), end: Double(start + 5))
+                do {
+                    _ = try await DownloadEngine().downloadSingle(url: "https://media.invalid/clip.m3u8", settings: settings, options: options)
+                } catch where error.localizedDescription.contains("outside the stream") {
+                    rejected.append(start)
+                }
             }
             let fetched = FixtureProtocol.requests().map(\.url.path).filter { $0.hasSuffix(".m4s") }
             let saved = ((try? FileManager.default.contentsOfDirectory(atPath: outDir.path)) ?? []).filter { !$0.hasPrefix(".") }
-            check(failure.contains("outside the stream") && fetched.isEmpty && saved.isEmpty,
-                  "a section after the end fails without fetching or saving media; failure=\(failure), segments=\(fetched), saved=\(saved)")
+            check(rejected == [60, 65] && fetched.isEmpty && saved.isEmpty,
+                  "sections at and past EOF fail without fetching or saving media; rejected=\(rejected), segments=\(fetched), saved=\(saved)")
         case "range-ignored":
             // Seventh review: a server that ignores Range answers 200 with the whole file. The
             // fixture's /seg- route does that, and its body is its own path.
@@ -657,8 +659,18 @@ struct RegressionChecks {
             } catch HTTPError.rangeUnsupported {
                 pastEnd = true
             }
+            let suffix = try await client.fetchRangeBytes(url: "https://media.invalid/seg-whole.mp3", range: ByteRange(start: 5, end: .max))
+            let before = FixtureProtocol.requests().count
+            var refused = 0
+            for bounds in [ByteRange(start: -1, end: 5), ByteRange(start: 5, end: 2)] {
+                do {
+                    _ = try await client.fetchRangeBytes(url: "https://media.invalid/seg-whole.mp3", range: bounds)
+                } catch HTTPError.rangeUnsupported { refused += 1 }
+            }
             let text = String(decoding: part, as: UTF8.self)
-            check(text == "whole" && pastEnd, "a 200 answer to a range request gives only the requested bytes; bytes 5-9=\(text), past the end refused=\(pastEnd)")
+            check(text == "whole" && pastEnd && String(decoding: suffix, as: UTF8.self) == "whole.mp3"
+                  && refused == 2 && FixtureProtocol.requests().count == before,
+                  "valid ranges return the requested bytes through EOF; invalid bounds make no request")
         case "hls-raw-section", "http-raw-section":
             // A raw MP3 stream (the shape that the SoundCloud extractor returns) with a 0:20-0:26
             // section is not trimmed. Over plain HTTP it is saved whole; over HLS, the segments that

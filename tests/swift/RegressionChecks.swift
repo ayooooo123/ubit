@@ -201,8 +201,24 @@ final class FixtureProtocol: URLProtocol {
         case ("media.invalid", "/repeat.m3u8"):
             data = Data("#EXTM3U\n#EXTINF:2,\npack.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:2,\npack.ts\n#EXT-X-ENDLIST\n".utf8)
         case ("media.invalid", "/alias.m3u8"):
-            // Four spellings of one HTTP resource: a fragment, an encoded letter and a default port.
-            data = Data("#EXTM3U\n#EXTINF:2,\npack.ts\n#EXTINF:2,\npack.ts#\n#EXTINF:2,\n%70ack.ts\n#EXTINF:2,\nhttps://media.invalid:443/pack.ts\n#EXT-X-ENDLIST\n".utf8)
+            // Four spellings of one HTTP resource: a fragment, empty user information and a default port.
+            data = Data("#EXTM3U\n#EXTINF:2,\npack.ts\n#EXTINF:2,\npack.ts#\n#EXTINF:2,\nhttps://@media.invalid/pack.ts\n#EXTINF:2,\nhttps://media.invalid:443/pack.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/alias-userinfo.m3u8"):
+            // Empty user information does not reach the origin: both lines request one resource.
+            data = Data("#EXTM3U\n#EXTINF:2,\npack.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:2,\nhttps://@media.invalid/pack.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/live-alias.m3u8"):
+            let seq = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            let segment = seq == 0 ? "pack.ts" : "https://@media.invalid/pack.ts\n#EXT-X-ENDLIST"
+            data = Data("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:\(seq)\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n\(segment)\n".utf8)
+        case ("media.invalid", "/routes.m3u8"):
+            data = Data("#EXTM3U\n#EXTINF:2,\nroute.ts?object=ab%2fCD\n#EXTINF:2,\nroute.ts?object=ab%2FCD\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/route.ts"):
+            // Two request targets that differ only in the case of an escape hold different objects.
+            switch URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedQuery {
+            case "object=ab%2fCD": data = Data("AAAA".utf8)
+            case "object=ab%2FCD": data = Data("BBBB".utf8)
+            default: status = 404
+            }
         case ("media.invalid", "/lost-after-headers"):
             // A 403 response, and then the connection is lost before any body byte.
             status = 403
@@ -211,7 +227,7 @@ final class FixtureProtocol: URLProtocol {
             // hls-live-whole-changed: every read after the first comes from a new edition.
             let changed = range == "bytes=2-3" || Self.lock.withLock {
                 (mode == "hls-live-changed" && Self.seen.contains { $0.url.path == url.path && $0.range == nil })
-                    || (["hls-live-whole-changed", "hls-repeat-changed", "hls-alias-changed"].contains(mode) && Self.seen.contains { $0.url.path == url.path })
+                    || (["hls-live-whole-changed", "hls-repeat-changed", "hls-alias-changed", "hls-userinfo-changed", "hls-live-userinfo"].contains(mode) && Self.seen.contains { $0.url.path == url.path })
             }
             let edition = Data((changed ? "BBBB" : "AAAA").utf8)
             if mode != "hls-untagged-edition" && !mode.hasPrefix("hls-live-") { headers["ETag"] = changed ? "\"B\"" : "\"A\"" }
@@ -263,7 +279,7 @@ final class FixtureProtocol: URLProtocol {
                     player = nil
                 case "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age", "watch-blocked-notice", "watch-header-age",
                      "watch-verify-human", "watch-open-details", "watch-details-summary", "watch-confirm-identity",
-                     "watch-identity-phone", "watch-age-device":
+                     "watch-identity-phone", "watch-age-device", "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online":
                     player = Self.playerPayload(status: "OK", streaming: Self.directStreaming(1, hls: true), title: title)
                 case "hls-fallback-watchlist":
                     player = Self.hlsOnlyPlayer(title: title)
@@ -287,7 +303,8 @@ final class FixtureProtocol: URLProtocol {
                 switch mode {
                 case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age",
                      "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
-                     "watch-details-summary", "watch-confirm-identity", "watch-identity-phone", "watch-age-device":
+                     "watch-details-summary", "watch-confirm-identity", "watch-identity-phone", "watch-age-device",
+                     "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online":
                     data = Self.wallPage(player: player, mode: mode)
                 case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson",
                      "watch-agent-settings", "watch-ordinary-objects":
@@ -559,6 +576,9 @@ final class FixtureProtocol: URLProtocol {
         case "watch-confirm-identity": html += "<main><p>Please confirm your identity to continue watching.</p></main>"
         case "watch-identity-phone": html += "<main role=\"alert\"><p>Please confirm your identity using your phone to continue watching.</p></main>"
         case "watch-age-device": html += "<main role=\"alert\"><p>Verify your age on this device to continue watching.</p></main>"
+        case "watch-age-parenthesis": html += "<main role=\"alert\"><p>Verify your age (18 or older) to continue watching.</p></main>"
+        case "watch-identity-dash": html += "<main role=\"alert\"><p>Confirm your identity — this is required to watch the video.</p></main>"
+        case "watch-identity-online": html += "<main role=\"alert\"><p>Please confirm your identity online to continue watching.</p></main>"
         default: html += "<main>Verify your identity before playback can continue. Playback is blocked.</main>"
         }
         if let player {
@@ -596,7 +616,7 @@ final class FixtureProtocol: URLProtocol {
         case "watch-agent-settings":
             html += "<article><h1>Remote playback</h1><p>Verify your agent settings, then try again.</p><p>Verify your audio settings.</p></article>"
         case "watch-ordinary-objects":
-            html += "<article><h1>Storage setup</h1><p>Confirm your identity provider settings before you save the configuration.</p><p>Confirm your identity-provider settings before you save the configuration.</p><p>Verify the cable is not a bottleneck for the disk.</p></article>"
+            html += "<article><h1>Storage setup</h1><p>Confirm your identity provider settings before you save the configuration.</p><p>Confirm your identity-provider settings before you save the configuration.</p><p>Verify the cable is not a bottleneck for the disk.</p><p>Verify your age group settings in the family profile.</p></article>"
         default: break
         }
         if mode == "watch-hidden-notice" {
@@ -946,7 +966,8 @@ struct RegressionChecks {
         // Finding 2: a visible notice outranks embedded metadata; inert text is not a notice.
         case "watch-wall-text", "watch-wall-metadata", "watch-human-notice", "watch-age-notice", "watch-inline-age",
              "watch-blocked-text", "watch-blocked-notice", "watch-header-age", "watch-verify-human", "watch-open-details",
-             "watch-details-summary", "watch-confirm-identity", "watch-identity-phone", "watch-age-device":
+             "watch-details-summary", "watch-confirm-identity", "watch-identity-phone", "watch-age-device",
+             "watch-age-parenthesis", "watch-identity-dash", "watch-identity-online":
             let before = FixtureProtocol.requests().count
             let error = await extractError()
             let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
@@ -1860,6 +1881,26 @@ struct RegressionChecks {
             let saved = try? Data(contentsOf: file)
             check(mode.hasSuffix("-changed") ? rejected && saved == nil : saved == Data(String(repeating: "AAAA", count: alias ? 4 : 2).utf8),
                   "whole reads of one HTTP resource, also under other spellings, must not publish bytes from different editions; saved=\(saved.map { String(decoding: $0, as: UTF8.self) } ?? "none")")
+        // Spellings whose requests are identical on the wire read one resource: a VOD selection
+        // and a live recording both stop when its second read is a new edition.
+        case "hls-userinfo-changed", "hls-live-userinfo":
+            let live = mode == "hls-live-userinfo"
+            let file = AppPaths.appSupportDir.appendingPathComponent("alias.ts")
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            var rejected = false
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/\(live ? "live-alias" : "alias-userinfo").m3u8", destination: file, connections: 1)
+            } catch HTTPError.rangeUnsupported { rejected = true }
+            let saved = try? Data(contentsOf: file)
+            check(rejected && saved == nil, "empty user information names the same resource, so a changed second read stops without a clip; saved=\(saved.map { String(decoding: $0, as: UTF8.self) } ?? "none")")
+        // Request targets that differ only in the case of an escape are requested as written.
+        case "hls-raw-routes":
+            let file = AppPaths.appSupportDir.appendingPathComponent("routes.ts")
+            _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/routes.m3u8", destination: file, connections: 1)
+            let saved = try? Data(contentsOf: file)
+            let queries = FixtureProtocol.requests().filter { $0.url.path == "/route.ts" }.map { URLComponents(url: $0.url, resolvingAgainstBaseURL: false)?.percentEncodedQuery ?? "" }
+            check(saved == Data("AAAABBBB".utf8) && queries == ["object=ab%2fCD", "object=ab%2FCD"],
+                  "each playlist URI is requested as written; saved=\(saved.map { String(decoding: $0, as: UTF8.self) } ?? "none"), queries=\(queries)")
         case "hls-short-range":
             let folder = AppPaths.appSupportDir.appendingPathComponent("out")
             var options = DownloadRequestOptions()

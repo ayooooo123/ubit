@@ -461,11 +461,10 @@ struct RegressionChecks {
             check(offsets.count == 5 && keepsSlots(offsets),
                   "after a middle waiter is cancelled, every wait still ends in its own 3 s slot; offsets from the start=\(offsets)")
         case "pace-late-wake":
-            // Seventh review: callers that wake late together must still send 3 s apart. Every
-            // thread of the cooperative pool is blocked for 7 s, so the waiters for the slots at
-            // 3 s and 6 s wake together at about 7 s. The second send must have woken late, or the
-            // pool was not blocked and the case proves nothing. The 0.5 s slack covers the hop from
-            // the pacer back to the waiter on a loaded machine; without the fix the gap is about 0 s.
+            // Delay the waiters for the 3 s and 6 s slots until both can resume.
+            // Record when each caller returns from pace(), not when HTTP starts.
+            // Require a late wake-up to exercise the second check, and allow 0.5 s
+            // for scheduling between the permit grant and its observation here.
             let pacer = YouTubeExtractor.YTGuard()
             let log = TimeLog()
             let start = now()
@@ -483,7 +482,7 @@ struct RegressionChecks {
             let offsets = log.all().map { $0 - start }.sorted()
             let gaps = zip(offsets.dropFirst(), offsets).map { $0 - $1 }
             check(offsets.count == 4 && offsets[1] > 6 && gaps.allSatisfy { $0 >= 2.5 },
-                  "callers that wake late together still send 3 s apart; offsets from the start=\(offsets), gaps=\(gaps)")
+                  "late waiters observe separate pacing permits; return offsets=\(offsets), gaps=\(gaps)")
         case "wall-unusable-cookie":
             // An expired or empty SAPISID is never sent, so it must not keep extraction going. Nor
             // must a nonempty root SAPISID that an empty /youtubei SAPISID shadows: the request

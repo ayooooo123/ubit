@@ -137,7 +137,7 @@ public struct YouTubeExtractor: SiteExtractor {
     /// Internal, not private, so that `tests/swift/RegressionChecks.swift` can drive one instance.
     actor YTGuard {
         static let shared = YTGuard()
-        /// Minimum time between two /player requests from this process, retries included.
+        /// Minimum time between permits for /player attempts, including retries.
         static let playerGap: TimeInterval = 3
 
         /// The cache key holds the request context as well as the video, because the
@@ -151,7 +151,7 @@ public struct YouTubeExtractor: SiteExtractor {
         private var visitorData: String?
         private var cache: [CacheKey: (info: MediaInfo, exp: Date)] = [:]
         private var nextPlayerSlot: TimeInterval = 0
-        private var lastPlayerSend: TimeInterval = -.infinity
+        private var lastPlayerPermit: TimeInterval = -.infinity
         private var fileURL: URL { AppPaths.appSupportDir.appendingPathComponent("yt_visitor.txt") }
 
         func visitor() -> String? {
@@ -187,29 +187,27 @@ public struct YouTubeExtractor: SiteExtractor {
             cache = cache.filter { $0.key.videoID != videoID }
         }
 
-        /// Waits until this caller may send one /player request. Slots are reserved 3 s apart
-        /// before the actor suspends, so concurrent callers queue behind each other instead of
-        /// waking together. A caller that wakes late (a suspended process, a busy thread pool)
-        /// sleeps again while the last actual send is less than 3 s ago, so callers that wake
-        /// together still go one by one. Cancellation ends the wait with `CancellationError` and
-        /// frees the slot when no later caller has queued behind it.
+        /// Reserves a slot and grants one permit. If several callers wake late, each checks
+        /// the time of the last grant before it can proceed. The caller starts HTTP work
+        /// after this method returns, so the interval between HTTP starts may be shorter.
+        /// Cancellation releases a reservation if no later caller has reserved a slot.
         func pace() async throws {
             let now = ProcessInfo.processInfo.systemUptime
             let slot = max(now, nextPlayerSlot)
             nextPlayerSlot = slot + Self.playerGap
-            var wait = max(slot, lastPlayerSend + Self.playerGap) - now
+            var wait = max(slot, lastPlayerPermit + Self.playerGap) - now
             do {
                 while wait > 0 {
                     try await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
-                    wait = lastPlayerSend + Self.playerGap - ProcessInfo.processInfo.systemUptime
+                    wait = lastPlayerPermit + Self.playerGap - ProcessInfo.processInfo.systemUptime
                 }
             } catch {
                 if nextPlayerSlot == slot + Self.playerGap { nextPlayerSlot = slot }
                 throw error
             }
-            // No suspension point since the last check, so no other caller can send in between.
-            lastPlayerSend = ProcessInfo.processInfo.systemUptime
-            nextPlayerSlot = max(nextPlayerSlot, lastPlayerSend + Self.playerGap)
+            // The actor cannot grant another permit between the check and this assignment.
+            lastPlayerPermit = ProcessInfo.processInfo.systemUptime
+            nextPlayerSlot = max(nextPlayerSlot, lastPlayerPermit + Self.playerGap)
         }
     }
 

@@ -445,7 +445,7 @@ public final class HTTPClient: @unchecked Sendable {
         return ContentRange(first: first, last: last, total: total)
     }
 
-    private static func strongTag(_ response: HTTPURLResponse) -> String? {
+    static func strongTag(_ response: HTTPURLResponse) -> String? {
         guard let tag = response.value(forHTTPHeaderField: "ETag"), tag.utf8.count >= 2,
               tag.first == "\"", tag.last == "\"" else { return nil }
         return tag

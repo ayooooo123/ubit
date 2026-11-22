@@ -577,7 +577,15 @@ public enum HLSEngine {
                 guard SHA256.hash(data: fresh) == digest else { throw HTTPError.rangeUnsupported }
                 liveSources[url] = .snapshot(fresh)
                 retired.removeValue(forKey: url)
-            } else if range != nil && liveSources[url] == nil {
+            } else if liveSources[url] == nil {
+                guard range != nil else {
+                    // A later playlist can name a byte range of this URI, so keep the
+                    // edition of the whole read: its strong ETag, or else its bytes until
+                    // the playlist drops the URI.
+                    let (data, response) = try await client.fetchData(url: url, headers: headers)
+                    liveSources[url] = HTTPClient.strongTag(response).map { .tagged($0) } ?? .snapshot(data)
+                    return data
+                }
                 liveSources[url] = try await RangeSource.open(url, client: client, headers: headers)
             }
             return try await fetchPart(url, range: range, client: client, headers: headers, source: liveSources[url])

@@ -116,15 +116,19 @@ final class FixtureProtocol: URLProtocol {
             status = 403
         case ("media.invalid", "/live-editions.m3u8"):
             let seq = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
-            let segment = seq == 0 ? "#EXT-X-BYTERANGE:2@0\npack.ts" : (seq == 1 ? "other.ts" : "#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST")
+            let segment = mode == "hls-live-whole"
+                ? (seq == 0 ? "pack.ts" : "#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST")
+                : (seq == 0 ? "#EXT-X-BYTERANGE:2@0\npack.ts" : (seq == 1 ? "other.ts" : "#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST"))
             data = Data("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:\(seq)\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n\(segment)\n".utf8)
         case ("media.invalid", "/other.ts"): data = Data("xx".utf8)
         case ("media.invalid", "/editions.m3u8"):
             data = Data("#EXTM3U\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@0\npack.ts\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST\n".utf8)
         case ("media.invalid", "/pack.ts"):
-            let changed = range == "bytes=2-3" || (mode == "hls-live-changed" && Self.lock.withLock {
-                Self.seen.contains { $0.url.path == url.path && $0.range == nil }
-            })
+            // hls-live-whole: every read after the first comes from a new edition.
+            let changed = range == "bytes=2-3" || Self.lock.withLock {
+                (mode == "hls-live-changed" && Self.seen.contains { $0.url.path == url.path && $0.range == nil })
+                    || (mode == "hls-live-whole" && Self.seen.contains { $0.url.path == url.path })
+            }
             let edition = Data((changed ? "BBBB" : "AAAA").utf8)
             if mode != "hls-untagged-edition" && !mode.hasPrefix("hls-live-") { headers["ETag"] = changed ? "\"B\"" : "\"A\"" }
             if let range {
@@ -1298,7 +1302,7 @@ struct RegressionChecks {
             try await transfer("allowed")
             let bytes = try Data(contentsOf: file)
             check(String(decoding: bytes, as: UTF8.self) == "/allowed/piece-1.m4s/allowed/piece-2.m4s/allowed/piece-3.m4s", "a later operation assembles only its own three segments")
-        case "hls-live-stable", "hls-live-changed":
+        case "hls-live-stable", "hls-live-changed", "hls-live-whole":
             let file = AppPaths.appSupportDir.appendingPathComponent("live.ts")
             // The CLI creates the output folder before a live recording starts.
             try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
@@ -1307,8 +1311,15 @@ struct RegressionChecks {
                 _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/live-editions.m3u8", destination: file)
             } catch HTTPError.rangeUnsupported { rejected = true }
             let saved = try? Data(contentsOf: file)
-            check(mode == "hls-live-changed" ? rejected && saved == nil : saved == Data("AAxxAA".utf8),
-                  "a returning untagged URI contributes the original bytes or stops the recording")
+            switch mode {
+            case "hls-live-changed":
+                check(rejected && saved == nil, "a returning untagged URI with new content stops the recording: saved=\(String(describing: saved))")
+            case "hls-live-whole":
+                // A whole read and a later range of the same URI must come from one edition.
+                check(saved == Data("AAAAAA".utf8), "a range after a whole read uses the same edition: \(String(decoding: saved ?? Data(), as: UTF8.self))")
+            default:
+                check(saved == Data("AAxxAA".utf8), "a returning untagged URI contributes the original bytes: \(String(decoding: saved ?? Data(), as: UTF8.self))")
+            }
         case "hls-changed-edition", "hls-untagged-edition":
             let file = AppPaths.appSupportDir.appendingPathComponent("clip.ts")
             var rejected = false

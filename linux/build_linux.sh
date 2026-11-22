@@ -30,8 +30,8 @@ build_linux_target() {
       -Wl,--gc-sections \
       -Wl,-s \
       -pthread \
-      -ldl \
       "$LSRC" \
+      -ldl \
       -o "$STAGE/ubit"
   else
     if ! command -v "$GCC_BIN" >/dev/null 2>&1; then
@@ -48,8 +48,8 @@ build_linux_target() {
       -Wl,--gc-sections \
       -s \
       -pthread \
-      -ldl \
       "$LSRC" \
+      -ldl \
       -o "$STAGE/ubit"
   fi
 
@@ -110,8 +110,8 @@ build_android_arm64() {
     -fdata-sections \
     -Wl,--gc-sections \
     -s \
-    -ldl \
     "$LSRC" \
+    -ldl \
     -o "$STAGE/ubit"
 
   ARCHIVE="$DIST/ubit-${VERSION}-android-arm64.tar.gz"

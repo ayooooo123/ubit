@@ -21,6 +21,19 @@ jobs:
           ./dist/ubit version
           ./dist/ubit --llms
           ./dist/ubit sites --json
+      - name: Built binary holds no home-directory path
+        run: ./tests/home-paths.sh dist/uBit.app/Contents/MacOS/ubit
+      - name: Binary and archive stay within the size limits
+        run: |
+          binary=$(stat -f %z dist/uBit.app/Contents/MacOS/ubit)
+          archive=$(stat -f %z dist/ubit-*-darwin-arm64.tar.gz)
+          echo "binary $binary bytes (limit 2000000), archive $archive bytes (limit 1000000)"
+          test "$binary" -lt 2000000
+          test "$archive" -lt 1000000
+      - name: Archive entries name no build account
+        run: |
+          others=$(/usr/bin/tar -tvzf dist/ubit-*-darwin-arm64.tar.gz | awk '$3 != "root" || $4 != "wheel"')
+          test -z "$others" || { echo "$others"; exit 1; }
       - name: Upload macOS release archive
         uses: actions/upload-artifact@v4
         with:
@@ -46,6 +59,21 @@ jobs:
           /tmp/test-amd64/ubit version
           /tmp/test-amd64/ubit --llms
           /tmp/test-amd64/ubit sites --json
+      - name: Linux & Android binaries hold no home-directory path
+        run: |
+          mkdir -p /tmp/test-arm64
+          tar -xzf dist/ubit-*-linux-arm64.tar.gz -C /tmp/test-arm64
+          ./tests/home-paths.sh /tmp/test-amd64/ubit /tmp/test-arm64/ubit /tmp/test-android/ubit
+      - name: Rust SDK rlibs hold no home-directory path
+        run: |
+          cargo fetch --locked
+          mkdir -p "$HOME/sdk build/source"
+          git archive HEAD | tar -x -C "$HOME/sdk build/source"
+          ln -s "$HOME" "$RUNNER_TEMP/build home"
+          export HOME="$RUNNER_TEMP/build home"
+          cd "$HOME/sdk build/source"
+          CARGO_ENCODED_RUSTFLAGS=-Cdebuginfo=2 sdk/cargo.sh build --locked --offline
+          find target -name '*.rlib' -print0 | xargs -0 ./tests/home-paths.sh
       - name: Upload Linux & Android release archives
         uses: actions/upload-artifact@v4
         with:

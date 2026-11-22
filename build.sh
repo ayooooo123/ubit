@@ -137,7 +137,10 @@ PLIST
 printf 'APPL????' > "$APP/Contents/PkgInfo"
 codesign --force --deep --sign - "$APP"
 ln -sf "$MACOS/ubit" "$DIST/ubit"
-tar -czf "$DIST/ubit-0.3.3-darwin-arm64.tar.gz" -C "$DIST" uBit.app
+# System bsdtar, owned by root:wheel, so that the archive does not hold the
+# account name of the person who built it or macOS extended attributes.
+COPYFILE_DISABLE=1 /usr/bin/tar --no-mac-metadata --no-xattrs --uid 0 --gid 0 --uname root --gname wheel \
+  -czf "$DIST/ubit-0.3.3-darwin-arm64.tar.gz" -C "$DIST" uBit.app
 
 echo "✓ Built $APP and $DIST/ubit-0.3.3-darwin-arm64.tar.gz"
 ls -lh "$MACOS/ubit" "$RES/AppIcon.icns" "$DIST/ubit-0.3.3-darwin-arm64.tar.gz"

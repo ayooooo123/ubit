@@ -426,28 +426,43 @@ public enum HLSEngine {
         try FileManager.default.createDirectory(at: segWorkDir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: segWorkDir) }
 
-        // Ordinary multi-file playlists need no version table. Only pin a URI that
-        // is used more than once and that contributes at least one byte range.
-        var shared = Set<String>()
-        if pl.initByteRange != nil || selected.contains(where: { $0.byteRange != nil }) {
-            var seen = Set<String>(), repeated = Set<String>(), ranged = Set<String>()
-            if let url = pl.initURL {
-                seen.insert(url)
-                if pl.initByteRange != nil { ranged.insert(url) }
+        /// Digests of the URIs that the selection reads whole more than once.
+        actor WholeReads {
+            let urls: Set<String>
+            var digests: [String: SHA256.Digest] = [:]
+            init(_ urls: Set<String>) { self.urls = urls }
+            func check(_ url: String, _ data: Data) throws {
+                guard urls.contains(url) else { return }
+                let digest = SHA256.hash(data: data)
+                guard let first = digests[url] else { digests[url] = digest; return }
+                // Compare complete responses rather than join bytes from two editions.
+                guard digest == first else { throw HTTPError.rangeUnsupported }
             }
-            for seg in selected {
-                if !seen.insert(seg.url).inserted { repeated.insert(seg.url) }
-                if seg.byteRange != nil { ranged.insert(seg.url) }
-            }
-            shared = repeated.intersection(ranged)
         }
+
+        // A URI that the selection uses more than once must give one edition. A URI with a byte
+        // range is pinned (a strong ETag or a complete copy). A URI that is only read whole keeps
+        // the digest of its first read, and every later read must give the same bytes.
+        var seen = Set<String>(), repeated = Set<String>(), ranged = Set<String>()
+        if let url = pl.initURL {
+            seen.insert(url)
+            if pl.initByteRange != nil { ranged.insert(url) }
+        }
+        for seg in selected {
+            if !seen.insert(seg.url).inserted { repeated.insert(seg.url) }
+            if seg.byteRange != nil { ranged.insert(seg.url) }
+        }
+        var shared = repeated.intersection(ranged)
+        let wholeReads = WholeReads(repeated.subtracting(shared))
         var sources: [String: RangeSource] = [:]
         var initData: Data?
         if let initU = pl.initURL {
             if shared.remove(initU) != nil {
                 sources[initU] = try await RangeSource.open(initU, client: client, headers: headers)
             }
-            initData = try await fetchPart(initU, range: pl.initByteRange, client: client, headers: headers, source: sources[initU])
+            let data = try await fetchPart(initU, range: pl.initByteRange, client: client, headers: headers, source: sources[initU])
+            try await wholeReads.check(initU, data)
+            initData = data
         }
         for url in shared { sources[url] = try await RangeSource.open(url, client: client, headers: headers) }
         let pinned = sources
@@ -502,6 +517,7 @@ public enum HLSEngine {
                         let seg = selected[pos]
                         let segFile = segWorkDir.appendingPathComponent(String(format: "%06d.seg", pos))
                         var raw = try await fetchPart(seg.url, range: seg.byteRange, client: client, headers: headers, source: pinned[seg.url])
+                        try await wholeReads.check(seg.url, raw)
                         if let kurl = seg.keyURL {
                             try Task.checkCancellation()
                             let key = try await keyStore.get(kurl, client: client, headers: headers)

@@ -7,7 +7,8 @@ public enum HTTPError: LocalizedError {
     case rangeUnsupported
     case incomplete(received: Int64, expected: Int64)
     case canceled
-    /// The response headers arrived, but the request failed before URLSession handed them over.
+    /// The request failed before uBit could read its status, and the task metrics do not prove
+    /// that no response had started. The response may have been a refusal.
     case noStatus(String)
 
     public var errorDescription: String? {
@@ -19,7 +20,7 @@ public enum HTTPError: LocalizedError {
             return "Incomplete download: received \(received) of \(expected) bytes"
         case .canceled: return "Canceled"
         case .noStatus(let u):
-            return "No HTTP status from \(URL(string: u)?.host ?? u): the response headers arrived, but its body did not start before the request failed. uBit does not repeat the request."
+            return "No HTTP status from \(URL(string: u)?.host ?? u): the request failed before uBit could read the status, and the response may have been a refusal. uBit does not repeat the request."
         }
     }
 }
@@ -206,18 +207,53 @@ private actor WorkStealingQueue {
 
 }
 
-/// Records whether the response of a task's last transaction had started when the task ended.
+/// Records whether a task's metrics prove that no response had started when the task ended.
 private final class ResponseStart: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     private let lock = NSLock()
-    private var started: Bool?
+    private var proven = false
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didFinishCollecting metrics: URLSessionTaskMetrics) {
-        let value = metrics.transactionMetrics.last?.responseStartDate != nil
-        lock.withLock { started = value }
+        // Only a network load whose last transaction has neither a response nor a response
+        // start proves it. Missing, empty or other metrics (for example from a URLProtocol)
+        // prove nothing.
+        guard let last = metrics.transactionMetrics.last else { return }
+        let value = last.resourceFetchType == .networkLoad && last.response == nil && last.responseStartDate == nil
+        lock.withLock { proven = value }
     }
 
-    /// True only when the metrics arrived and show that no response had started.
-    var noResponse: Bool { lock.withLock { started == false } }
+    /// True only when the metrics arrived and prove that no response had started.
+    var noResponse: Bool { lock.withLock { proven } }
+}
+
+/// Lets one request of a client wait for its status at a time. One client serves one operation,
+/// so a request starts only after every earlier request of the operation has a status, and no
+/// request starts after a refusal or an unknown status, also on another worker. Bodies with a
+/// known status still arrive in parallel.
+private actor StatusGate {
+    private var busy = false
+    private var stopped: Error?
+    private var waiting: [CheckedContinuation<Void, Error>] = []
+
+    func enter() async throws {
+        if let stopped { throw stopped }
+        guard busy else { busy = true; return }
+        try await withCheckedThrowingContinuation { waiting.append($0) }
+    }
+
+    /// Ends the wait of the current request. A `stop` error ends the operation: every waiting
+    /// and every later request throws it.
+    func leave(stop: Error?) {
+        if stopped == nil, let stop { stopped = stop }
+        if let stopped {
+            busy = false
+            for next in waiting { next.resume(throwing: stopped) }
+            waiting.removeAll()
+        } else if waiting.isEmpty {
+            busy = false
+        } else {
+            waiting.removeFirst().resume()
+        }
+    }
 }
 
 public final class HTTPClient: @unchecked Sendable {
@@ -248,6 +284,7 @@ public final class HTTPClient: @unchecked Sendable {
     }
 
     public let session: URLSession
+    private let gate = StatusGate()
     public let cookies: CookieVault
     public let limiter: RateLimiter
     public let defaultHeaders: [String: String]
@@ -323,19 +360,27 @@ public final class HTTPClient: @unchecked Sendable {
         return req
     }
 
-    /// Sends `req` and returns at the first body byte. URLSession hands over a response only
-    /// with its first body byte, so a refusal that sends headers and then stalls or fails reaches
-    /// this code as a transport error. When the task metrics show that the response of the last
-    /// transaction had started, or show nothing, the status is unknown and could be a refusal:
-    /// the error becomes `HTTPError.noStatus`, which no caller retries. A transport error is
-    /// therefore retried only when no response had started. URLSession delivers the metrics
-    /// before the task fails.
+    /// Sends `req` and returns when URLSession hands over the response. URLSession can hold a
+    /// response until some of its body arrives, so a refusal that sends headers and then stalls
+    /// or fails can reach this code as a transport error. Such an error becomes
+    /// `HTTPError.noStatus`, which no caller retries, unless the task metrics prove that no
+    /// response had started. Through `gate`, a request starts only when no other request of this
+    /// client waits for its status, and never after a refusal or an unknown status.
     func responseBytes(for req: URLRequest, url: String) async throws -> (URLSession.AsyncBytes, URLResponse) {
+        try await gate.enter()
         let start = ResponseStart()
         do {
-            return try await session.bytes(for: req, delegate: start)
+            try Task.checkCancellation()
+            let reply = try await session.bytes(for: req, delegate: start)
+            let code = (reply.1 as? HTTPURLResponse)?.statusCode ?? 0
+            await gate.leave(stop: Self.isRefusal(code) ? HTTPError.status(code, url) : nil)
+            return reply
         } catch let error as URLError where error.code != .cancelled && !start.noResponse {
+            await gate.leave(stop: HTTPError.noStatus(url))
             throw HTTPError.noStatus(url)
+        } catch {
+            await gate.leave(stop: nil)
+            throw error
         }
     }
 
@@ -352,9 +397,9 @@ public final class HTTPClient: @unchecked Sendable {
             try Task.checkCancellation()
             do {
                 let req = try makeRequest(url: url, method: method, headers: headers, body: body, includeCookies: includeCookies)
-                // The status decides as soon as URLSession hands over the response, at the first
-                // body byte. A refusal ends here even when its explanation then stalls or breaks
-                // off, so a body error cannot cause another request.
+                // The status decides as soon as URLSession hands over the response. A refusal
+                // ends here even when its explanation then stalls or breaks off, so a body error
+                // cannot cause another request.
                 let (bytes, resp) = try await responseBytes(for: req, url: url)
                 guard let http = resp as? HTTPURLResponse else {
                     bytes.task.cancel()
@@ -681,9 +726,14 @@ public final class HTTPClient: @unchecked Sendable {
         return true
     }
 
-    // Do not leave media from a refused operation available for resume.
+    // Do not leave media from a refused operation, or from one whose status is unknown, available
+    // for resume.
     private static func discardRefusedTransfer(partURL: URL, stateURL: URL, after error: Error) {
-        guard case HTTPError.status(let code, _) = error, isRefusal(code) else { return }
+        switch error {
+        case HTTPError.status(let code, _) where isRefusal(code): break
+        case HTTPError.noStatus: break
+        default: return
+        }
         try? FileManager.default.removeItem(at: partURL)
         try? FileManager.default.removeItem(at: stateURL)
     }

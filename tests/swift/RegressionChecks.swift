@@ -118,6 +118,7 @@ final class FixtureProtocol: URLProtocol {
         var headers: [String: String] = [:]
         var failure: URLError?
         var redirect: URL?
+        var lostAfterResponse = false
 
         switch (url.host ?? "", url.path) {
         case ("cdn.syndication.twimg.com", "/tweet-result"), ("instance.invalid", "/api/v1/videos/fixture"), ("i.imgur.com", "/abc123.mp4"):
@@ -197,11 +198,17 @@ final class FixtureProtocol: URLProtocol {
             } else { data = body }
         case ("media.invalid", "/editions.m3u8"):
             data = Data("#EXTM3U\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@0\npack.ts\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/repeat.m3u8"):
+            data = Data("#EXTM3U\n#EXTINF:2,\npack.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:2,\npack.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/lost-after-headers"):
+            // A 403 response, and then the connection is lost before any body byte.
+            status = 403
+            lostAfterResponse = true
         case ("media.invalid", "/pack.ts"):
             // hls-live-whole-changed: every read after the first comes from a new edition.
             let changed = range == "bytes=2-3" || Self.lock.withLock {
                 (mode == "hls-live-changed" && Self.seen.contains { $0.url.path == url.path && $0.range == nil })
-                    || (mode == "hls-live-whole-changed" && Self.seen.contains { $0.url.path == url.path })
+                    || ((mode == "hls-live-whole-changed" || mode == "hls-repeat-changed") && Self.seen.contains { $0.url.path == url.path })
             }
             let edition = Data((changed ? "BBBB" : "AAAA").utf8)
             if mode != "hls-untagged-edition" && !mode.hasPrefix("hls-live-") { headers["ETag"] = changed ? "\"B\"" : "\"A\"" }
@@ -279,7 +286,7 @@ final class FixtureProtocol: URLProtocol {
                      "watch-details-summary", "watch-confirm-identity":
                     data = Self.wallPage(player: player, mode: mode)
                 case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson",
-                     "watch-agent-settings":
+                     "watch-agent-settings", "watch-ordinary-objects":
                     data = Self.inertTextPage(player: mode == "watch-lesson-no-state" ? nil : player, visitor: visitor, mode: mode)
                 default:
                     data = Self.watchPage(player: player, visitor: visitor)
@@ -446,6 +453,10 @@ final class FixtureProtocol: URLProtocol {
         headers["Content-Length"] = String(data.count)
         let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
         client!.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        if lostAfterResponse {
+            client!.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+            return
+        }
         if !data.isEmpty { client!.urlProtocol(self, didLoad: data) }
         client!.urlProtocolDidFinishLoading(self)
     }
@@ -578,6 +589,8 @@ final class FixtureProtocol: URLProtocol {
             html += "<article><h1>Uploading a video</h1><p>This lesson explains why an upload remains private until verification is complete.</p></article>"
         case "watch-agent-settings":
             html += "<article><h1>Remote playback</h1><p>Verify your agent settings, then try again.</p><p>Verify your audio settings.</p></article>"
+        case "watch-ordinary-objects":
+            html += "<article><h1>Storage setup</h1><p>Confirm your identity provider settings before you save the configuration.</p><p>Verify the cable is not a bottleneck for the disk.</p></article>"
         default: break
         }
         if mode == "watch-hidden-notice" {
@@ -934,7 +947,7 @@ struct RegressionChecks {
             check(closedByBotGate(error) && paths == ["/watch"] && savedOutputs().isEmpty,
                   "a visible verification notice stops after the first response, even when the page embeds ordinary player metadata; error=\(String(describing: error)), paths=\(paths), saved=\(savedOutputs())")
         case "watch-inert-text", "watch-lesson-no-state", "watch-hidden-notice", "watch-closed-details", "watch-verification-lesson",
-             "watch-agent-settings":
+             "watch-agent-settings", "watch-ordinary-objects":
             let (file, error) = await download(audioExt: "webm")
             let bytes = file.flatMap { try? Data(contentsOf: $0) }
             let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
@@ -1115,10 +1128,10 @@ struct RegressionChecks {
                 check(status == 403 && origin.requests == 1,
                       "a 403 ends the request at its headers, whatever happens to its body; status=\(status), requests=\(origin.requests), error=\(String(describing: failure))")
             }
-        // URLSession hands over a response only with its first body byte. A 403 that sends its
+        // URLSession can hold a response until some of its body arrives. A 403 that sends its
         // headers and then no body reaches uBit as a timeout, so its status is unknown; neither
-        // fetchData nor a parallel range worker sends that request again. A repeated request
-        // would get the whole refusal at once.
+        // fetchData nor a parallel range worker sends that request again, and no probe, stream or
+        // worker exit keeps resume files. A repeated request would get the whole refusal at once.
         case "refusal-headers-only":
             final class Counts: @unchecked Sendable {
                 private let lock = NSLock()
@@ -1148,7 +1161,34 @@ struct RegressionChecks {
                 }
                 close(connection)
             }
+            // Every request to `probe` gets the refusal headers. `stream` answers its probe without
+            // byte ranges, so the download uses one stream, and that stream gets them.
+            let probe = WireOrigin { connection, _, _ in
+                WireOrigin.transmit(connection, refusal)
+                sleep(45)
+                close(connection)
+            }
+            let stream = WireOrigin { connection, number, _ in
+                if number == 1 {
+                    WireOrigin.transmit(connection, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nabcd")
+                } else {
+                    WireOrigin.transmit(connection, refusal)
+                    sleep(45)
+                }
+                close(connection)
+            }
             let file = AppPaths.appSupportDir.appendingPathComponent("headers-only.bin")
+            let probeFile = AppPaths.appSupportDir.appendingPathComponent("headers-only-probe.bin")
+            let streamFile = AppPaths.appSupportDir.appendingPathComponent("headers-only-stream.bin")
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            for target in [file, probeFile, streamFile] {
+                try Data("resume prefix".utf8).write(to: target.appendingPathExtension("part"))
+                try Data("{}".utf8).write(to: target.appendingPathExtension("part.json"))
+            }
+            func leftovers(_ target: URL) -> [String] {
+                [target, target.appendingPathExtension("part"), target.appendingPathExtension("part.json")]
+                    .filter { FileManager.default.fileExists(atPath: $0.path) }.map(\.lastPathComponent)
+            }
             async let fetchFailure: Error? = {
                 do { _ = try await HTTPClient().fetchData(url: "http://127.0.0.1:\(single.port)/unavailable", retries: 3) } catch { return error }
                 return nil
@@ -1157,16 +1197,75 @@ struct RegressionChecks {
                 do { try await HTTPClient().downloadFile(url: "http://127.0.0.1:\(parallel.port)/unavailable.bin", destination: file, connections: 2) } catch { return error }
                 return nil
             }()
+            async let probeFailure: Error? = {
+                do { try await HTTPClient().downloadFile(url: "http://127.0.0.1:\(probe.port)/unavailable.bin", destination: probeFile, connections: 2) } catch { return error }
+                return nil
+            }()
+            async let streamFailure: Error? = {
+                do { try await HTTPClient().downloadFile(url: "http://127.0.0.1:\(stream.port)/unavailable.bin", destination: streamFile, connections: 2) } catch { return error }
+                return nil
+            }()
             func unknownStatus(_ error: Error?) -> Bool {
                 if case HTTPError.noStatus? = error as? HTTPError { return true }
                 return false
             }
-            let (first, second) = await (fetchFailure, downloadFailure)
+            let (first, second, third, fourth) = await (fetchFailure, downloadFailure, probeFailure, streamFailure)
             check(unknownStatus(first) && single.requests == 1,
                   "fetchData does not repeat a request whose headers arrived without a body; requests=\(single.requests), error=\(String(describing: first))")
             let seen = ranges.all
-            check(unknownStatus(second) && !seen.isEmpty && seen.values.allSatisfy { $0 == 1 } && !FileManager.default.fileExists(atPath: file.path),
-                  "a range worker does not repeat a range whose headers arrived without a body; ranges=\(seen), error=\(String(describing: second))")
+            check(unknownStatus(second) && !seen.isEmpty && seen.values.allSatisfy { $0 == 1 } && leftovers(file).isEmpty,
+                  "a range worker does not repeat a range whose headers arrived without a body, and keeps no resume files; ranges=\(seen), files=\(leftovers(file)), error=\(String(describing: second))")
+            check(unknownStatus(third) && probe.requests == 1 && leftovers(probeFile).isEmpty,
+                  "a probe whose status is unknown keeps no resume files; requests=\(probe.requests), files=\(leftovers(probeFile)), error=\(String(describing: third))")
+            check(unknownStatus(fourth) && stream.requests == 2 && leftovers(streamFile).isEmpty,
+                  "a single stream whose status is unknown keeps no resume files; requests=\(stream.requests), files=\(leftovers(streamFile)), error=\(String(describing: fourth))")
+        // No request starts while another request of the operation waits for its status, so no
+        // segment request starts after a refusal whose status uBit has not read yet. `s1` is a
+        // slow success; without the rule, its worker asks for `s2` while `s0` is refused.
+        case "refusal-hls-parallel":
+            final class Paths: @unchecked Sendable {
+                private let lock = NSLock()
+                private var list: [String] = []
+                func add(_ path: String) { lock.withLock { list.append(path) } }
+                var all: [String] { lock.withLock { list } }
+            }
+            let paths = Paths()
+            let origin = WireOrigin { connection, _, request in
+                let path = request.split(separator: " ").dropFirst().first.map(String.init) ?? ""
+                paths.add(path)
+                switch path {
+                case "/clip.m3u8":
+                    let body = "#EXTM3U\n#EXTINF:2,\ns0.ts\n#EXTINF:2,\ns1.ts\n#EXTINF:2,\ns2.ts\n#EXT-X-ENDLIST\n"
+                    WireOrigin.transmit(connection, "HTTP/1.1 200 OK\r\nContent-Length: \(body.utf8.count)\r\nConnection: close\r\n\r\n" + body)
+                case "/s0.ts":
+                    WireOrigin.transmit(connection, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: 16\r\nConnection: close\r\n\r\n")
+                    sleep(45)
+                default:
+                    usleep(500_000)
+                    WireOrigin.transmit(connection, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nGGGG")
+                }
+                close(connection)
+            }
+            let file = AppPaths.appSupportDir.appendingPathComponent("refused.ts")
+            var failure: Error?
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "http://127.0.0.1:\(origin.port)/clip.m3u8", destination: file, connections: 2)
+            } catch { failure = error }
+            let seen = paths.all
+            check(failure != nil && seen.last == "/s0.ts" && !seen.contains("/s2.ts") && !FileManager.default.fileExists(atPath: file.path),
+                  "no segment request starts after a refusal whose status is not yet known; requests=\(seen), error=\(String(describing: failure))")
+        // A request that fails after its response began, with metrics that prove nothing (here a
+        // URLProtocol load), is not repeated: missing proof is not permission.
+        case "metrics-unproven":
+            var failure: Error?
+            do {
+                _ = try await HTTPClient().fetchData(url: "https://media.invalid/lost-after-headers", retries: 3)
+            } catch { failure = error }
+            let attempts = FixtureProtocol.requests().filter { $0.url.path == "/lost-after-headers" }.count
+            var unknown = false
+            if case HTTPError.noStatus? = failure as? HTTPError { unknown = true }
+            check(unknown && attempts == 1,
+                  "uninformative metrics do not allow another request; attempts=\(attempts), error=\(String(describing: failure))")
         case "cancel-slots":
             // A waiter that is cancelled gives its slot back when nobody queued behind it.
             let pacer = YouTubeExtractor.YTGuard()
@@ -1716,6 +1815,17 @@ struct RegressionChecks {
             let saved = try? Data(contentsOf: file)
             check(mode == "hls-changed-edition" ? rejected && saved == nil : saved == Data("AAAA".utf8),
                   "two playlist ranges must not publish bytes from different editions")
+        // Two whole reads of one URI in one selection give one edition: a changed object fails
+        // without a clip, and an unchanged object is saved twice.
+        case "hls-repeat-stable", "hls-repeat-changed":
+            let file = AppPaths.appSupportDir.appendingPathComponent("repeat.ts")
+            var rejected = false
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/repeat.m3u8", destination: file, connections: 1)
+            } catch HTTPError.rangeUnsupported { rejected = true }
+            let saved = try? Data(contentsOf: file)
+            check(mode == "hls-repeat-changed" ? rejected && saved == nil : saved == Data("AAAAAAAA".utf8),
+                  "two whole reads of one URI must not publish bytes from different editions; saved=\(saved.map { String(decoding: $0, as: UTF8.self) } ?? "none")")
         case "hls-short-range":
             let folder = AppPaths.appSupportDir.appendingPathComponent("out")
             var options = DownloadRequestOptions()

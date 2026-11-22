@@ -263,22 +263,40 @@ public struct YouTubeExtractor: SiteExtractor {
             text.localizedCaseInsensitiveContains("confirm your age")
     }
 
-    /// Text that a reader sees as a verification instruction, read from one visible block.
-    /// Prose that only explains verification is not a notice. An instruction starts with
-    /// "verify" or "confirm" as a whole word, so "verify your agent settings" is not
-    /// "verify your age".
-    private static func isNotice(_ text: String) -> Bool {
-        let instruction = text.hasPrefix("please ") ? String(text.dropFirst(7)) : text
-        func starts(_ phrase: String) -> Bool {
-            guard instruction.hasPrefix(phrase) else { return false }
-            guard let next = instruction.dropFirst(phrase.count).first else { return true }
+    /// Objects of a verification instruction: the age or identity of the reader, or a statement
+    /// that the reader is human.
+    private static let noticeObjects: [String] = {
+        let human = ["human", "a human", "not a bot", "not a robot"]
+        let subjects = ["you are ", "you're ", "you’re "]
+        return ["your age", "your identity"] + subjects.flatMap { subject in human.map { subject + $0 } }
+    }()
+
+    /// Words that can follow the object of an instruction and start a new part of the sentence.
+    private static let clauseWords: Set<String> = ["to", "before", "and", "so", "by", "with", "first", "now", "again", "then", "or", "if", "below", "here"]
+
+    /// True for "verify" or "confirm", an optional "that", and an object that ends there:
+    /// after it comes the end of the text, a punctuation mark, or a word from `clauseWords`.
+    /// So "verify your agent settings", "confirm your identity provider settings" and "verify
+    /// the cable is not a bottleneck" are not instructions.
+    private static func isInstruction(_ text: String) -> Bool {
+        var rest = Substring(text)
+        if rest.hasPrefix("please ") { rest = rest.dropFirst(7) }
+        guard let verb = ["verify ", "confirm "].first(where: { rest.hasPrefix($0) }) else { return false }
+        rest = rest.dropFirst(verb.count)
+        if rest.hasPrefix("that ") { rest = rest.dropFirst(5) }
+        return noticeObjects.contains { object in
+            guard rest.hasPrefix(object) else { return false }
+            let after = rest.dropFirst(object.count)
+            guard let next = after.first else { return true }
+            if next == " " { return clauseWords.contains(String(after.dropFirst().prefix(while: \.isLetter))) }
             return !next.isLetter && !next.isNumber
         }
-        let human = ["you are human", "you're human", "you’re human", "you are a human", "you're a human", "you’re a human", "not a bot", "not a robot"]
-        return ["verify", "confirm"].contains { verb in
-            starts("\(verb) your age") || starts("\(verb) your identity")
-                || (starts(verb) && human.contains(where: instruction.contains))
-        }
+    }
+
+    /// Text that a reader sees as a verification instruction, read from one visible block.
+    /// Prose that only explains verification is not a notice.
+    private static func isNotice(_ text: String) -> Bool {
+        isInstruction(text)
             || (text.contains("playback is blocked") && text.contains("verif"))
             || (text.contains("sign in to confirm") && (text.contains("not a bot") || text.contains("your age")))
             || text.contains("detected unusual traffic")

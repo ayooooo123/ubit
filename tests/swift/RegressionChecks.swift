@@ -41,6 +41,8 @@ final class FixtureProtocol: URLProtocol {
     static let firstVisitor = "CgtFixtureVisitorFirst00000000000000"
     static let secondVisitor = "CgtFixtureVisitorSecond0000000000000"
     static let mediaBytes = Data("fixture-media-payload-for-the-http-path".utf8)
+    /// Modes in which every /player response names an HLS playlist and every range test fails.
+    static let hlsFallbackModes: Set<String> = ["hls-fallback", "hls-fallback-nowatch"]
 
     static func requests() -> [SeenRequest] { lock.withLock { seen } }
     static func beginDownload() { lock.withLock { downloadPhase = true } }
@@ -92,7 +94,10 @@ final class FixtureProtocol: URLProtocol {
                 ? ["playabilityStatus": ["status": "LOGIN_REQUIRED", "reason": "Sign in to confirm you're not a bot"]]
                 : ["playabilityStatus": ["status": "OK"]]
             let json = String(data: try! JSONSerialization.data(withJSONObject: player), encoding: .utf8)!
-            data = Data("<script>var ytcfg = {\"VISITOR_DATA\":\"\(visitor)\"};</script><script>var ytInitialPlayerResponse = \(json);</script>".utf8)
+            // hls-fallback-nowatch: the watch page carries no ytInitialPlayerResponse.
+            data = mode == "hls-fallback-nowatch"
+                ? Data("<script>var ytcfg = {\"VISITOR_DATA\":\"\(visitor)\"};</script>".utf8)
+                : Data("<script>var ytcfg = {\"VISITOR_DATA\":\"\(visitor)\"};</script><script>var ytInitialPlayerResponse = \(json);</script>".utf8)
         case (_, let path) where path.hasSuffix("/player"):
             if mode == "auth-header" && playerNumber % 2 == 1 {
                 // Not the bot wall, so extraction goes on to the next client profile.
@@ -116,10 +121,13 @@ final class FixtureProtocol: URLProtocol {
                 case "ump-unknown-length": break
                 default: format["contentLength"] = String(Self.mediaBytes.count)
                 }
+                // In the hls-fallback modes, /player also names an HLS playlist.
+                var streaming: [String: Any] = ["adaptiveFormats": [format]]
+                if Self.hlsFallbackModes.contains(mode) { streaming["hlsManifestUrl"] = "https://media.invalid/clip.m3u8" }
                 data = Self.json([
                     "playabilityStatus": ["status": "OK"],
                     "videoDetails": ["title": "\(title)-\(playerNumber)", "lengthSeconds": "8"],
-                    "streamingData": ["adaptiveFormats": [format]],
+                    "streamingData": streaming,
                 ])
             }
         case ("media.invalid", "/media"):
@@ -128,6 +136,8 @@ final class FixtureProtocol: URLProtocol {
             let broken = (phase && mediaNumber == 1) || mode == "ump-cold"
             if broken && ["stale", "section", "stale-embed"].contains(mode) {
                 status = 403
+            } else if Self.hlsFallbackModes.contains(mode) {
+                status = 403   // every range test fails from the start
             } else if broken && ["ump-cut", "ump-complete", "ump-unknown-length", "ump-cold"].contains(mode) {
                 // Ranged GETs are refused; the UMP start request answers with a redirect part.
                 // In ump-complete the 1-byte probe works, so the HTTP downloader opens its
@@ -160,7 +170,9 @@ final class FixtureProtocol: URLProtocol {
         case ("media.invalid", let path) where path.hasPrefix("/seg-"):
             data = Data(path.utf8)
         case ("media.invalid", "/clip.m3u8"):
-            // An fMP4 VOD playlist of 15 segments, 4 s each, with four 1 s samples in each segment.
+            // An HLS playlist of 15 fragmented MP4 segments, 4 s each, with four 1 s samples in each
+            // segment. The boxes are the smallest tree that uBit's reader accepts, not a file that
+            // a standard player can read (the stsd box is empty, and mvhd, tkhd, mfhd and tfdt are missing).
             let segments = (0..<15).map { "#EXTINF:4.0,\nclip-\($0).m4s" }.joined(separator: "\n")
             data = Data("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"clip-init.mp4\"\n\(segments)\n#EXT-X-ENDLIST\n".utf8)
         case ("media.invalid", "/clip-init.mp4"):
@@ -261,8 +273,8 @@ enum Bytes {
 
     static func box(_ type: String, _ payload: [UInt8]) -> [UInt8] { be32(UInt32(8 + payload.count)) + Array(type.utf8) + payload }
 
-    /// Init segment of a one-track audio fMP4: timescale 1000, default sample duration 1000 (1 s),
-    /// default sample size 1 byte.
+    /// Init segment of one audio track: timescale 1000, default sample duration 1000 (1 s), default
+    /// sample size 1 byte. Only uBit's reader needs to accept it.
     static let clipInit: [UInt8] = {
         let mdhd = box("mdhd", be32(0) + be32(0) + be32(0) + be32(1000) + be32(0) + be32(0))
         let hdlr = box("hdlr", be32(0) + be32(0) + Array("soun".utf8) + [UInt8](repeating: 0, count: 13))
@@ -554,6 +566,45 @@ struct RegressionChecks {
             let fetched = FixtureProtocol.requests().map(\.url.path).filter { $0.hasSuffix(".m4s") }.sorted()
             check(seconds == [20, 21, 22, 23, 24, 25] && fetched == ["/clip-4.m4s", "/clip-5.m4s", "/clip-6.m4s"],
                   "a 0:20-0:26 section of an HLS stream saves the samples of seconds 20 to 25; saved seconds=\(seconds), segments=\(fetched)")
+        case "hls-raw-section", "http-raw-section":
+            // A raw MP3 stream (the shape that the SoundCloud extractor returns) with a 0:20-0:26
+            // section is not trimmed. Over plain HTTP it is saved whole; over HLS, the segments that
+            // overlap the section (4 to 6 of 15, 4 s each) are saved as they are.
+            let overHLS = FixtureProtocol.mode == "hls-raw-section"
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.cookieSource = "none"
+            options.audioOnly = true
+            options.connections = 1
+            options.targetFormat = "mp3"
+            options.outputDir = AppPaths.appSupportDir.appendingPathComponent("out").path
+            options.section = SectionRange(start: 20, end: 26)
+            let format = overHLS
+                ? MediaFormat(id: "hls-mp3", url: "https://media.invalid/hls.m3u8", ext: "mp3", proto: .hls, vcodec: "none", acodec: "mp3", bitrate: 128_000)
+                : MediaFormat(id: "http-mp3", url: "https://media.invalid/seg-whole.mp3", ext: "mp3", proto: .http, vcodec: "none", acodec: "mp3", bitrate: 128_000)
+            let info = MediaInfo(id: "x", title: "x", site: "Fixture", webpageURL: "https://media.invalid/page", formats: [format])
+            let file = try await DownloadEngine().downloadSingle(url: "https://media.invalid/page", preExtracted: info, settings: settings, options: options)
+            let saved = String(decoding: try Data(contentsOf: file), as: UTF8.self)
+            let expected = overHLS ? "/seg-4.ts/seg-5.ts/seg-6.ts" : "/seg-whole.mp3"
+            check(saved == expected, "a raw MP3 stream with --section is not trimmed (whole over HTTP, overlapping segments over HLS); saved=\(saved), expected=\(expected)")
+        case "hls-fallback", "hls-fallback-nowatch":
+            // Every range test fails, and every /player response names an HLS playlist. With player
+            // data on the watch page, extraction offers only the HLS formats. Without it, extraction
+            // fails. Neither mode tries UMP.
+            var formats: [String] = []
+            var failure = ""
+            do {
+                formats = try await extract().formats.map { "\($0.id):\($0.proto.rawValue)" }
+            } catch ExtractorError.notFound(let message) {
+                failure = message
+            }
+            let ok = FixtureProtocol.mode == "hls-fallback"
+                ? !formats.isEmpty && formats.allSatisfy { $0.hasSuffix(":hls") } && failure.isEmpty
+                : formats.isEmpty && failure.contains("player request failed")
+            check(ok && umpPosts().isEmpty,
+                  "after every range test fails, the HLS playlist is used only with player data from the watch page; formats=\(formats), failure=\(failure), umpPosts=\(umpPosts().count)")
         case "non-http-error":
             let (_, error) = await download(audioExt: "webm")
             check((error as? URLError)?.code == .cancelled && umpPosts().isEmpty,

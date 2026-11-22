@@ -46,7 +46,7 @@ ubit get -q 720 --no-library --json -o /tmp/ubit-out "<url>"
 
 ### 3. Extract Only a Specific Time Window (`--section`)
 
-Never download a multi-gigabyte video when only a short segment is needed. For an MP4 or M4A stream with a `sidx` index and a server that accepts byte ranges, `--section` fetches only the `init` box and the overlapping segment bytes; for HLS it fetches only the overlapping segments. Without a `sidx` index, for DASH, and after the YouTube UMP fallback, the whole stream is downloaded, so a short clip does not guarantee a small transfer. The clip is cut on the preceding sync keyframe when the output goes through the MP4 muxer (MP4, M4A, HLS, DASH). A WebM stream or a raw MP3, Opus, FLAC or WAV audio stream is saved whole: `--section` does not trim it.
+Never download a multi-gigabyte video when only a short segment is needed. For an MP4 or M4A stream with a `sidx` index and a server that accepts byte ranges, `--section` fetches only the `init` box and the overlapping segment bytes; for HLS it fetches only the overlapping segments. Without a `sidx` index, for DASH, and after the YouTube UMP fallback, the whole stream is downloaded, so a short clip does not guarantee a small transfer. The clip is cut on the preceding sync keyframe when the output goes through the MP4 muxer (MP4 or M4A output from a progressive, HLS or DASH stream). A WebM stream or a raw MP3, Opus, FLAC or WAV audio stream is not trimmed: over plain HTTP it is saved whole, and over HLS the segments that overlap the section are saved as they are, so the file can start and end up to one segment outside the section.
 
 ```sh
 ubit get -q 720 --section 1:30-2:00 --no-library --quiet -o /tmp/ubit-out "<url>"

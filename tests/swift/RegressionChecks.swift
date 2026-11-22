@@ -1098,13 +1098,24 @@ struct RegressionChecks {
             let fromThird = MP4Muxer.trimTracks([video], section: SectionRange(start: 0.4, end: 0.5),
                                                  baseStart: SectionTimeBase(ticks: 1, timescale: 3))
             check(fromThird.first?.samples.map(\.offset) == [10, 11, 12, 13, 14], "the exclusive end omits frame 15 after a one-third-second fragment start")
-            let decode = [0, 2, -1, -1].enumerated().map {
-                MP4Sample(offset: UInt64($0.offset), size: 1, duration: 1, ctsOffset: Int32($0.element), isSync: $0.offset == 0)
+            let offsets: [Int32] = [0, 2, -1, -1]
+            let decode = offsets.enumerated().map { i, offset -> MP4Sample in
+                let byte = Data([UInt8(i)])
+                return MP4Sample(offset: 0, size: 1, duration: 1, ctsOffset: offset, isSync: i == 0, inlineData: byte)
             }
             var reordered = video
             reordered.samples = decode
             let display = MP4Muxer.trimTracks([reordered], section: SectionRange(start: 0, end: 0.1)).first
             check(display?.samples.count == 4 && display?.editSegmentTicks == 3, "the clip retains the fourth decode sample but presents only the first three pictures")
+            let file = AppPaths.appSupportDir.appendingPathComponent("reordered.mp4")
+            if let display {
+                try MP4Muxer.writeMP4(tracks: [display], sourceFiles: [], destination: file)
+                let reopened = try MP4Muxer.readTracks(from: file)
+                let open = MP4Muxer.trimTracks(reopened, section: SectionRange(start: 0, end: nil))
+                let eof = MP4Muxer.trimTracks(reopened, section: SectionRange(start: 0.1, end: nil))
+                check(open.first?.editSegmentTicks == 3 && open.first?.samples.count == 4 && eof.isEmpty,
+                      "reopening the clip cannot present the hidden reference picture or create a clip at displayed EOF")
+            }
         case "hls-decimal", "sidx-boundaries", "sidx-fragments", "sidx-padding":
             let hls = mode == "hls-decimal"
             let path = hls ? "/clip.m3u8" : "/indexed.mp4"

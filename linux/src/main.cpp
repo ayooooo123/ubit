@@ -222,7 +222,7 @@ inline std::string pad_col(const std::string& s, size_t w) {
 inline void print_llm_manifest() {
     std::printf(
         "# uBit (%s) — Agent CLI Contract\n\n"
-        "Binary: `ubit` (Linux x86_64 / arm64 & macOS arm64). Zero external dependencies required for MP4 and M4A.\n\n"
+        "Binary: `ubit` (C++ CLI). The native macOS Swift CLI has a separate contract.\n\n"
         "## Commands\n"
         "- `ubit get <url>... [flags]` — Download video/audio. Prefer `--json` (NDJSON events on stdout) or `--quiet` (prints only final saved file path(s)).\n"
         "- `ubit info <url> --json` — Probe metadata (`id`, `title`, `site`, `author`, `duration`, `isLive`, `isDRM`, `formats`, `subtitles`, `chapters`, `entries`).\n"
@@ -235,7 +235,7 @@ inline void print_llm_manifest() {
         "- `--json` — Emit NDJSON events: `start`, `info`, `progress`, `process`, `done`, `error`, `stopped`.\n"
         "- `--quiet` — Print ONLY saved absolute file paths to stdout.\n"
         "- `--no-library` — Omit ephemeral agent scratch downloads from user library.\n"
-        "- `--section START-END` — Keyframe-accurate `sidx` HTTP byte-range clip trim (e.g. `0:30-1:00`).\n"
+        "- `--section START-END` — Best-effort clip (e.g. `0:30-1:00`), not a guarantee of keyframe accuracy. The C++ engine uses only the first segment index. A cut MP4 can return success with missing frames. HLS clips can be shifted or contain media at playlist EOF. Verify the decoded frames.\n"
         "- `-q <best|2160|1440|1080|720|480|360>` / `-f <vid+aid>` / `-a` (audio only).\n"
         "- `UBIT_CONFIG_DIR=/tmp/agent-ubit` — Isolate state per agent sandbox.\n\n"
         "## Exit Codes\n"
@@ -277,7 +277,9 @@ inline void print_get_help() {
         "      --subs / --sub-langs L / --sub-files\n"
         "  -i, --input FILE              Read URLs one per line (- reads stdin)\n"
         "      --playlist / --no-playlist / --items 1,3,5-7\n"
-        "      --section 1:00-2:30       Keyframe-accurate sidx byte-range clip trim\n"
+        "      --section 1:00-2:30       Best-effort clip. Only the first MP4 segment index is checked.\n"
+        "                                A cut MP4 can exit 0. HLS clips can be shifted or include\n"
+        "                                media at playlist EOF. Verify the decoded frames.\n"
         "      --sponsors-remove CATS / --sponsors-mark CATS / --keep-sponsors\n"
         "      --title TEXT / --name TEMPLATE\n"
         "      --rate 2M / --connections N (1-32, default 8)\n"

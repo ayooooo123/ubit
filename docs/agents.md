@@ -44,6 +44,8 @@ On the native macOS Swift CLI, for indexed MP4/M4A input, `ubit` requests the st
 
 For an indexed MP4 or M4A clip, each selected reference must contain a media fragment, not just padding. If the client downloads the whole file, it checks every top-level segment index, including those after the requested clip. A reference to padding or missing bytes causes the command to fail without saving the clip.
 
+The Swift muxer can copy or shorten a track with a single normal-speed edit. A frame that the player needs for decoding can remain in the file without being displayed. Reopening the clip does not extend its displayed interval. The muxer rejects multiple edits and nonstandard playback rates rather than silently changing their timeline.
+
 On that path, for HLS, at least one segment must contain media inside the requested interval. A section that starts at or beyond the end of the playlist fails without fetching a media segment. At an exact segment boundary, `ubit` also keeps the previous segment, if present, for keyframe preroll. WebM and raw MP3, Opus, FLAC or WAV do not go through the MP4 trimmer: `ubit` saves the whole file over plain HTTP, or the selected segments over HLS.
 
 ```sh

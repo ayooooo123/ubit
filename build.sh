@@ -139,8 +139,16 @@ codesign --force --deep --sign - "$APP"
 ln -sf "$MACOS/ubit" "$DIST/ubit"
 # System bsdtar, owned by root:wheel, so that the archive does not hold the
 # account name of the person who built it or macOS extended attributes.
-COPYFILE_DISABLE=1 /usr/bin/tar --no-mac-metadata --no-xattrs --uid 0 --gid 0 --uname root --gname wheel \
-  -czf "$DIST/ubit-0.3.3-darwin-arm64.tar.gz" -C "$DIST" uBit.app
+# AppleDouble (._*) files are left out. Every entry gets the time of the last
+# commit (or SOURCE_DATE_EPOCH), the entries go in byte order and gzip -n
+# writes no time, so the same build gives the same archive bytes.
+EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || echo 0)}"
+STAMP=$(date -u -r "$EPOCH" +%Y-%m-%dT%H:%M:%SZ)
+(cd "$DIST" && find uBit.app -name '._*' -prune -o -exec touch -h -d "$STAMP" {} + \
+  && find uBit.app -name '._*' -prune -o -print | LC_ALL=C sort > .pack-list \
+  && COPYFILE_DISABLE=1 /usr/bin/tar --no-mac-metadata --no-xattrs --uid 0 --gid 0 --uname root --gname wheel \
+    -n -T .pack-list -cf ubit-0.3.3-darwin-arm64.tar \
+  && gzip -n -f ubit-0.3.3-darwin-arm64.tar && rm .pack-list)
 
 echo "✓ Built $APP and $DIST/ubit-0.3.3-darwin-arm64.tar.gz"
 ls -lh "$MACOS/ubit" "$RES/AppIcon.icns" "$DIST/ubit-0.3.3-darwin-arm64.tar.gz"

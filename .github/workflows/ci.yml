@@ -22,7 +22,9 @@ jobs:
           ./dist/ubit --llms
           ./dist/ubit sites --json
       - name: Built binary holds no home-directory path
-        run: ./tests/home-paths.sh dist/uBit.app/Contents/MacOS/ubit
+        run: |
+          ./tests/home-paths-selftest.sh
+          ./tests/home-paths.sh dist/uBit.app/Contents/MacOS/ubit
       - name: Binary and archive stay within the size limits
         run: |
           binary=$(stat -f %z dist/uBit.app/Contents/MacOS/ubit)
@@ -30,10 +32,17 @@ jobs:
           echo "binary $binary bytes (limit 2000000), archive $archive bytes (limit 1000000)"
           test "$binary" -lt 2000000
           test "$archive" -lt 1000000
-      - name: Archive entries name no build account
+      - name: Archive entries name no build account and hold no AppleDouble file
         run: |
           others=$(/usr/bin/tar -tvzf dist/ubit-*-darwin-arm64.tar.gz | awk '$3 != "root" || $4 != "wheel"')
           test -z "$others" || { echo "$others"; exit 1; }
+          # macOS tar hides ._ entries when it lists an archive, so Python reads the names.
+          python3 -c 'import sys, tarfile; bad = [n for n in tarfile.open(sys.argv[1]).getnames() if n.rsplit("/", 1)[-1].startswith("._")]; print(*bad, sep="\n"); sys.exit(1 if bad else 0)' dist/ubit-*-darwin-arm64.tar.gz
+      - name: A second build gives the same archive bytes
+        run: |
+          cp dist/ubit-*-darwin-arm64.tar.gz "$RUNNER_TEMP/first.tar.gz"
+          ./build.sh
+          cmp "$RUNNER_TEMP/first.tar.gz" dist/ubit-*-darwin-arm64.tar.gz
       - name: Upload macOS release archive
         uses: actions/upload-artifact@v4
         with:
@@ -45,7 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install aarch64 cross-compiler & binutils
-        run: sudo apt-get update && sudo apt-get install -y g++-aarch64-linux-gnu file binutils
+        run: sudo apt-get update && sudo apt-get install -y g++-aarch64-linux-gnu file binutils ffmpeg
       - name: Build Linux (amd64, arm64) and Android/Termux (android-arm64) archives
         run: ./linux/build_linux.sh
       - name: Verify Linux amd64 & Android Bionic ELF linkage
@@ -55,16 +64,17 @@ jobs:
           tar -xzf dist/ubit-*-android-arm64.tar.gz -C /tmp/test-android
           file /tmp/test-amd64/ubit /tmp/test-android/ubit
           readelf -d /tmp/test-android/ubit | grep NEEDED
-          ! readelf -d /tmp/test-android/ubit | grep -q 'libc++_shared'
+          if readelf -d /tmp/test-android/ubit | grep -q 'libc++_shared'; then exit 1; fi
           /tmp/test-amd64/ubit version
           /tmp/test-amd64/ubit --llms
           /tmp/test-amd64/ubit sites --json
       - name: Linux & Android binaries hold no home-directory path
         run: |
+          ./tests/home-paths-selftest.sh
           mkdir -p /tmp/test-arm64
           tar -xzf dist/ubit-*-linux-arm64.tar.gz -C /tmp/test-arm64
           ./tests/home-paths.sh /tmp/test-amd64/ubit /tmp/test-arm64/ubit /tmp/test-android/ubit
-      - name: Rust SDK rlibs hold no home-directory path
+      - name: Rust SDK rlibs hold no home-directory path, and the SDK tests pass
         run: |
           cargo fetch --locked
           mkdir -p "$HOME/sdk build/source"
@@ -72,8 +82,16 @@ jobs:
           ln -s "$HOME" "$RUNNER_TEMP/build home"
           export HOME="$RUNNER_TEMP/build home"
           cd "$HOME/sdk build/source"
-          CARGO_ENCODED_RUSTFLAGS=-Cdebuginfo=2 sdk/cargo.sh build --locked --offline
+          export CARGO_ENCODED_RUSTFLAGS=-Cdebuginfo=2
+          sdk/cargo.sh build --locked --offline
           find target -name '*.rlib' -print0 | xargs -0 ./tests/home-paths.sh
+          # Control: the same build without the remap must hold home paths, or the scan proves nothing.
+          cargo build --locked --offline --target-dir plain-target
+          if find plain-target -name '*.rlib' -print0 | xargs -0 ./tests/home-paths.sh > plain-scan.log; then
+            echo "the scan passed an SDK built without the remap"; exit 1
+          fi
+          echo "$(grep -c '^FAIL' plain-scan.log) of $(wc -l < plain-scan.log) unremapped rlibs hold a home path"
+          sdk/cargo.sh test --locked --offline
       - name: Upload Linux & Android release archives
         uses: actions/upload-artifact@v4
         with:

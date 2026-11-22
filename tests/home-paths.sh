@@ -14,9 +14,15 @@ for f in "$@"; do
     bad=1
     continue
   fi
-  n=$(LC_ALL=C grep -a -o -F -e "$HOME" -e "$PHOME" "$f" | wc -l | tr -d ' ')
-  if [ "$n" -gt 0 ]; then
-    echo "FAIL $f: $n home-directory paths"
+  # The file goes in on standard input, so that a name such as `--x` is never read as an
+  # option. grep exits 0 on a match, 1 on no match and 2 on an error.
+  status=0
+  n=$(LC_ALL=C grep -a -c -F -e "$HOME" -e "$PHOME" < "$f") || status=$?
+  if [ "$status" -gt 1 ]; then
+    echo "FAIL $f: grep could not read the file"
+    bad=1
+  elif [ "$status" -eq 0 ]; then
+    echo "FAIL $f: $n lines with a home-directory path"
     bad=1
   else
     echo "ok   $f"

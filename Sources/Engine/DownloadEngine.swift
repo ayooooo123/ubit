@@ -336,7 +336,7 @@ public final class DownloadEngine: @unchecked Sendable {
 
             switch fmt.proto {
             case .hls:
-                let (isFMP4, _) = try await HLSEngine.downloadStream(
+                let (isFMP4, _, startTime) = try await HLSEngine.downloadStream(
                     client: client,
                     playlistURL: fmt.url,
                     destination: dest,
@@ -360,7 +360,7 @@ public final class DownloadEngine: @unchecked Sendable {
                         }
                     }
                 }
-                return (0, !isFMP4)
+                return (startTime, !isFMP4)
 
             case .dash:
                 try await DASHEngine.downloadRepresentation(

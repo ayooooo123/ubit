@@ -153,6 +153,12 @@ final class FixtureProtocol: URLProtocol {
         case ("media.invalid", "/ump-stream"):
             // A stream cut between two complete fragments: every box fits, but bytes are missing.
             data = Bytes.umpPart(21, [0] + Bytes.cutStream)
+        case ("media.invalid", "/hls.m3u8"):
+            // A VOD playlist of 15 segments, 4 s each.
+            let segments = (0..<15).map { "#EXTINF:4.0,\nseg-\($0).ts" }.joined(separator: "\n")
+            data = Data("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n\(segments)\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", let path) where path.hasPrefix("/seg-"):
+            data = Data(path.utf8)
         default:
             status = 404   // never forward an unexpected request
         }
@@ -493,6 +499,15 @@ struct RegressionChecks {
             _ = await download(audioExt: "m4a")
             let sidxRefused = FixtureProtocol.requests().contains { $0.url.host == "media.invalid" && $0.method == "GET" && $0.status == 403 }
             check(sidxRefused && !umpPosts().isEmpty, "a refused sidx section request reaches the UMP fallback; umpPosts=\(umpPosts().count)")
+        case "hls-section-base":
+            // The saved HLS timeline starts at 0, so the engine must know where the first kept
+            // segment starts in the stream, or the trim cuts the wrong seconds.
+            let dest = AppPaths.appSupportDir.appendingPathComponent("hls-section.ts")
+            let result = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/hls.m3u8",
+                                                            destination: dest, section: SectionRange(start: 20, end: 26))
+            let fetched = FixtureProtocol.requests().map(\.url.path).filter { $0.hasPrefix("/seg-") }.sorted()
+            check(result.startTime == 16 && fetched == ["/seg-4.ts", "/seg-5.ts", "/seg-6.ts"],
+                  "a section of 0:20-0:26 fetches the three overlapping 4 s segments and reports that they start at 16 s; startTime=\(result.startTime), segments=\(fetched)")
         case "non-http-error":
             let (_, error) = await download(audioExt: "webm")
             check((error as? URLError)?.code == .cancelled && umpPosts().isEmpty,
@@ -568,14 +583,20 @@ struct RegressionChecks {
             let info = await CLIRunner.run(arguments: ["ubit", "info", "--proxy", "127.0.0.1:9", target])
             let get = await CLIRunner.run(arguments: ["ubit", "get", "--proxy", "not a proxy", target])
             let socks4 = await CLIRunner.run(arguments: ["ubit", "info", "--proxy", "socks4://127.0.0.1:9", target])
+            let socks4a = await CLIRunner.run(arguments: ["ubit", "info", "--proxy", "socks4a://127.0.0.1:9", target])
             let added = FixtureProtocol.requests().count - before
             var settings = Settings()
             let storedBad = settings.setByKey("proxy", value: "bogus")
+            let storedSocks4a = settings.setByKey("proxy", value: "socks4a://127.0.0.1:9")
             let storedGood = settings.setByKey("proxy", value: "socks5://127.0.0.1:9")
             _ = await CLIRunner.run(arguments: ["ubit", "info", "--no-cookies", "--proxy", "socks5://127.0.0.1:9", "https://fixture.invalid/video"])
-            let routed = FixtureProtocol.resolvedProxies().contains("\(kCFProxyTypeSOCKS as String) 127.0.0.1:9")
-            check(formats == 2 && info == 2 && get == 2 && socks4 == 2 && added == 0 && !storedBad && storedGood && routed,
-                  "invalid proxies exit 2 before any request, settings refuse them, a valid one is installed; formats=\(formats), info=\(info), get=\(get), socks4=\(socks4), requests=\(added), storedBad=\(storedBad), routed=\(routed)")
+            _ = await CLIRunner.run(arguments: ["ubit", "info", "--no-cookies", "--proxy", "SOCKS5://127.0.0.1", "https://fixture.invalid/video"])
+            let resolved = FixtureProtocol.resolvedProxies()
+            let routed = resolved.contains("\(kCFProxyTypeSOCKS as String) 127.0.0.1:9")
+            let capitalPort = resolved.contains("\(kCFProxyTypeSOCKS as String) 127.0.0.1:1080")
+            check(formats == 2 && info == 2 && get == 2 && socks4 == 2 && socks4a == 2 && added == 0
+                    && !storedBad && !storedSocks4a && storedGood && routed && capitalPort,
+                  "invalid proxies exit 2 before any request, settings refuse them, valid ones are installed and a capital SOCKS5 scheme gets port 1080; formats=\(formats), info=\(info), get=\(get), socks4=\(socks4), socks4a=\(socks4a), requests=\(added), storedBad=\(storedBad), storedSocks4a=\(storedSocks4a), resolved=\(resolved)")
         case "proxy-stored":
             // A proxy that was stored before validation existed (or typed into settings.json)
             // must fail the command, not send the request without a proxy.
@@ -619,6 +640,12 @@ struct RegressionChecks {
     static func main() async {
         guard CommandLine.arguments.count == 2 else {
             print("usage: checks <case>")
+            exit(2)
+        }
+        // Some cases write settings.json; without a scratch config directory they would change
+        // the user's real settings.
+        guard ProcessInfo.processInfo.environment["UBIT_CONFIG_DIR"]?.isEmpty == false else {
+            print("SETUP: set UBIT_CONFIG_DIR to a scratch directory (tests/swift/run.sh does this)")
             exit(2)
         }
         FixtureProtocol.mode = CommandLine.arguments[1]

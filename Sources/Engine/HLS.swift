@@ -318,12 +318,12 @@ public enum HLSEngine {
         connections: Int = 8,
         shouldStopLive: (@Sendable () -> Bool)? = nil,
         onProgress: (@Sendable (_ downloaded: Int64, _ estTotal: Int64, _ fraction: Double, _ recordedSec: Double) -> Void)? = nil
-    ) async throws -> (isFMP4: Bool, duration: Double) {
+    ) async throws -> (isFMP4: Bool, duration: Double, startTime: Double) {
         let (text, finalURL) = try await client.fetchText(url: playlistURL, headers: headers)
         let pl = parseMediaPlaylist(text, baseURL: finalURL)
 
         if pl.isLive && section == nil {
-            return try await recordLiveStream(
+            let (isFMP4, recorded) = try await recordLiveStream(
                 client: client,
                 playlistURL: finalURL.absoluteString,
                 initialPlaylist: pl,
@@ -332,22 +332,30 @@ public enum HLSEngine {
                 shouldStop: shouldStopLive,
                 onProgress: onProgress
             )
+            return (isFMP4, recorded, 0)
         }
 
-        // Filter segments if section range was requested
+        // Filter segments if section range was requested. The demuxers start the saved timeline
+        // at 0, so the caller needs the stream time where the first kept segment starts.
         var selected = pl.segments
+        var startTime: Double = 0
         if let sec = section {
             var acc: Double = 0
             var filtered: [HLSVals.Segment] = []
+            var firstStart: Double = 0
             for seg in pl.segments {
                 let segStart = acc
                 let segEnd = acc + seg.duration
                 acc = segEnd
                 if let s = sec.start, segEnd < s { continue }
                 if let e = sec.end, segStart > e { break }
+                if filtered.isEmpty { firstStart = segStart }
                 filtered.append(seg)
             }
-            if !filtered.isEmpty { selected = filtered }
+            if !filtered.isEmpty {
+                selected = filtered
+                startTime = firstStart
+            }
         }
 
         let segWorkDir = destination.deletingLastPathComponent().appendingPathComponent(".\(destination.lastPathComponent).segs", isDirectory: true)
@@ -463,7 +471,7 @@ public enum HLSEngine {
         try? FileManager.default.removeItem(at: segWorkDir)
 
         let isFMP4 = initData != nil || (firstBytes.count >= 8 && String(decoding: firstBytes[4..<8], as: UTF8.self) == "ftyp") || (firstBytes.first != 0x47)
-        return (isFMP4, totalDur)
+        return (isFMP4, totalDur, startTime)
     }
 
     private static func recordLiveStream(

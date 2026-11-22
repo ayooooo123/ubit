@@ -179,14 +179,19 @@ private actor SpeedMeter {
 public final class DownloadEngine: @unchecked Sendable {
     public init() {}
 
-    public func makeClient(settings: Settings, options: DownloadRequestOptions) -> HTTPClient {
-        let cookies = CookieVault.load(source: options.cookieSource)
+    public func makeClient(settings: Settings, options: DownloadRequestOptions) throws -> HTTPClient {
+        let proxy = options.proxy ?? (settings.proxy.isEmpty ? nil : settings.proxy)
+        // A proxy string that the client cannot install would send every request directly.
+        if let proxy, !proxy.isEmpty, !HTTPClient.isValidProxy(proxy) {
+            throw HTTPError.badURL("invalid proxy setting: use http://host:port or socks5://host:port")
+        }
+        let cookies = try CookieVault.load(source: options.cookieSource)
         var extra = options.extraHeaders
         if let ref = options.referer, !ref.isEmpty { extra["Referer"] = ref }
         let rate = FormatHelpers.parseRateLimit(options.rateLimit ?? settings.rateLimit)
         return HTTPClient(
             cookies: cookies,
-            proxy: options.proxy ?? (settings.proxy.isEmpty ? nil : settings.proxy),
+            proxy: proxy,
             rateLimitBytesPerSec: rate,
             userAgent: options.userAgent,
             extraHeaders: extra
@@ -194,7 +199,7 @@ public final class DownloadEngine: @unchecked Sendable {
     }
 
     public func extract(url: String, settings: Settings, options: DownloadRequestOptions) async throws -> MediaInfo {
-        let client = makeClient(settings: settings, options: options)
+        let client = try makeClient(settings: settings, options: options)
         return try await ExtractorRegistry.extract(url: url, client: client)
     }
 
@@ -211,7 +216,7 @@ public final class DownloadEngine: @unchecked Sendable {
         try AppPaths.ensureAppSupport()
         onEvent?(.start(url: url))
 
-        let client = makeClient(settings: settings, options: options)
+        let client = try makeClient(settings: settings, options: options)
         var info: MediaInfo
         if let pre = preExtracted, !pre.formats.isEmpty {
             info = pre
@@ -226,7 +231,7 @@ public final class DownloadEngine: @unchecked Sendable {
             info.title = customTitle
         }
 
-        var selected = try FormatSelector.select(from: info.formats, options: options)
+        let selected = try FormatSelector.select(from: info.formats, options: options)
         let isAudioOut = options.audioOnly || (selected.video == nil)
         let targetExt: String
         if let tf = options.targetFormat, !tf.isEmpty {
@@ -290,41 +295,14 @@ public final class DownloadEngine: @unchecked Sendable {
         let aEstSize = selected.audio?.filesize ?? 0
         let combinedEst = vEstSize + aEstSize
 
-        // Helper that downloads one MediaFormat (with stale-URL refresh on 403/410!)
+        // Downloads one MediaFormat. A refusal ends the download: there is no re-extraction,
+        // no other format and no other URL.
         var videoSectionBaseSec: Double = 0
         var audioSectionBaseSec: Double = 0
         var videoIsTS = false
         var audioIsTS = false
 
         func fetchStream(_ fmt: MediaFormat, to dest: URL, priorBytes: Int64, isVideoRole: Bool) async throws -> (baseSec: Double, isTS: Bool) {
-            var currentFmt = fmt
-            var blockedFormatIDs = Set<String>()
-            for refreshAttempt in 0..<3 {
-                do {
-                    return try await fetchStreamOnce(currentFmt, to: dest, priorBytes: priorBytes, isVideoRole: isVideoRole)
-                } catch HTTPError.staleLink {
-                    guard refreshAttempt < 2 else { throw HTTPError.staleLink(403) }
-                    if refreshAttempt == 1 {
-                        blockedFormatIDs.insert(currentFmt.id)
-                        try? FileManager.default.removeItem(at: dest.appendingPathExtension("part"))
-                        try? FileManager.default.removeItem(at: dest.appendingPathExtension("part.json"))
-                    }
-                    let freshInfo = try await ExtractorRegistry.extract(url: url, client: client)
-                    let remaining = freshInfo.formats.filter { !blockedFormatIDs.contains($0.id) }
-                    let candidatePool = remaining.isEmpty ? freshInfo.formats : remaining
-                    let freshSel = try FormatSelector.select(from: candidatePool, options: options)
-                    if let updated = isVideoRole ? freshSel.video : (freshSel.audio ?? freshSel.video) {
-                        currentFmt = updated
-                        selected = freshSel
-                        continue
-                    }
-                    throw HTTPError.staleLink(403)
-                }
-            }
-            return (0, false)
-        }
-
-        func fetchStreamOnce(_ fmt: MediaFormat, to dest: URL, priorBytes: Int64, isVideoRole: Bool) async throws -> (baseSec: Double, isTS: Bool) {
             var mergedHeaders = fmt.headers ?? [:]
             if let ref = options.referer, mergedHeaders["Referer"] == nil { mergedHeaders["Referer"] = ref }
 
@@ -425,10 +403,11 @@ public final class DownloadEngine: @unchecked Sendable {
             audioIsTS = res.isTS
         }
 
-        // Fetch cover art, subtitles, and SponsorBlock segments concurrently!
+        // Cover art, subtitles and SponsorBlock segments are optional, but a refusal of any of
+        // them still ends the download.
         var coverJPEG: Data?
         if settings.embedMetadata || settings.saveThumbnail, let thumbURL = info.thumbnail, !thumbURL.isEmpty {
-            if let (rawImg, _) = try? await client.fetchData(url: thumbURL, includeCookies: false) {
+            if let (rawImg, _) = try await ExtractorUtils.optionalRequest({ try await client.fetchData(url: thumbURL, includeCookies: false) }) {
                 coverJPEG = MediaConverter.normalizeThumbnailToJPEG(rawImg)
             }
         }
@@ -437,7 +416,7 @@ public final class DownloadEngine: @unchecked Sendable {
         if options.downloadSubtitles && !info.subtitles.isEmpty {
             let chosenSubs = chooseSubtitles(available: info.subtitles, langSpec: options.subtitleLangs)
             for sub in chosenSubs {
-                if let (subText, _) = try? await client.fetchText(url: sub.url) {
+                if let (subText, _) = try await ExtractorUtils.optionalRequest({ try await client.fetchText(url: sub.url) }) {
                     let cues = SponsorAndSubtitles.parseSubtitleCues(subText)
                     if !cues.isEmpty { downloadedSubTracks.append((sub.lang, cues)) }
                 }
@@ -449,7 +428,7 @@ public final class DownloadEngine: @unchecked Sendable {
 
         if options.sponsorMode != "keep" && info.site.lowercased() == "youtube" {
             let cats = SponsorAndSubtitles.parseCategories(options.sponsorCategories)
-            let segs = await SponsorAndSubtitles.fetchSponsorSegments(client: client, videoID: info.id, categories: cats)
+            let segs = try await SponsorAndSubtitles.fetchSponsorSegments(client: client, videoID: info.id, categories: cats)
             if options.sponsorMode == "remove" && !segs.isEmpty {
                 onEvent?(.process(stage: "Removing sponsors"))
                 sponsorCutIntervals = segs.map { ($0.start, $0.end) }

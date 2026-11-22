@@ -19,7 +19,7 @@ Run `ubit --llms` at any time to print the installed binary's exact CLI and NDJS
 
 ## Core Agent Workflows
 
-### 1. Probe Metadata, Formats & Subtitles First (Zero Media Bytes Downloaded)
+### 1. Probe Metadata, Formats & Subtitles First (No Media File Saved)
 
 ```sh
 ubit info --json "<url>"
@@ -28,6 +28,7 @@ ubit info --json "<url>"
 - Check `isDRM` (`true` means Widevine/FairPlay encrypted — report immediately rather than retrying).
 - Check `entries` (non-empty for playlists, channels, sets, or `ytsearch:<query>` searches).
 - Check `subtitles` for human or ASR caption tracks (`--subs --sub-langs en --sub-files` downloads `.vtt` sidecars).
+- `info` and `formats` accept only `--json`, `--cookies`, `--cookies-from-browser`, `--no-cookies` and `--proxy`; any other flag exits with code `2`.
 
 ### 2. Download a Video or Audio File Deterministically
 
@@ -67,6 +68,11 @@ ubit info --json "ytsearch:blender open movie"
 
 ### 6. Handle Auth-Gated Links & Resume
 
-- **Cookies**: `ubit` uses `~/Library/Application Support/uBit/cookies.txt` by default (shared with `ubit browse`), or pass `--cookies-from-browser firefox`, `--cookies /path/to/cookies.txt`, or `--no-cookies`.
+- **Provider refusals**: HTTP 401, 403, 407, 410, 429 or 451, or a YouTube playability or verification challenge, ends that URL's operation, also for optional requests such as cover art or subtitles. `ubit` does not retry with another URL, client identity or route. Do not retry that URL with another identity or route yourself. A request that fails before `ubit` reads its status is repeated only when the request provably never reached the server; a timeout gives a "No HTTP status" error with no repeat. A refusal that sends only headers ends after the 30 s request timeout.
+- **YouTube notices**: Only three visible watch-page sentences stop extraction: "Sign in to confirm you're not a bot", "Sign in to confirm your age" and "Our systems have detected unusual traffic from your computer network". A reCAPTCHA widget or a redirect to a Google challenge, sign-in or consent page also stops it. `docs/agents.md` has the exact rule.
+- YouTube video extraction does not accept a raw `Cookie` header. This applies even with `--no-cookies`.
+- **Cookies**: `ubit` uses `~/Library/Application Support/uBit/cookies.txt` by default (shared with `ubit browse`), or pass `--cookies-from-browser safari`, `--cookies-from-browser firefox`, `--cookies /path/to/cookies.txt`, or `--no-cookies`. Chrome/Brave/Edge are refused with an explicit error (keychain + AES unwrap not implemented). Cookies authenticate ordinary requests; they do not justify a retry after a refusal or challenge.
+- **YouTube pacing**: Each process grants permits for `/player` attempts at least 3 seconds apart. This interval applies to permits, not HTTP starts.
+- **Proxy values**: A `--proxy` value must be an `http://`, `https://`, `socks5://`, `socks5h://` or `socks://` URL with a host (all socks schemes use SOCKS version 5); any other value exits with code `2`, and the error does not repeat the value.
 - **Sandbox Isolation**: Set `UBIT_CONFIG_DIR=/tmp/agent-ubit-$$` when running parallel workers.
-- **Exit Codes**: `0` = done, `1` = download/extractor error, `2` = bad CLI flags, `130` = interrupted (`.part` + `.part.json` saved; re-running the identical command resumes at byte-level).
+- **Exit Codes**: `0` = done, `1` = download/extractor error (including a provider refusal or challenge), `2` = bad CLI flags, `130` = interrupted (`.part` + `.part.json` saved; re-running the identical command resumes at byte-level).

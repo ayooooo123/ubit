@@ -236,6 +236,7 @@ public struct MP4Metadata: Sendable {
 }
 
 public struct SidxSegment: Sendable {
+    var trackID: UInt32
     public var byteRange: ByteRange
     public var startTimeSec: Double
     public var endTimeSec: Double
@@ -293,39 +294,59 @@ public enum MP4Muxer {
         if let lastProbedByte, lastProbedByte >= Int64(data.count) { throw HTTPError.rangeUnsupported }
         let boxes = listBoxes(in: data, from: 0, to: data.count)
         guard boxes.last?.endOffset == data.count else { throw HTTPError.rangeUnsupported }
+        guard boxes.contains(where: { $0.type == "sidx" }) else { return }
+        guard let moov = boxes.first(where: { $0.type == "moov" }) else { throw HTTPError.rangeUnsupported }
+        let context = try fragmentContext(data, moov: moov, fileURL: url)
         for box in boxes where box.type == "sidx" {
             var valid = true
             let end = endOfReferences(in: data, box: box) { segment in
-                if valid { valid = indexReferenceContainsMedia(in: data, range: segment.byteRange) }
+                if valid { valid = indexReferenceContainsMedia(in: data, range: segment.byteRange, segment: segment, context: context) }
             }
             guard valid, let end, end <= Int64(data.count) else { throw HTTPError.rangeUnsupported }
         }
     }
 
-    /// True when every byte of the referenced range is a well-formed box and the
-    /// range holds a `moof` with a `traf` plus its `mdat`. A padding box that replaces
-    /// a fragment parses, but it has no media and therefore fails this check.
-    static func indexReferenceContainsMedia(in data: Data, range: ByteRange) -> Bool {
-        guard range.start >= 0, range.end >= range.start, range.end < Int64(data.count) else { return false }
-        let start = Int(range.start)
+    /// Check the actual track samples, not just the names of the surrounding boxes.
+    static func indexReferenceContainsMedia(in data: Data, range: ByteRange, segment: SidxSegment, context: FragmentContext) -> Bool {
+        guard range.start >= 0, range.end >= range.start, range.end < Int64(data.count),
+              let track = context.tracks[segment.trackID] else { return false }
         let end = Int(range.end) + 1
-        let boxes = listBoxes(in: data, from: start, to: end)
-        guard boxes.first?.headerOffset == start, boxes.last?.endOffset == end else { return false }
-        var hasMoof = false
-        var hasMdat = false
-        for box in boxes {
-            switch box.type {
-            case "moof":
-                let traffic = listBoxes(in: data, from: box.payloadOffset, to: box.endOffset)
-                guard traffic.contains(where: { $0.type == "traf" }) else { return false }
-                hasMoof = true
-            case "mdat":
-                hasMdat = true
-            default:
-                break
+        let boxes = listBoxes(in: data, from: Int(range.start), to: end)
+        guard boxes.last?.endOffset == end else { return false }
+        let payloads = boxes.filter { $0.type == "mdat" && $0.payloadSize > 0 }
+        var found = false
+        for moof in boxes where moof.type == "moof" {
+            var tracks = [segment.trackID: track]
+            tracks[segment.trackID]?.samples.removeAll()
+            parseMoof(data: data, moof: moof, trexDefaults: context.defaults, sourceIndex: 0, tracks: &tracks)
+            guard let samples = tracks[segment.trackID]?.samples, !samples.isEmpty else { return false }
+            var elapsed: Int64 = 0, earliest = Int64.max
+            for sample in samples {
+                guard sample.size > 0, payloads.contains(where: {
+                    sample.offset >= UInt64($0.payloadOffset) && sample.offset <= UInt64($0.endOffset) &&
+                        UInt64(sample.size) <= UInt64($0.endOffset) - sample.offset
+                }) else { return false }
+                earliest = min(earliest, elapsed + Int64(sample.ctsOffset))
+                elapsed += Int64(sample.duration)
             }
+            if !found {
+                for traf in listBoxes(in: data, from: moof.payloadOffset, to: moof.endOffset) where traf.type == "traf" {
+                    let children = listBoxes(in: data, from: traf.payloadOffset, to: traf.endOffset)
+                    guard let tfhd = children.first(where: { $0.type == "tfhd" }), tfhd.payloadSize >= 8,
+                          data.beU32(tfhd.payloadOffset + 4) == segment.trackID else { continue }
+                    guard let tfdt = children.first(where: { $0.type == "tfdt" }) else { return false }
+                    let p = tfdt.payloadOffset
+                    guard tfdt.payloadSize >= 8, data[p] <= 1, data[p] == 0 || tfdt.payloadSize >= 12 else { return false }
+                    let time = data[p] == 0 ? UInt64(data.beU32(p + 4)) : data.beU64(p + 4)
+                    guard let base = Int64(exactly: time) else { return false }
+                    let (pts, overflow) = base.addingReportingOverflow(earliest)
+                    let (start, underflow) = pts.subtractingReportingOverflow(track.editMediaTimeTicks ?? 0)
+                    guard !overflow, !underflow, rescale(UInt64(max(0, start)), from: track.timescale, to: segment.timescale) == segment.startTicks else { return false }
+                }
+            }
+            found = true
         }
-        return hasMoof && hasMdat
+        return found
     }
 
     private static func endOfReferences(in headerData: Data, box sidx: MP4BoxRef,
@@ -370,6 +391,7 @@ public enum MP4Muxer {
                 let startSec = Double(segmentStartTicks) / Double(timescale)
                 curTicks += subsegDur
                 visit(SidxSegment(
+                    trackID: headerData.beU32(p + 4),
                     byteRange: ByteRange(start: curByte, end: curByte + refSize - 1),
                     startTimeSec: startSec,
                     endTimeSec: Double(curTicks) / Double(timescale),
@@ -399,6 +421,28 @@ public enum MP4Muxer {
             throw NSError(domain: "MP4Muxer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Missing moov box in \(fileURL.lastPathComponent)"])
         }
 
+        let context = try fragmentContext(data, moov: moov, fileURL: fileURL, sourceIndex: sourceIndex)
+        var tracksByID = context.tracks
+        // Parse any fragmented MP4 `moof` boxes!
+        for box in topBoxes where box.type == "moof" {
+            parseMoof(data: data, moof: box, trexDefaults: context.defaults, sourceIndex: sourceIndex, tracks: &tracksByID)
+        }
+
+        return context.order.compactMap { id in
+            guard var track = tracksByID[id], !track.samples.isEmpty else { return nil }
+            // Fragment headers can give a media start before the duration is known.
+            if track.editMediaTimeTicks != nil && track.editSegmentTicks == nil { track.editSegmentTicks = track.totalTicks }
+            return track
+        }
+    }
+
+    struct FragmentContext {
+        var tracks: [UInt32: MP4Track]
+        var defaults: [UInt32: (dur: UInt32, size: UInt32, flags: UInt32)]
+        var order: [UInt32]
+    }
+
+    static func fragmentContext(_ data: Data, moov: MP4BoxRef, fileURL: URL, sourceIndex: Int = 0) throws -> FragmentContext {
         let moovChildren = listBoxes(in: data, from: moov.payloadOffset, to: moov.endOffset)
 
         var movieTimescale: UInt32 = 0
@@ -432,17 +476,7 @@ public enum MP4Muxer {
             }
         }
 
-        // Parse any fragmented MP4 `moof` boxes!
-        for box in topBoxes where box.type == "moof" {
-            parseMoof(data: data, moof: box, trexDefaults: trexDefaults, sourceIndex: sourceIndex, tracks: &tracksByID)
-        }
-
-        return orderedIDs.compactMap { id in
-            guard var track = tracksByID[id], !track.samples.isEmpty else { return nil }
-            // Fragment headers can give a media start before the duration is known.
-            if track.editMediaTimeTicks != nil && track.editSegmentTicks == nil { track.editSegmentTicks = track.totalTicks }
-            return track
-        }
+        return FragmentContext(tracks: tracksByID, defaults: trexDefaults, order: orderedIDs)
     }
 
     private static func parseTrak(data: Data, trak: MP4BoxRef, sourceURL: URL, sourceIndex: Int, movieTimescale: UInt32) throws -> MP4Track? {
@@ -704,6 +738,7 @@ public enum MP4Muxer {
             guard let tfhd = trafBoxes.first(where: { $0.type == "tfhd" }), tfhd.payloadOffset + 8 <= tfhd.endOffset else { continue }
             let hp = tfhd.payloadOffset
             let tfFlags = data.beU32(hp) & 0x00ffffff
+            guard tfFlags & 0x010000 == 0 else { continue } // duration-is-empty
             let trackID = data.beU32(hp + 4)
             guard var track = tracks[trackID] else { continue }
 
@@ -736,10 +771,14 @@ public enum MP4Muxer {
                 let tp = trun.payloadOffset
                 let trFlags = data.beU32(tp) & 0x00ffffff
                 let count = Int(data.beU32(tp + 4))
+                guard count <= data.count else { continue }
                 var tOff = tp + 8
                 if (trFlags & 0x000001) != 0, tOff + 4 <= trun.endOffset {
                     let rel = Int64(data.beI32(tOff))
-                    runningDataOffset = UInt64(Int64(baseDataOffset) + rel)
+                    guard let base = Int64(exactly: baseDataOffset) else { continue }
+                    let (offset, overflow) = base.addingReportingOverflow(rel)
+                    guard !overflow, offset >= 0 else { continue }
+                    runningDataOffset = UInt64(offset)
                     tOff += 4
                 }
                 var firstSampleFlags: UInt32?
@@ -1085,11 +1124,28 @@ public enum MP4Muxer {
             }
         }
 
+        // elst durations are in movie ticks. Choose a clock that represents every
+        // edited duration exactly; rounding up can make a decode-only picture visible.
+        var movieTimescale: UInt32 = 1
+        func gcd(_ a: UInt32, _ b: UInt32) -> UInt32 {
+            var x = a, y = b
+            while y != 0 { (x, y) = (y, x % y) }
+            return x
+        }
+        for t in tracks {
+            guard let duration = t.editSegmentTicks else { continue }
+            let denominator = t.timescale / gcd(t.timescale, UInt32(duration % UInt64(t.timescale)))
+            let (clock, overflow) = (movieTimescale / gcd(movieTimescale, denominator)).multipliedReportingOverflow(by: denominator)
+            guard !overflow else { throw NSError(domain: "MP4Muxer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Track edit durations cannot share an exact movie timescale"]) }
+            movieTimescale = clock
+        }
+        if movieTimescale < 1000 { movieTimescale *= (999 / movieTimescale + 1) }
+
         // Two-pass moov build: pass 1 measures exact `moov` byte length using fixed `co64` (8-byte offsets so length never shifts!),
         // pass 2 writes exact final file offsets `ftyp.count + moov.count + mdatHeaderLen + relOffset`!
-        let dummyMoov = buildMoov(tracks: tracks, chunkBaseOffset: 0, relativeOffsets: relativeOffsets, metadata: metadata, chapterTrackID: chapterTrackID)
+        let dummyMoov = buildMoov(tracks: tracks, movieTimescale: movieTimescale, chunkBaseOffset: 0, relativeOffsets: relativeOffsets, metadata: metadata, chapterTrackID: chapterTrackID)
         let mdatPayloadStart = UInt64(ftyp.count + dummyMoov.count) + mdatHeaderLen
-        let finalMoov = buildMoov(tracks: tracks, chunkBaseOffset: mdatPayloadStart, relativeOffsets: relativeOffsets, metadata: metadata, chapterTrackID: chapterTrackID)
+        let finalMoov = buildMoov(tracks: tracks, movieTimescale: movieTimescale, chunkBaseOffset: mdatPayloadStart, relativeOffsets: relativeOffsets, metadata: metadata, chapterTrackID: chapterTrackID)
 
         try FileManager.default.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
         let partURL = destination.appendingPathExtension("mux.part")
@@ -1149,23 +1205,24 @@ public enum MP4Muxer {
 
     private static func buildMoov(
         tracks: [MP4Track],
+        movieTimescale: UInt32,
         chunkBaseOffset: UInt64,
         relativeOffsets: [[UInt64]],
         metadata: MP4Metadata,
         chapterTrackID: UInt32?
     ) -> Data {
-        let movieTimescale: UInt32 = 1000
-        let maxDurSec = tracks.map(\.presentationDurationSeconds).max() ?? 0
-        let movieDurTicks = UInt64(maxDurSec * Double(movieTimescale))
+        let movieDurTicks = tracks.reduce(UInt64(0)) { duration, track in
+            max(duration, rescale(track.editSegmentTicks ?? track.totalTicks, from: track.timescale, to: movieTimescale))
+        }
+        let wide = movieDurTicks > UInt32.max
 
         var moov = BinaryBuffer(capacity: 65_536)
         moov.box("moov") { m in
             // mvhd
-            m.fullBox("mvhd", version: 0, flags: 0) { b in
-                b.u32(0) // creation_time
-                b.u32(0) // modification_time
+            m.fullBox("mvhd", version: wide ? 1 : 0, flags: 0) { b in
+                b.zeros(wide ? 16 : 8) // creation and modification times
                 b.u32(movieTimescale)
-                b.u32(UInt32(clamping: movieDurTicks))
+                if wide { b.u64(movieDurTicks) } else { b.u32(UInt32(movieDurTicks)) }
                 b.u32(0x00010000) // rate 1.0
                 b.u16(0x0100)     // volume 1.0
                 b.zeros(10)
@@ -1196,23 +1253,19 @@ public enum MP4Muxer {
         relativeOffsets: [UInt64],
         chapterTrackID: UInt32?
     ) {
-        let trackDurMovie: UInt32
-        if let editTicks = track.editSegmentTicks {
-            let scaled = rescale(editTicks, from: track.timescale, to: movieTimescale)
-            trackDurMovie = UInt32(clamping: scaled)
-        } else {
-            trackDurMovie = UInt32(clamping: UInt64(track.durationSeconds * Double(movieTimescale)))
-        }
+        let mediaDuration = track.totalTicks
+        let trackDurMovie = rescale(track.editSegmentTicks ?? mediaDuration, from: track.timescale, to: movieTimescale)
+        let wideTrack = trackDurMovie > UInt32.max
         let isChapter = (track.kind == .text && chapterTrackID == track.trackID)
         // tkhd flags: enabled=1, in_movie=2, in_preview=4 -> 3 (disabled for hidden chapter reference track)
         let tkhdFlags: UInt32 = isChapter ? 0 : 0x000003
 
         m.box("trak") { tr in
-            tr.fullBox("tkhd", version: 0, flags: tkhdFlags) { b in
-                b.u32(0); b.u32(0)
+            tr.fullBox("tkhd", version: wideTrack ? 1 : 0, flags: tkhdFlags) { b in
+                b.zeros(wideTrack ? 16 : 8)
                 b.u32(track.trackID)
                 b.u32(0)
-                b.u32(trackDurMovie)
+                if wideTrack { b.u64(trackDurMovie) } else { b.u32(UInt32(trackDurMovie)) }
                 b.zeros(8)
                 b.u16(0) // layer
                 b.u16(track.kind == .audio ? 1 : (track.kind == .subtitle ? 2 : 0))
@@ -1234,7 +1287,7 @@ public enum MP4Muxer {
             // pictures kept for decoding do not appear as extra frames.
             if let mediaTime = track.editMediaTimeTicks, let segmentTicks = track.editSegmentTicks,
                mediaTime >= 0, segmentTicks > 0 {
-                let movieDuration = rescale(segmentTicks, from: track.timescale, to: movieTimescale)
+                let movieDuration = trackDurMovie
                 let useVersion1 = movieDuration > UInt64(UInt32.max) || mediaTime > Int64(Int32.max)
                 tr.box("edts") { edts in
                     edts.fullBox("elst", version: useVersion1 ? 1 : 0, flags: 0) { b in
@@ -1252,10 +1305,11 @@ public enum MP4Muxer {
             }
 
             tr.box("mdia") { md in
-                md.fullBox("mdhd", version: 0, flags: 0) { b in
-                    b.u32(0); b.u32(0)
+                let wideMedia = mediaDuration > UInt32.max
+                md.fullBox("mdhd", version: wideMedia ? 1 : 0, flags: 0) { b in
+                    b.zeros(wideMedia ? 16 : 8)
                     b.u32(track.timescale)
-                    b.u32(UInt32(clamping: track.totalTicks))
+                    if wideMedia { b.u64(mediaDuration) } else { b.u32(UInt32(mediaDuration)) }
                     let chars = Array(track.languageISO639_2.lowercased().utf8)
                     let l1 = UInt16(chars.count > 0 && chars[0] >= 0x60 ? chars[0] - 0x60 : 21)
                     let l2 = UInt16(chars.count > 1 && chars[1] >= 0x60 ? chars[1] - 0x60 : 14)

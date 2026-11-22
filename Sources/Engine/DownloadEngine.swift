@@ -669,9 +669,11 @@ public final class DownloadEngine: @unchecked Sendable {
             throw HTTPError.rangeUnsupported
         }
 
+        guard let moov = MP4Muxer.listBoxes(in: initBytes, from: 0, to: initBytes.count).first(where: { $0.type == "moov" }) else { throw HTTPError.rangeUnsupported }
+        let context = try MP4Muxer.fragmentContext(initBytes, moov: moov, fileURL: destination)
         for segment in parsed.segments where segment.byteRange.start >= bodyRange.start && segment.byteRange.end <= bodyRange.end {
             let local = ByteRange(start: segment.byteRange.start - bodyRange.start, end: segment.byteRange.end - bodyRange.start)
-            guard MP4Muxer.indexReferenceContainsMedia(in: bodyBytes, range: local) else { throw HTTPError.rangeUnsupported }
+            guard MP4Muxer.indexReferenceContainsMedia(in: bodyBytes, range: local, segment: segment, context: context) else { throw HTTPError.rangeUnsupported }
         }
         var combined = Data(capacity: initBytes.count + bodyBytes.count)
         combined.append(initBytes)

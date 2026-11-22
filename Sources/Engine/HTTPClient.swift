@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 public enum HTTPError: LocalizedError {
     case badURL(String)
@@ -27,7 +28,8 @@ public actor RateLimiter {
         self.bytesPerSec = bytesPerSec ?? 0
     }
 
-    public func consume(_ bytes: Int) async {
+    public func consume(_ bytes: Int) async throws {
+        try Task.checkCancellation()
         guard bytesPerSec > 0, bytes > 0 else { return }
         let now = ProcessInfo.processInfo.systemUptime
         let duration = Double(bytes) / Double(bytesPerSec)
@@ -35,13 +37,14 @@ public actor RateLimiter {
         nextAllowedTime = start + duration
         let delay = start - now
         if delay > 0.002 {
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
         }
     }
 }
 
 public struct ChunkStateFile: Codable, Sendable {
     public var totalSize: Int64
+    public var resourceDigest: Data?
     public var etag: String?
     public var completed: [ByteRange]
 
@@ -316,9 +319,16 @@ public final class HTTPClient: @unchecked Sendable {
             do {
                 let req = try makeRequest(url: url, method: method, headers: headers, body: body, includeCookies: includeCookies)
                 let (data, resp) = try await session.data(for: req)
-                await limiter.consume(data.count)
+                try await limiter.consume(data.count)
                 guard let http = resp as? HTTPURLResponse else {
                     throw HTTPError.badURL(url)
+                }
+                if http.statusCode == 206, method == "GET", req.value(forHTTPHeaderField: "Range") == nil {
+                    guard let value = http.value(forHTTPHeaderField: "Content-Range"),
+                          let range = Self.parseContentRange(value), range.first == 0,
+                          let total = range.total, range.last == total - 1, Int64(data.count) == total else {
+                        throw HTTPError.rangeUnsupported
+                    }
                 }
                 if (200..<300).contains(http.statusCode) {
                     return (data, http)
@@ -433,6 +443,12 @@ public final class HTTPClient: @unchecked Sendable {
         return ContentRange(first: first, last: last, total: total)
     }
 
+    private static func strongTag(_ response: HTTPURLResponse) -> String? {
+        guard let tag = response.value(forHTTPHeaderField: "ETag"), tag.utf8.count >= 2,
+              tag.first == "\"", tag.last == "\"" else { return nil }
+        return tag
+    }
+
     /// Probes total file size and range support using a tiny `Range: bytes=0-0` request.
     private func probeRemote(url: String, headers: [String: String]?) async throws -> (totalSize: Int64?, acceptsRanges: Bool, etag: String?) {
         var hdrs = headers ?? [:]
@@ -443,7 +459,7 @@ public final class HTTPClient: @unchecked Sendable {
         guard (200..<300).contains(http.statusCode) else {
             throw HTTPError.status(http.statusCode, url)
         }
-        let etag = http.value(forHTTPHeaderField: "ETag")
+        let etag = Self.strongTag(http)
         if http.statusCode == 206 {
             // A 206 with `*` gives no file size, and this body's length is not the file length.
             guard let value = http.value(forHTTPHeaderField: "Content-Range"),
@@ -478,20 +494,17 @@ public final class HTTPClient: @unchecked Sendable {
         }
         let totalSize = probe.totalSize ?? knownSize
 
+        // Hash the URL: a signed query string must not be stored in a resume file.
+        let resource = Data(SHA256.hash(data: Data(url.utf8)))
         guard let total = totalSize, total > 512 * 1024, probe.acceptsRanges, connections > 1 else {
-            // A parallel `.part` is preallocated to the full length, so its size is not a safe
-            // resume offset for a single sequential stream.
-            if FileManager.default.fileExists(atPath: stateURL.path) {
-                try? FileManager.default.removeItem(at: stateURL)
-                try? FileManager.default.removeItem(at: partURL)
-            }
             do {
                 try await singleStreamDownload(
                     url: url,
                     partURL: partURL,
                     destination: destination,
                     headers: headers,
-                    acceptsRanges: probe.acceptsRanges,
+                    resumeTag: probe.acceptsRanges ? probe.etag : nil,
+                    resource: resource, stateURL: stateURL,
                     totalSize: totalSize,
                     onProgress: onProgress
                 )
@@ -510,7 +523,7 @@ public final class HTTPClient: @unchecked Sendable {
            let stateData = try? Data(contentsOf: stateURL),
            let saved = try? JSONDecoder().decode(ChunkStateFile.self, from: stateData),
            Self.isValidResumeState(saved, total: total),
-           (saved.etag == nil || probe.etag == nil || saved.etag == probe.etag) {
+           saved.resourceDigest == resource, probe.etag != nil, saved.etag == probe.etag {
             chunkState = saved
         } else {
             try? FileManager.default.removeItem(at: stateURL)
@@ -518,7 +531,7 @@ public final class HTTPClient: @unchecked Sendable {
             let fh = try FileHandle(forWritingTo: partURL)
             try fh.truncate(atOffset: UInt64(total))
             try fh.close()
-            chunkState = ChunkStateFile(totalSize: total, etag: probe.etag, completed: [])
+            chunkState = ChunkStateFile(totalSize: total, resourceDigest: resource, etag: probe.etag, completed: [])
         }
 
         onProgress?(chunkState.downloadedBytes, total)
@@ -537,6 +550,9 @@ public final class HTTPClient: @unchecked Sendable {
         }
         defer { close(fd) }
 
+        var rangeHeaders = headers ?? [:]
+        rangeHeaders["If-Range"] = probe.etag
+        let workerHeaders = rangeHeaders
         let numWorkers = max(1, min(32, connections))
         let workQueue = WorkStealingQueue(state: chunkState, stateURL: stateURL, initialSplits: numWorkers * 2)
 
@@ -551,7 +567,7 @@ public final class HTTPClient: @unchecked Sendable {
                                 workerID: claim.workerID,
                                 initialRange: claim.range,
                                 url: url,
-                                headers: headers,
+                                headers: workerHeaders,
                                 fd: fd,
                                 totalSize: total,
                                 workQueue: workQueue,
@@ -705,7 +721,7 @@ public final class HTTPClient: @unchecked Sendable {
         workQueue: WorkStealingQueue,
         onProgress: (@Sendable (Int64, Int64) -> Void)?
     ) async throws -> (keepGoing: Bool, written: Int) {
-        await limiter.consume(buf.count)
+        try await limiter.consume(buf.count)
         try Task.checkCancellation()
         let decision = try await workQueue.writeChunk(buf, fd: fd, workerID: workerID, start: offset)
         buf.removeAll(keepingCapacity: true)
@@ -718,7 +734,8 @@ public final class HTTPClient: @unchecked Sendable {
         partURL: URL,
         destination: URL,
         headers: [String: String]?,
-        acceptsRanges: Bool,
+        resumeTag: String?,
+        resource: Data, stateURL: URL,
         totalSize: Int64?,
         onProgress: (@Sendable (Int64, Int64) -> Void)?
     ) async throws {
@@ -726,7 +743,10 @@ public final class HTTPClient: @unchecked Sendable {
         // bytes: a parallel preallocation has the full length and may have no state file. Both
         // cases start from zero.
         var existingOffset: Int64 = 0
-        if acceptsRanges, let sz = Self.fileSize(partURL), sz > 0,
+        if let resumeTag, let record = try? Data(contentsOf: stateURL),
+           let saved = try? JSONDecoder().decode(ChunkStateFile.self, from: record),
+           saved.resourceDigest == resource, saved.etag == resumeTag, saved.completed.isEmpty,
+           let sz = Self.fileSize(partURL), sz > 0,
            totalSize.map({ sz < $0 }) ?? true {
             existingOffset = sz
         } else {
@@ -737,6 +757,7 @@ public final class HTTPClient: @unchecked Sendable {
         var hdrs = headers ?? [:]
         if existingOffset > 0 {
             hdrs["Range"] = "bytes=\(existingOffset)-"
+            hdrs["If-Range"] = resumeTag
         }
         let req = try makeRequest(url: url, headers: hdrs)
         let (bytes, resp) = try await session.bytes(for: req)
@@ -755,6 +776,9 @@ public final class HTTPClient: @unchecked Sendable {
             }
             guard let total = content.total ?? totalSize, total > 0, content.last == total - 1,
                   totalSize == nil || totalSize == total else { throw HTTPError.rangeUnsupported }
+            if existingOffset > 0, http.value(forHTTPHeaderField: "ETag") != nil, Self.strongTag(http) != resumeTag {
+                throw HTTPError.rangeUnsupported
+            }
             expectedTotal = total
         } else {
             // 200 is the whole file, even when the request carried a resume range.
@@ -776,6 +800,11 @@ public final class HTTPClient: @unchecked Sendable {
             try fh.seekToEnd()
         }
 
+        if existingOffset == 0 {
+            let tag = http.value(forHTTPHeaderField: "Content-Encoding") == nil ? Self.strongTag(http) : nil
+            let record = ChunkStateFile(totalSize: expectedTotal, resourceDigest: resource, etag: tag, completed: [])
+            try JSONEncoder().encode(record).write(to: stateURL, options: .atomic)
+        }
         var downloaded = existingOffset
         var buf = Data()
         buf.reserveCapacity(65_536)
@@ -784,7 +813,7 @@ public final class HTTPClient: @unchecked Sendable {
             buf.append(b)
             if buf.count >= 65_536 {
                 try Task.checkCancellation()
-                await limiter.consume(buf.count)
+                try await limiter.consume(buf.count)
                 try fh.write(contentsOf: buf)
                 downloaded += Int64(buf.count)
                 buf.removeAll(keepingCapacity: true)
@@ -792,11 +821,12 @@ public final class HTTPClient: @unchecked Sendable {
             }
         }
         if !buf.isEmpty {
-            await limiter.consume(buf.count)
+            try await limiter.consume(buf.count)
             try fh.write(contentsOf: buf)
             downloaded += Int64(buf.count)
             onProgress?(downloaded, expectedTotal)
         }
+        try Task.checkCancellation()
         try fh.truncate(atOffset: UInt64(downloaded))
         if expectedTotal > 0 && downloaded != expectedTotal {
             throw HTTPError.incomplete(received: downloaded, expected: expectedTotal)

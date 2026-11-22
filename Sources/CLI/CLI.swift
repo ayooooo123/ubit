@@ -21,7 +21,9 @@ private final class InterruptController: @unchecked Sendable {
     func setCancelHandler(_ fn: (() -> Void)?) {
         lock.lock()
         activeTaskCancel = fn
+        let interrupted = count > 0
         lock.unlock()
+        if interrupted { fn?() }
     }
 
     var interruptCount: Int {
@@ -285,7 +287,17 @@ public enum CLIRunner {
 
             // Probe first in case targetURL is a playlist / channel
             do {
-                let initialInfo = try await engine.extract(url: targetURL, settings: settings, options: opts)
+                let probe = Task { [targetURL, settings, opts] in
+                    try Task.checkCancellation()
+                    return try await engine.extract(url: targetURL, settings: settings, options: opts)
+                }
+                InterruptController.shared.setCancelHandler { probe.cancel() }
+                let initialInfo: MediaInfo
+                do {
+                    defer { InterruptController.shared.setCancelHandler(nil) }
+                    initialInfo = try await probe.value
+                    if probe.isCancelled { throw CancellationError() }
+                }
                 if !initialInfo.entries.isEmpty && initialInfo.formats.isEmpty {
                     let chosenEntries = filterPlaylistEntries(initialInfo.entries, spec: itemsSpec)
                     var itemOpts = opts
@@ -322,6 +334,11 @@ public enum CLIRunner {
                 if code == 130 { return 130 }
                 if code != 0 { anyFailed = true }
             } catch {
+                if InterruptController.shared.interruptCount > 0 {
+                    if jsonMode { emitNDJSON(["event": "stopped", "url": targetURL]) }
+                    else { fputs("Stopped.\n", stderr) }
+                    return 130
+                }
                 anyFailed = true
                 if jsonMode {
                     emitNDJSON(["event": "error", "url": targetURL, "error": error.localizedDescription])
@@ -915,7 +932,7 @@ public enum CLIRunner {
         - `0` — All requested URLs completed
         - `1` — Extraction, network, DRM, or muxing failure
         - `2` — Invalid CLI flags/arguments
-        - `130` — Interrupted (`SIGINT`); `.part` + `.part.json` state preserved for instant resume on identical re-run
+        - `130` — Interrupted (`SIGINT`); run the command again; HTTP resume requires the same URL and strong ETag
         """)
     }
 }

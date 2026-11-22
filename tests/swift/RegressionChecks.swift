@@ -147,6 +147,10 @@ final class FixtureProtocol: URLProtocol {
                 switch mode {
                 case "watch-gate", "wall-unusable-cookie", "watch-challenge-cookie":
                     player = Self.challengePlayer(1, title: title)
+                case "watch-wall-text":
+                    player = nil
+                case "watch-wall-metadata":
+                    player = Self.playerPayload(status: "OK", streaming: Self.directStreaming(1, hls: true), title: title)
                 case "hls-fallback-watchlist":
                     player = Self.hlsOnlyPlayer(title: title)
                 case "hls-fallback-nowatch", "hls-fallback-lateprofile":
@@ -163,9 +167,17 @@ final class FixtureProtocol: URLProtocol {
                     )
                 }
                 let omitVisitor = forcedStage == "watch"
-                    || ["watch-gate", "wall-unusable-cookie", "watch-challenge-cookie"].contains(mode)
+                    || ["watch-gate", "wall-unusable-cookie", "watch-challenge-cookie",
+                        "watch-wall-text", "watch-wall-metadata"].contains(mode)
                 let visitor = omitVisitor ? nil : (mode == "visitor-reuse" ? Self.secondVisitor : Self.firstVisitor)
-                data = Self.watchPage(player: player, visitor: visitor)
+                switch mode {
+                case "watch-wall-text", "watch-wall-metadata":
+                    data = Self.wallPage(player: player)
+                case "watch-inert-text":
+                    data = Self.inertTextPage(player: player, visitor: visitor)
+                default:
+                    data = Self.watchPage(player: player, visitor: visitor)
+                }
                 if mode == "cancel-watch" { failure = URLError(.cancelled) }
             }
         case (_, let path) where path.hasSuffix("/player"):
@@ -249,7 +261,7 @@ final class FixtureProtocol: URLProtocol {
         case ("media.invalid", "/clip.m3u8"):
             // An HLS playlist of 15 fragmented MP4 segments, 4 s each, with four 1 s samples in each
             // segment. The boxes are the smallest tree that uBit's reader accepts, not a file that
-            // a standard player can read (the stsd box is empty, and mvhd, tkhd, mfhd and tfdt are missing).
+            // a standard player can read (the stsd box is empty, and mvhd, tkhd and mfhd are missing).
             let duration = mode == "hls-ntsc" ? "1.001" : (mode == "hls-decimal" ? "0.800000" : "4.0")
             let count = mode == "hls-ntsc" ? 7 : 15
             let segments = (0..<count).map { "#EXTINF:\(duration),\nclip-\($0).m4s" }.joined(separator: "\n")
@@ -258,10 +270,19 @@ final class FixtureProtocol: URLProtocol {
             data = Data(Bytes.clipInit(sampleTicks: mode == "hls-decimal" ? 200 : 1000))
         case ("media.invalid", let path) where path.hasPrefix("/clip-"):
             data = Data(Bytes.clipSegment(Int(path.dropFirst(6).dropLast(4)) ?? 0))
-        case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4", "/cut-unknown.mp4", "/cut-later.mp4", "/cut-padding.mp4"].contains(path):
+        case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4", "/cut-unknown.mp4", "/cut-later.mp4", "/cut-padding.mp4", "/cut-empty.mp4", "/cut-stale.mp4"].contains(path):
             var bytes = mode == "sidx-fragments" || path == "/cut-later.mp4" || path == "/cut-padding.mp4" ? Bytes.fragmentIndexedClip : Bytes.indexedClip
             if mode == "sidx-padding" { bytes += Bytes.box("free", Array(repeating: 0, count: 24)) }
-            if path == "/cut-later.mp4" || path == "/cut-padding.mp4" {
+            if path == "/cut-empty.mp4" || path == "/cut-stale.mp4" {
+                let table = MP4Muxer.parseSidx(in: Data(bytes))!.segments
+                let offset = Int(table[1].byteRange.start)
+                if path == "/cut-stale.mp4" {
+                    bytes.replaceSubrange(offset..<(offset + Bytes.clipSegment(1).count), with: Bytes.clipSegment(2))
+                } else {
+                    let count = bytes[offset...].firstRange(of: Array("trun".utf8))!.upperBound + 4
+                    bytes.replaceSubrange(count..<count + 4, with: Bytes.be32(0))
+                }
+            } else if path == "/cut-later.mp4" || path == "/cut-padding.mp4" {
                 let data = Data(bytes)
                 let indexes = MP4Muxer.listBoxes(in: data, from: 0, to: data.count).filter { $0.type == "sidx" }
                 let offset = indexes[2].endOffset
@@ -382,6 +403,41 @@ final class FixtureProtocol: URLProtocol {
         return Data(html.utf8)
     }
 
+    /// A verification wall whose only signal is visible page text. `player` is optional, so one
+    /// variant also carries embedded metadata that reports ordinary playback.
+    static func wallPage(player: [String: Any]?) -> Data {
+        var html = "<html><head><title>Verification required</title></head><body>"
+        html += "<main>Verify your identity before playback can continue. Playback is blocked.</main>"
+        if let player {
+            let json = String(data: try! JSONSerialization.data(withJSONObject: player), encoding: .utf8)!
+            html += "<script>var ytInitialPlayerResponse = \(json);</script>"
+        }
+        return Data((html + "</body></html>").utf8)
+    }
+
+    /// An ordinary page: challenge words appear only where a reader cannot see them, that is in
+    /// the title, the meta description, the video description, page code and a comment.
+    static func inertTextPage(player: [String: Any]?, visitor: String?) -> Data {
+        var html = "<html><head>"
+        html += "<title>How to verify your account - YouTube</title>"
+        html += "<meta name=\"description\" content=\"Verify your account: unusual traffic and not a bot, explained.\">"
+        if let visitor {
+            html += "<script>var ytcfg = {\"VISITOR_DATA\":\"\(visitor)\"};</script>"
+        }
+        if var player {
+            var details = player["videoDetails"] as? [String: Any] ?? [:]
+            details["shortDescription"] = "How to proceed when a page asks you to verify your account after unusual traffic. This is not a bot."
+            player["videoDetails"] = details
+            let json = String(data: try! JSONSerialization.data(withJSONObject: player), encoding: .utf8)!
+            html += "<script>var ytInitialPlayerResponse = \(json);</script>"
+        }
+        html += "</head><body>"
+        html += "<!-- Confirm your age appears only in this comment. -->"
+        html += "<script>var notice = \"Verify your identity before playback can continue\";</script>"
+        html += "<main>Fixture player</main></body></html>"
+        return Data(html.utf8)
+    }
+
     private static func json(_ object: [String: Any]) -> Data {
         try! JSONSerialization.data(withJSONObject: object)
     }
@@ -432,11 +488,12 @@ enum Bytes {
     }
 
     /// Media segment `n`: one `moof` with four samples, and an `mdat` whose four bytes are the
-    /// stream seconds 4n to 4n+3. The data offset 60 is the `moof` (52 bytes) plus the `mdat` header.
+    /// stream seconds 4n to 4n+3. The data offset includes the fragment and the media header.
     static func clipSegment(_ n: Int) -> [UInt8] {
         let tfhd = box("tfhd", be32(0x020000) + be32(1))
-        let trun = box("trun", be32(0x000001) + be32(4) + be32(60))
-        return box("moof", box("traf", tfhd + trun)) + box("mdat", (0..<4).map { UInt8(4 * n + $0) })
+        let tfdt = box("tfdt", be32(0) + be32(UInt32(n * 4000)))
+        let trun = box("trun", be32(0x000001) + be32(4) + be32(76))
+        return box("moof", box("traf", tfhd + tfdt + trun)) + box("mdat", (0..<4).map { UInt8(4 * n + $0) })
     }
 
     static let indexedClip: [UInt8] = {
@@ -633,6 +690,19 @@ struct RegressionChecks {
             let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
             check(closedByBotGate(error) && paths == ["/watch"],
                   "a watch-page bot gate with streaming data stops before visitor and /player; error=\(String(describing: error)), paths=\(paths)")
+        // Finding 2: a visible notice outranks embedded metadata; inert text is not a notice.
+        case "watch-wall-text", "watch-wall-metadata":
+            let before = FixtureProtocol.requests().count
+            let error = await extractError()
+            let paths = FixtureProtocol.requests().dropFirst(before).map(\.url.path)
+            check(closedByBotGate(error) && paths == ["/watch"] && savedOutputs().isEmpty,
+                  "a visible verification notice stops after the first response, even when the page embeds ordinary player metadata; error=\(String(describing: error)), paths=\(paths), saved=\(savedOutputs())")
+        case "watch-inert-text":
+            let (file, error) = await download(audioExt: "webm")
+            let bytes = file.flatMap { try? Data(contentsOf: $0) }
+            let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
+            check(error == nil && bytes == FixtureProtocol.mediaBytes,
+                  "challenge words in a title, description, meta tag, script or comment do not stop an ordinary page; error=\(String(describing: error)), paths=\(paths)")
         case "player-gate":
             let error = await extractError()
             let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
@@ -1196,7 +1266,7 @@ struct RegressionChecks {
             options.cookieSource = "none"
             let out = AppPaths.appSupportDir.appendingPathComponent("out")
             options.outputDir = out.path
-            let scenarios: [(String, Double?)] = [("200", 10), ("206", 10), ("206", 61), ("unknown", 61), ("unknown", nil), ("later", 12), ("padding", 12)]
+            let scenarios: [(String, Double?)] = [("200", 10), ("206", 10), ("206", 61), ("unknown", 61), ("unknown", nil), ("later", 12), ("padding", 12), ("empty", 8), ("stale", 8)]
             for (status, end) in scenarios {
                 options.section = SectionRange(start: start, end: end)
                 do {

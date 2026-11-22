@@ -122,7 +122,7 @@ When `--json` is passed to `ubit get`, `stdout` emits strictly valid newline-del
 | `0` | All URLs succeeded | Read output path from `done.path` or `--quiet` stdout |
 | `1` | Extraction, auth, DRM, network, provider refusal, or challenge error | Inspect `error`. A provider refusal or challenge is terminal for that URL: do not retry with another identity or route. For ordinary auth-gated content, pass `--cookies` / `--cookies-from-browser firefox` or ask the user to sign in via `ubit browse <url>` |
 | `2` | Invalid CLI usage / flag syntax | Fix invocation flags (check `ubit get --help`) |
-| `130` | Interrupted (`SIGINT`) | Re-run the exact same command to resume from `.part` + `.part.json` |
+| `130` | Interrupted (`SIGINT`) | Run the same command again. The Swift client resumes HTTP media only when the URL and its strong ETag match the saved partial file. Otherwise it starts from byte zero. |
 
 ---
 

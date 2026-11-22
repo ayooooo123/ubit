@@ -79,4 +79,4 @@ ubit info --json "ytsearch:blender open movie"
 - **YouTube pacing**: Each process grants permits for `/player` attempts at least 3 seconds apart. This interval applies to permits, not HTTP starts.
 - **Proxy values**: A `--proxy` value must be an `http://`, `https://`, `socks5://`, `socks5h://` or `socks://` URL with a host (all socks schemes use SOCKS version 5); any other value exits with code `2`, and the error does not repeat the value.
 - **Sandbox Isolation**: Set `UBIT_CONFIG_DIR=/tmp/agent-ubit-$$` when running parallel workers.
-- **Exit Codes**: `0` = done, `1` = download/extractor error (including a provider refusal or challenge), `2` = bad CLI flags, `130` = interrupted (`.part` + `.part.json` saved; re-running the identical command resumes at byte-level).
+- **Exit Codes**: `0` = done, `1` = download/extractor error (including a provider refusal or challenge), `2` = bad CLI flags, `130` = interrupted (run the same command again; HTTP resume on macOS requires the same URL and strong ETag).

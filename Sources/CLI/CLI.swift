@@ -21,7 +21,9 @@ private final class InterruptController: @unchecked Sendable {
     func setCancelHandler(_ fn: (() -> Void)?) {
         lock.lock()
         activeTaskCancel = fn
+        let interrupted = count > 0
         lock.unlock()
+        if interrupted { fn?() }
     }
 
     var interruptCount: Int {
@@ -212,6 +214,10 @@ public enum CLIRunner {
                 opts.cookieSource = "none"
             case "--proxy":
                 guard let v = nextVal(a) else { return 2 }
+                guard HTTPClient.isValidProxy(v) else {
+                    fputs("ubit get: invalid --proxy value: use http://host:port or socks5://host:port\n", stderr)
+                    return 2
+                }
                 opts.proxy = v
             case "--referer":
                 guard let v = nextVal(a) else { return 2 }
@@ -281,7 +287,7 @@ public enum CLIRunner {
 
             // Probe first in case targetURL is a playlist / channel
             do {
-                let initialInfo = try await engine.extract(url: targetURL, settings: settings, options: opts)
+                let initialInfo = try await extractCancellable(engine: engine, url: targetURL, settings: settings, options: opts)
                 if !initialInfo.entries.isEmpty && initialInfo.formats.isEmpty {
                     let chosenEntries = filterPlaylistEntries(initialInfo.entries, spec: itemsSpec)
                     var itemOpts = opts
@@ -318,6 +324,11 @@ public enum CLIRunner {
                 if code == 130 { return 130 }
                 if code != 0 { anyFailed = true }
             } catch {
+                if InterruptController.shared.interruptCount > 0 {
+                    if jsonMode { emitNDJSON(["event": "stopped", "url": targetURL]) }
+                    else { fputs("Stopped.\n", stderr) }
+                    return 130
+                }
                 anyFailed = true
                 if jsonMode {
                     emitNDJSON(["event": "error", "url": targetURL, "error": error.localizedDescription])
@@ -515,31 +526,57 @@ public enum CLIRunner {
 
     // MARK: - `ubit info` & `ubit formats`
 
+    /// Reads the metadata of `url`. The first SIGINT cancels the request, and then this throws
+    /// `CancellationError`.
+    private static func extractCancellable(engine: DownloadEngine, url: String, settings: Settings, options: DownloadRequestOptions) async throws -> MediaInfo {
+        let probe = Task { [url, settings, options] in
+            try Task.checkCancellation()
+            return try await engine.extract(url: url, settings: settings, options: options)
+        }
+        InterruptController.shared.setCancelHandler { probe.cancel() }
+        defer { InterruptController.shared.setCancelHandler(nil) }
+        let info = try await probe.value
+        if probe.isCancelled { throw CancellationError() }
+        return info
+    }
+
     private static func runInfo(_ args: [String], formatsOnly: Bool) async -> Int32 {
         let jsonMode = args.contains("--json")
         var cookieSrc = Settings.load().cookies
+        var proxy: String?
         var targetURL: String?
         var i = 0
         while i < args.count {
             let a = args[i]
             if a == "--json" { /* handled */ }
-            else if a == "--cookies" && i + 1 < args.count { i += 1; cookieSrc = args[i] }
+            else if (a == "--cookies" || a == "--cookies-from-browser") && i + 1 < args.count { i += 1; cookieSrc = args[i] }
+            else if a == "--proxy" && i + 1 < args.count { i += 1; proxy = args[i] }
             else if a == "--no-cookies" { cookieSrc = "none" }
-            else if !a.hasPrefix("-") && targetURL == nil { targetURL = a }
+            else if a.hasPrefix("-") {
+                // An unknown flag's value would otherwise become the target URL.
+                fputs("error: unknown flag \(a) for \(formatsOnly ? "formats" : "info")\n", stderr)
+                return 2
+            }
+            else if targetURL == nil { targetURL = a }
             i += 1
         }
         guard let url = targetURL else {
-            fputs("Usage: ubit \(formatsOnly ? "formats" : "info") <url> [--json]\n", stderr)
+            fputs("Usage: ubit \(formatsOnly ? "formats" : "info") <url> [--json] [--cookies FILE | --cookies-from-browser B | --no-cookies] [--proxy URL]\n", stderr)
+            return 2
+        }
+        if let proxy, !HTTPClient.isValidProxy(proxy) {
+            fputs("error: invalid --proxy value: use http://host:port or socks5://host:port\n", stderr)
             return 2
         }
 
         let settings = Settings.load()
         var opts = DownloadRequestOptions.from(settings: settings)
         opts.cookieSource = cookieSrc
+        if let proxy { opts.proxy = proxy }
         let engine = DownloadEngine()
 
         do {
-            let info = try await engine.extract(url: url, settings: settings, options: opts)
+            let info = try await extractCancellable(engine: engine, url: url, settings: settings, options: opts)
             if info.isDRM && info.formats.isEmpty {
                 fputs("error: this media is protected by DRM and can't be downloaded\n", stderr)
                 return 1
@@ -586,6 +623,10 @@ public enum CLIRunner {
             }
             return 0
         } catch {
+            if InterruptController.shared.interruptCount > 0 {
+                fputs("Stopped.\n", stderr)
+                return 130
+            }
             fputs("error: \(error.localizedDescription)\n", stderr)
             return 1
         }
@@ -737,7 +778,7 @@ public enum CLIRunner {
         let key = positional[0]
         let val = positional.dropFirst().joined(separator: " ")
         guard settings.setByKey(key, value: val) else {
-            fputs("error: invalid setting or value '\(key) = \(val)'\n", stderr)
+            fputs("error: invalid setting or value for '\(key)'\n", stderr)
             return 2
         }
         do {
@@ -842,7 +883,7 @@ public enum CLIRunner {
 
         Network & Output
               --cookies FILE            Netscape cookie file (default: built-in browser)
-              --cookies-from-browser B  firefox (or path)
+              --cookies-from-browser B  safari, firefox (or a cookies.txt path)
               --no-cookies              Send no cookies
               --proxy URL               socks5://127.0.0.1:1080 or http://127.0.0.1:8080
               --referer URL             Custom Referer header
@@ -851,6 +892,10 @@ public enum CLIRunner {
               --json                    Stream NDJSON events (start, info, progress, process, done, error, stopped)
               --quiet                   Print only saved file paths
               --no-library              Omit from app library
+
+        HTTP 401, 403 (access denied), 407, 410, 429 or 451 or a playability challenge ends that URL.
+        uBit does not retry with another URL, identity or route,
+        and it does not finish the download.
         """)
     }
 
@@ -858,11 +903,11 @@ public enum CLIRunner {
         print("""
         # uBit (\(UBIT_VERSION)) — Agent CLI Contract
 
-        Binary: `ubit` (also inside `uBit.app/Contents/MacOS/ubit`). Zero external dependencies required for MP4, M4A, MOV, WAV, AIFF, FLAC.
+        Binary: `ubit` (also inside `uBit.app/Contents/MacOS/ubit`). Zero external dependencies required for MP4, M4A, MOV, WAV, AIFF, FLAC. This manifest describes the native macOS Swift CLI; the Linux, Termux/Android, WASM and Rust SDK engines use a separate C++ engine.
 
         ## Commands
         - `ubit get <url>... [flags]` — Download video/audio. Prefer `--json` (NDJSON events on stdout) or `--quiet` (prints only final saved file path(s), one per line).
-        - `ubit info <url> --json` — Probe metadata (`id`, `title`, `site`, `author`, `duration`, `isLive`, `isDRM`, `formats`, `subtitles`, `chapters`, `entries`) without downloading.
+        - `ubit info <url> --json` — Probe metadata (`id`, `title`, `site`, `author`, `duration`, `isLive`, `isDRM`, `formats`, `subtitles`, `chapters`, `entries`) without saving a media file. A server that ignores byte ranges sends the whole stream. A byte-range response does not prove that the provider authorized access, and uBit does not claim that a provider verification check was completed. `info` and `formats` accept only `--json`, `--cookies FILE`, `--cookies-from-browser B`, `--no-cookies` and `--proxy URL`; any other flag exits with code `2`.
         - `ubit formats <url> --json` — Return JSON array of `MediaFormat` objects (`id`, `ext`, `proto`, `vcodec`, `acodec`, `width`, `height`, `fps`, `bitrate`, `filesize`).
         - `ubit list --json` — Return JSON array of library/queue items (`id`, `url`, `title`, `state`, `path`, `downloadedBytes`, `totalBytes`).
         - `ubit subs [list|add <url>|remove <n>|check] [--json] [--quiet]` — Manage channel/playlist subscriptions.
@@ -882,6 +927,11 @@ public enum CLIRunner {
         - `--quiet` — Suppress progress bars; print ONLY saved absolute file paths to stdout (ideal for command substitution `FILE=$(ubit get --quiet ...)`).
         - `--no-library` — Ephemeral run; do not append agent scratch downloads to the user's GUI library.
         - `--section START-END` — Keyframe-accurate clip trim (e.g. `0:30-1:15` or `90-135`). Uses `sidx` HTTP byte-range planning so a 15s clip from a 2h video downloads only ~2–4 MB.
+        - Provider refusals: HTTP 401, 403 (access denied), 407, 410, 429 or 451 ends the operation for that URL, also on optional requests. The status decides when URLSession hands over the response. uBit does not read a refused body, retry with another URL, client identity or route, or continue other connections after a range refusal. Sign-in cookies only authenticate ordinary requests.
+        - Before a status is known, uBit retries only when the error proves that the request did not reach the server. A timeout or reset before a status gives a "No HTTP status" error. A refusal that sends only headers can take the 30 s request timeout and makes one request. A broken 2xx body keeps its ordinary retry. A `/player` retry needs a new pacing permit.
+        - YouTube playability: Only the `/watch` and `/player` decisions count. A decision other than OK, or OK with a non-null error screen, ends extraction. A reason alone on OK is not a refusal. The embed page only supplies the player script URL.
+        - YouTube verification notices: Extraction stops when the watch page or the optional visitor request ends on `/sorry/` on google.com or a subdomain, accounts.google.com, consent.youtube.com or consent.google.com. It also stops if the watch page shows a reCAPTCHA widget or a visible sentence that matches exactly: "Sign in to confirm you're not a bot", "Sign in to confirm your age", or "Our systems have detected unusual traffic from your computer network". Case, whitespace and apostrophe style are ignored. Relevant HTML character references are decoded once. Hidden text, including later summaries of closed details, does not count.
+        - YouTube extraction may try more than one profile for ordinary format selection. A refusal or challenge ends extraction instead of advancing to another profile or route. Without a direct format, HLS requires player data from the watch page or from a profile that named a playlist without direct formats. The first playlist URL named by a tried profile takes precedence. The watch-page URL is used only if no profile named one, not when the profile URL is unreadable. YouTube video extraction rejects raw Cookie headers before the first request, even with an empty cookie vault.
         - `-a --to wav` — Extract 16-bit 44.1 kHz stereo PCM `.wav` natively via macOS AudioToolbox (zero FFmpeg) for ASR/transcription pipelines.
         - `-q <best|2160|1440|1080|720|480|360>` / `-f <vid+aid>` — Bound resolution or select exact stream IDs.
         - `--subs --sub-langs en --sub-files` — Download WebVTT `.vtt` subtitle sidecar files alongside media.

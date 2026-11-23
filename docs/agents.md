@@ -48,11 +48,13 @@ AUDIO_WAV="$(ubit get -a --to wav --section 0:00-5:00 --no-library --quiet -o /t
 ```
 
 ### Pattern D: Structured Metadata & Subtitle Probe (`ubit info --json`)
-Inspect available qualities, codecs, byte sizes, durations, chapters, playlist items, and subtitle tracks **before** downloading bytes:
+Inspect available qualities, codecs, byte sizes, durations, chapters, playlist items, and subtitle tracks without saving a media file. Extraction can still request stream bytes, and a server that ignores byte ranges sends the whole response. Such a response does not prove that the provider authorized access, and `ubit` does not claim that a provider verification check was completed:
 
 ```sh
 ubit info --json "$URL"
 ```
+
+`ubit info` and `ubit formats` accept only `--json`, `--cookies FILE`, `--cookies-from-browser B`, `--no-cookies` and `--proxy URL`. Any other flag exits with code `2`.
 
 Top-level JSON fields returned by `ubit info --json`:
 
@@ -106,7 +108,7 @@ When `--json` is passed to `ubit get`, `stdout` emits strictly valid newline-del
 | Exit Code | Meaning | Agent Action |
 | ---: | --- | --- |
 | `0` | All URLs succeeded | Read output path from `done.path` or `--quiet` stdout |
-| `1` | Extraction, auth, DRM, or network error | Inspect `error` field; if auth-gated, pass `--cookies` / `--cookies-from-browser firefox` or ask user to sign in via `ubit browse <url>` |
+| `1` | Extraction, auth, DRM, network, provider refusal, or challenge error | Inspect `error`. A provider refusal or challenge is terminal for that URL: do not retry with another identity or route. For ordinary auth-gated content, pass `--cookies` / `--cookies-from-browser firefox` or ask the user to sign in via `ubit browse <url>` |
 | `2` | Invalid CLI usage / flag syntax | Fix invocation flags (check `ubit get --help`) |
 | `130` | Interrupted (`SIGINT`) | Re-run the exact same command to resume from `.part` + `.part.json` |
 
@@ -119,7 +121,31 @@ When `--json` is passed to `ubit get`, `stdout` emits strictly valid newline-del
 - **Authenticated / Age-Gated Sites**:
   1. Default (`--cookies builtin`): reads `~/Library/Application Support/uBit/cookies.txt`, automatically populated whenever the user signs into a site inside `ubit browse <url>` (`⌘B`).
   2. Firefox SQLite (`--cookies-from-browser firefox`): copies and queries the active Firefox profile's `cookies.sqlite` read-only.
+  2b. Safari (`--cookies-from-browser safari`): reads `~/Library/Containers/com.apple.Safari/Data/Library/Cookies/Cookies.binarycookies` (falling back to `~/Library/Cookies`). The file is unencrypted, so no keychain access is needed. Chrome/Brave/Edge are rejected with an explicit error: their cookie values need the browser's keychain password and an AES unwrap.
   3. Explicit Netscape Cookie File (`--cookies /path/to/cookies.txt`).
   4. Cookie-free (`--no-cookies`): forces unauthenticated extraction.
+- **YouTube Request Pacing & Cache**:
+  In one `ubit` process, the pacer grants permission for one YouTube `/player` attempt at a time, at least 3 seconds after the previous grant. Retries need a permit too. A caller can pause after it gets permission, so two HTTP requests can start less than 3 seconds apart.
+
+  The process caches a video's metadata for 5.5 hours per request context: the cookies for `/watch` and `/player`, the User-Agent, extra headers and the proxy. Separate processes do not share the pacer or the cache.
+- **YouTube Challenges**:
+  Only playability decisions from the watch page and the `/player` API count. The embed page supplies the player script URL only. A decision other than `OK`, or `OK` with a non-null error screen, ends extraction with exit code `1`. A reason alone or a JSON `null` error screen does not prevent playback when the decision is `OK`. If a decision other than `OK` has a reason from the list below, the error identifies a verification challenge. Signing in does not change the stop rule. `ubit` does not complete the challenge or retry with a different client profile, `User-Agent` or route.
+
+  The watch page and the optional `/sw.js_data` visitor request stop extraction if the final URL is on `accounts.google.com`, `consent.youtube.com`, `consent.google.com`, or a `/sorry/` path on `google.com` or one of its subdomains. The path `/sorry/` itself counts.
+
+  The watch page also stops extraction if it shows a reCAPTCHA widget or a visible sentence that exactly matches one of these sentences. The comparison ignores case, whitespace differences and apostrophe style:
+    - "Sign in to confirm you're not a bot"
+    - "Sign in to confirm your age"
+    - "Our systems have detected unusual traffic from your computer network"
+
+  Common HTML references for letters in the notice, spaces, apostrophes and ending punctuation are decoded once, within each text node. An inline tag cannot join two parts of a character reference. Text in a script, a comment, an attribute, the page title or a hidden element does not count. Hidden elements include `hidden`, `aria-hidden="true"`, `display:none`, a closed `<dialog>`, and a closed `<details>` except for its first `<summary>`. An inline script does not split the surrounding text into two sentences. A longer sentence does not stop extraction merely because it contains a listed sentence.
+- **Provider refusals:** HTTP 401, 403 (access denied), 407, 410 (gone), 429 (rate limited) or 451, or a YouTube challenge, ends that URL's operation. This also applies to optional requests such as cover art, subtitles, SponsorBlock segments and extra metadata. `ubit` does not retry with another URL, client identity or route. Sign-in cookies still authenticate ordinary requests; they do not turn a refusal into a retry.
+
+  The status decides as soon as URLSession hands the response to `ubit`, and `ubit` does not read a refused body. A request that fails before `ubit` can read its status is repeated only when the failure proves that the request never reached the server: no network, no host address, or no connection. Any other failure before the status, such as a timeout or a connection reset, gives a "No HTTP status" error and is not repeated, because the server may have sent a refusal. URLSession itself can send a request again when the connection closes before any response byte arrives; `ubit` adds no attempt in that case. After a 2xx status, a body that breaks off keeps its ordinary retry; a YouTube `/player` retry waits for a new pacing permit. In a download with several connections, a refused byte range ends every connection, and no connection requests that range again.
+
+  URLSession can hold a response until some of its body arrives. A refusal that sends only headers therefore ends after the 30 s request timeout, with one request and a "No HTTP status" error. This delay is accepted: a shorter wait would need a second request or a lower-level HTTP stack.
+- **YouTube format selection:** Extraction may try more than one client profile for ordinary format selection. A refusal or challenge is not a format-selection failure: it ends extraction instead of advancing to another profile or route. If no direct format is available, HLS requires player data from the watch page or from a profile that named a playlist without direct formats. `ubit` selects the first playlist URL named by a tried profile. It uses the watch-page URL only if no tried profile named one. If the selected URL is unreadable, `ubit` does not try another playlist. Without usable metadata and formats, no media download starts.
+- **Cookie headers:** YouTube video extraction rejects an explicit `Cookie` header before the first request, even if the cookie vault is empty. The error does not repeat the value.
+- **Proxy Values**: `--proxy` and the `proxy` setting accept only `http://`, `https://`, `socks5://`, `socks5h://` or `socks://` URLs with a host and, when the URL names a port, a port from 1 to 65535. Every socks scheme uses SOCKS version 5, so `socks4://` and `socks4a://` are refused. Any other value exits with code `2` (or fails the download, for a value that was already stored) before a request is sent, so a mistyped proxy never sends traffic directly. The error does not repeat the value, because a proxy URL can hold a password.
 - **Unrecognized JS-Heavy Player Pages**:
-  If static/API extraction fails on a custom video host, hand the URL to the built-in WebKit media-sniffer browser (`ubit browse <url>`), which hooks `fetch`, `XMLHttpRequest`, and `<video>` across all frames to capture dynamic HLS/DASH/MP4 URLs.
+  If static/API extraction fails on a custom video host for a reason other than a provider refusal or challenge, hand the URL to the built-in WebKit media-sniffer browser (`ubit browse <url>`), which hooks `fetch`, `XMLHttpRequest`, and `<video>` across all frames to capture dynamic HLS/DASH/MP4 URLs.

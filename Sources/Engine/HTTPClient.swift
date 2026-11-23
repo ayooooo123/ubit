@@ -3,17 +3,20 @@ import Foundation
 public enum HTTPError: LocalizedError {
     case badURL(String)
     case status(Int, String)
-    case staleLink(Int)
     case rangeUnsupported
     case canceled
+    /// The request failed before uBit could read its status, and the failure does not prove
+    /// that the request never reached the server. The response may have been a refusal.
+    case noStatus(String)
 
     public var errorDescription: String? {
         switch self {
         case .badURL(let u): return "Invalid URL: \(u)"
         case .status(let code, let u): return "HTTP \(code) from \(URL(string: u)?.host ?? u)"
-        case .staleLink(let code): return "Stream link expired (HTTP \(code))"
         case .rangeUnsupported: return "Server stopped serving byte ranges"
         case .canceled: return "Canceled"
+        case .noStatus(let u):
+            return "No HTTP status from \(URL(string: u)?.host ?? u): the request failed before uBit could read the status, and the response may have been a refusal. uBit does not repeat the request."
         }
     }
 }
@@ -92,6 +95,7 @@ private actor WorkStealingQueue {
     private var active: [Int: ActiveWorker] = [:]
     private var nextID: Int = 1
     private let minStealSize: Int64 = 512 * 1024 // 512 KB minimum split
+    private var stopped = false
 
     init(state: ChunkStateFile, stateURL: URL, initialSplits: Int) {
         self.state = state
@@ -113,6 +117,7 @@ private actor WorkStealingQueue {
     }
 
     func claimWork() -> (workerID: Int, range: ByteRange)? {
+        guard !stopped else { return nil }
         if !pending.isEmpty {
             let r = pending.removeFirst()
             let id = nextID
@@ -167,10 +172,12 @@ private actor WorkStealingQueue {
         return (keepGoing, allowed, state.downloadedBytes)
     }
 
-    func failWorker(workerID: Int) {
-        if let w = active.removeValue(forKey: workerID), w.currentPos <= w.endPos {
-            pending.insert(ByteRange(start: w.currentPos, end: w.endPos), at: 0)
-        }
+    /// Ends the transfer after a worker fails: no range is put back, and no worker claims new
+    /// work. A refused range is therefore never requested again by another worker.
+    func stop() {
+        stopped = true
+        pending.removeAll()
+        active.removeAll()
     }
 
     func flushState() {
@@ -187,11 +194,61 @@ private actor WorkStealingQueue {
 public final class HTTPClient: @unchecked Sendable {
     public static let defaultBrowserUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15"
 
+    /// Provider refusals. A refusal ends the operation: uBit never repeats the request, and
+    /// never asks the provider for another URL, client identity or route.
+    static func isRefusal(_ code: Int) -> Bool {
+        switch code { case 401, 403, 407, 410, 429, 451: return true; default: return false }
+    }
+
+    /// Transport failures that prove that the request never reached the server: no network,
+    /// no host address, or no connection. Only these may be repeated before a status arrives.
+    /// Any other failure before the status (a timeout, a lost connection) can hide a refusal.
+    static func canRetryTransport(_ error: Error) -> Bool {
+        guard let transport = error as? URLError else { return false }
+        switch transport.code {
+        case .notConnectedToInternet, .cannotFindHost, .dnsLookupFailed, .cannotConnectToHost: return true
+        default: return false
+        }
+    }
+
+    /// `responseBytes` converts uncertain pre-status failures to `noStatus`. A POSIX reset
+    /// that reaches this check therefore interrupted a body after an accepted status.
+    static func canRetryData(_ error: Error) -> Bool {
+        if let transport = error as? URLError { return transport.code != .cancelled }
+        let cause = error as NSError
+        return cause.domain == NSPOSIXErrorDomain && cause.code == Int(ECONNRESET)
+    }
+
+    /// True for a proxy URL that `init` can install: an http, https, socks, socks5 or socks5h
+    /// scheme, a host, and no port or a TCP port from 1 to 65535. URLSession speaks SOCKS
+    /// version 5 for every socks scheme, so socks4 and socks4a are refused. Any other string
+    /// would leave the session without a working proxy, so callers reject it instead of
+    /// sending the requests.
+    public static func isValidProxy(_ proxy: String) -> Bool {
+        proxySettings(proxy) != nil
+    }
+
+    private static func proxySettings(_ value: String) -> (host: String, port: Int, socks: Bool)? {
+        guard let parts = URLComponents(string: value), let host = parts.url?.host, !host.isEmpty,
+              let scheme = parts.scheme?.lowercased(),
+              ["http", "https", "socks", "socks5", "socks5h"].contains(scheme) else { return nil }
+        let socks = scheme.hasPrefix("socks")
+        if let port = parts.port {
+            guard (1...65535).contains(port) else { return nil }
+            return (host, port, socks)
+        }
+        guard parts.rangeOfPort == nil else { return nil }
+        return (host, socks ? 1080 : 8080, socks)
+    }
+
     public let session: URLSession
     public let cookies: CookieVault
     public let limiter: RateLimiter
     public let defaultHeaders: [String: String]
     public let userAgent: String
+    /// The proxy URL this client routes through, or nil for a direct route.
+    public let proxy: String?
+    private let invalidProxy: Bool
 
     public init(
         cookies: CookieVault = CookieVault(),
@@ -204,6 +261,9 @@ public final class HTTPClient: @unchecked Sendable {
         self.limiter = RateLimiter(bytesPerSec: rateLimitBytesPerSec)
         self.userAgent = (userAgent?.isEmpty == false) ? userAgent! : Self.defaultBrowserUA
         self.defaultHeaders = extraHeaders
+        self.proxy = (proxy?.isEmpty == false) ? proxy : nil
+        let route = self.proxy.flatMap(Self.proxySettings)
+        self.invalidProxy = self.proxy != nil && route == nil
 
         let cfg = URLSessionConfiguration.ephemeral
         cfg.httpCookieAcceptPolicy = .never
@@ -213,9 +273,8 @@ public final class HTTPClient: @unchecked Sendable {
         cfg.timeoutIntervalForResource = 86400
         cfg.waitsForConnectivity = false
 
-        if let p = proxy, !p.isEmpty, let purl = URL(string: p), let host = purl.host {
-            let port = purl.port ?? (purl.scheme?.hasPrefix("socks") == true ? 1080 : 8080)
-            if purl.scheme?.lowercased().hasPrefix("socks") == true {
+        if let (host, port, socks) = route {
+            if socks {
                 cfg.connectionProxyDictionary = [
                     kCFStreamPropertySOCKSProxyHost as String: host,
                     kCFStreamPropertySOCKSProxyPort as String: port,
@@ -241,6 +300,7 @@ public final class HTTPClient: @unchecked Sendable {
         body: Data? = nil,
         includeCookies: Bool = true
     ) throws -> URLRequest {
+        guard !invalidProxy else { throw HTTPError.badURL("invalid proxy setting") }
         guard let u = URL(string: url) else { throw HTTPError.badURL(url) }
         var req = URLRequest(url: u)
         req.httpMethod = method
@@ -259,6 +319,35 @@ public final class HTTPClient: @unchecked Sendable {
         return req
     }
 
+    /// Sends `req` and returns when URLSession hands over the response. A refusal status throws
+    /// `HTTPError.status` at once, without reading the body. A failure before the status stays
+    /// as it is only for a cancellation or when `canRetryTransport` proves that the request
+    /// never reached the server; any other failure, also one that is not a `URLError`, becomes
+    /// `HTTPError.noStatus`, which no caller repeats. URLSession can hold a response until some
+    /// body arrives, so a refusal that sends only headers reaches uBit as `noStatus` after the
+    /// 30 s request timeout.
+    func responseBytes(for req: URLRequest, url: String) async throws -> (URLSession.AsyncBytes, HTTPURLResponse) {
+        let bytes: URLSession.AsyncBytes, response: URLResponse
+        do {
+            (bytes, response) = try await session.bytes(for: req)
+        } catch let error as URLError where error.code == .cancelled || Self.canRetryTransport(error) {
+            throw error
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw HTTPError.noStatus(url)
+        }
+        guard let http = response as? HTTPURLResponse else {
+            bytes.task.cancel()
+            throw HTTPError.badURL(url)
+        }
+        if Self.isRefusal(http.statusCode) {
+            bytes.task.cancel()
+            throw HTTPError.status(http.statusCode, url)
+        }
+        return (bytes, http)
+    }
+
     public func fetchData(
         url: String,
         method: String = "GET",
@@ -272,27 +361,25 @@ public final class HTTPClient: @unchecked Sendable {
             try Task.checkCancellation()
             do {
                 let req = try makeRequest(url: url, method: method, headers: headers, body: body, includeCookies: includeCookies)
-                let (data, resp) = try await session.data(for: req)
-                await limiter.consume(data.count)
-                guard let http = resp as? HTTPURLResponse else {
-                    throw HTTPError.badURL(url)
-                }
-                if (200..<300).contains(http.statusCode) {
-                    return (data, http)
-                }
-                if http.statusCode == 403 || http.statusCode == 410 {
+                let (bytes, http) = try await responseBytes(for: req, url: url)
+                guard (200..<300).contains(http.statusCode) else {
+                    bytes.task.cancel()
+                    if [500, 502, 503, 504].contains(http.statusCode) && attempt + 1 < retries {
+                        try await Task.sleep(nanoseconds: UInt64(400_000_000 * (1 << attempt)))
+                        continue
+                    }
                     throw HTTPError.status(http.statusCode, url)
                 }
-                if [429, 500, 502, 503, 504].contains(http.statusCode) && attempt + 1 < retries {
-                    try await Task.sleep(nanoseconds: UInt64(400_000_000 * (1 << attempt)))
-                    continue
-                }
-                throw HTTPError.status(http.statusCode, url)
+                var data = Data()
+                if http.expectedContentLength > 0 { data.reserveCapacity(Int(min(http.expectedContentLength, 1 << 26))) }
+                for try await b in bytes { data.append(b) }
+                await limiter.consume(data.count)
+                return (data, http)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
                 lastErr = error
-                if attempt + 1 < retries, (error as? URLError) != nil {
+                if attempt + 1 < retries, Self.canRetryData(error) {
                     try await Task.sleep(nanoseconds: UInt64(400_000_000 * (1 << attempt)))
                     continue
                 }
@@ -317,9 +404,10 @@ public final class HTTPClient: @unchecked Sendable {
         method: String = "GET",
         headers: [String: String]? = nil,
         body: Data? = nil,
-        includeCookies: Bool = true
+        includeCookies: Bool = true,
+        retries: Int = 3
     ) async throws -> Any {
-        let (data, _) = try await fetchData(url: url, method: method, headers: headers, body: body, includeCookies: includeCookies)
+        let (data, _) = try await fetchData(url: url, method: method, headers: headers, body: body, includeCookies: includeCookies, retries: retries)
         return try JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
     }
 
@@ -335,11 +423,7 @@ public final class HTTPClient: @unchecked Sendable {
         var hdrs = headers ?? [:]
         hdrs["Range"] = "bytes=0-0"
         let req = try makeRequest(url: url, headers: hdrs)
-        let (_, resp) = try await session.bytes(for: req)
-        guard let http = resp as? HTTPURLResponse else { return (nil, false, nil) }
-        if http.statusCode == 403 || http.statusCode == 410 {
-            throw HTTPError.staleLink(http.statusCode)
-        }
+        let (_, http) = try await responseBytes(for: req, url: url)
         guard (200..<300).contains(http.statusCode) else {
             throw HTTPError.status(http.statusCode, url)
         }
@@ -404,6 +488,7 @@ public final class HTTPClient: @unchecked Sendable {
 
         let initialDone = chunkState.downloadedBytes
         onProgress?(initialDone, total)
+        try Task.checkCancellation()
         if initialDone >= total {
             if FileManager.default.fileExists(atPath: destination.path) {
                 try FileManager.default.removeItem(at: destination)
@@ -441,7 +526,9 @@ public final class HTTPClient: @unchecked Sendable {
                         }
                     }
                 }
-                try await group.waitForAll()
+                // The first failure ends the group at once and cancels the other workers. A
+                // plain `waitForAll` would let them finish and claim more work first.
+                for try await _ in group {}
             }
         } catch {
             await workQueue.flushState()
@@ -449,6 +536,7 @@ public final class HTTPClient: @unchecked Sendable {
         }
 
         await workQueue.flushState()
+        try Task.checkCancellation()
         if FileManager.default.fileExists(atPath: destination.path) {
             try FileManager.default.removeItem(at: destination)
         }
@@ -479,16 +567,10 @@ public final class HTTPClient: @unchecked Sendable {
                 var hdrs = headers ?? [:]
                 hdrs["Range"] = "bytes=\(curStart)-\(reqEnd)"
                 let req = try makeRequest(url: url, headers: hdrs)
-                let (bytes, resp) = try await session.bytes(for: req)
-                guard let http = resp as? HTTPURLResponse else {
-                    throw HTTPError.badURL(url)
-                }
-                if http.statusCode == 403 || http.statusCode == 410 {
-                    await workQueue.failWorker(workerID: workerID)
-                    throw HTTPError.staleLink(http.statusCode)
-                }
+                // A refusal or an unread status throws HTTPError, which ends every worker.
+                let (bytes, http) = try await responseBytes(for: req, url: url)
                 guard http.statusCode == 206 else {
-                    await workQueue.failWorker(workerID: workerID)
+                    bytes.task.cancel()
                     throw HTTPError.rangeUnsupported
                 }
 
@@ -507,7 +589,7 @@ public final class HTTPClient: @unchecked Sendable {
                         }
                         if !res.keepGoing { return }
                         if Task.isCancelled {
-                            await workQueue.failWorker(workerID: workerID)
+                            await workQueue.stop()
                             throw CancellationError()
                         }
                     }
@@ -519,19 +601,14 @@ public final class HTTPClient: @unchecked Sendable {
                 }
                 attempts = 0
                 if reqEnd >= origEnd { return }
-            } catch is CancellationError {
-                await workQueue.failWorker(workerID: workerID)
-                throw CancellationError()
-            } catch let e as HTTPError {
-                await workQueue.failWorker(workerID: workerID)
-                throw e
-            } catch {
+            } catch let error as URLError where error.code != .cancelled && attempts < 3 {
+                // The status was 206 and the body broke off, or the connection never opened
+                // (`responseBytes` turns every other failure before the status into `noStatus`).
                 attempts += 1
-                if attempts >= 4 {
-                    await workQueue.failWorker(workerID: workerID)
-                    throw error
-                }
                 try await Task.sleep(nanoseconds: UInt64(350_000_000 * attempts))
+            } catch {
+                await workQueue.stop()
+                throw error
             }
         }
     }
@@ -589,11 +666,7 @@ public final class HTTPClient: @unchecked Sendable {
             hdrs["Range"] = "bytes=\(existingOffset)-"
         }
         let req = try makeRequest(url: url, headers: hdrs)
-        let (bytes, resp) = try await session.bytes(for: req)
-        guard let http = resp as? HTTPURLResponse else { throw HTTPError.badURL(url) }
-        if http.statusCode == 403 || http.statusCode == 410 {
-            throw HTTPError.staleLink(http.statusCode)
-        }
+        let (bytes, http) = try await responseBytes(for: req, url: url)
         guard (200..<300).contains(http.statusCode) else {
             throw HTTPError.status(http.statusCode, url)
         }

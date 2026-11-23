@@ -77,7 +77,7 @@ public struct VimeoExtractor: SiteExtractor {
                         sawOnlyDRM = true
                         continue
                     }
-                    if let hlsFmts = try? await HLSEngine.extractFormats(client: client, playlistURL: m3u8, headers: headers, idPrefix: "hls") {
+                    if let hlsFmts = try await ExtractorUtils.optionalRequest({ try await HLSEngine.extractFormats(client: client, playlistURL: m3u8, headers: headers, idPrefix: "hls") }) {
                         formats.append(contentsOf: hlsFmts)
                         break
                     }
@@ -111,7 +111,7 @@ public struct SoundCloudExtractor: SiteExtractor {
         }
         let scripts = ExtractorUtils.allMatches("<script[^>]+src=[\"'](https://a-v2\\.sndcdn\\.com/assets/[^\"']+\\.js)[\"']", in: pageHTML)
         for jsURL in scripts.suffix(4).reversed() {
-            if let (js, _) = try? await client.fetchText(url: jsURL, includeCookies: false),
+            if let (js, _) = try await ExtractorUtils.optionalRequest({ try await client.fetchText(url: jsURL, includeCookies: false) }),
                let cid = ExtractorUtils.firstMatch("client_id\\s*:\\s*\"([a-zA-Z0-9]{32})\"", in: js) {
                 return cid
             }
@@ -146,7 +146,7 @@ public struct SoundCloudExtractor: SiteExtractor {
         if kind == "user" {
             let uid = String((resolved["id"] as? Int) ?? 0)
             let uname = (resolved["username"] as? String) ?? "Artist"
-            let tracksResp = try? await client.fetchJSON(url: "https://api-v2.soundcloud.com/users/\(uid)/tracks?limit=50&client_id=\(clientID)") as? [String: Any]
+            let tracksResp = try await ExtractorUtils.optionalRequest({ try await client.fetchJSON(url: "https://api-v2.soundcloud.com/users/\(uid)/tracks?limit=50&client_id=\(clientID)") }) as? [String: Any]
             let coll = (tracksResp?["collection"] as? [[String: Any]]) ?? []
             let entries = coll.compactMap { tr -> PlaylistEntry? in
                 guard let tid = tr["id"] as? Int, let purl = tr["permalink_url"] as? String else { return nil }
@@ -175,7 +175,7 @@ public struct SoundCloudExtractor: SiteExtractor {
 
                 var lookup = "\(apiStreamURL)?client_id=\(clientID)"
                 if let ta = trackAuth { lookup += "&track_authorization=\(ta)" }
-                guard let linkObj = try? await client.fetchJSON(url: lookup) as? [String: Any],
+                guard let linkObj = try await ExtractorUtils.optionalRequest({ try await client.fetchJSON(url: lookup) }) as? [String: Any],
                       let actualURL = linkObj["url"] as? String else { continue }
 
                 let isHLS = protoStr.contains("hls")
@@ -538,7 +538,7 @@ public struct RedditExtractor: SiteExtractor {
         if host == "v.redd.it" {
             let vid = url.path.split(separator: "/").first.map(String.init) ?? "reddit"
             let hlsURL = "https://v.redd.it/\(vid)/HLSPlaylist.m3u8"
-            if let fmts = try? await HLSEngine.extractFormats(client: client, playlistURL: hlsURL), !fmts.isEmpty {
+            if let fmts = try await ExtractorUtils.optionalRequest({ try await HLSEngine.extractFormats(client: client, playlistURL: hlsURL) }), !fmts.isEmpty {
                 return MediaInfo(id: vid, title: "Reddit Video \(vid)", site: "Reddit", webpageURL: url.absoluteString, formats: fmts)
             }
         }
@@ -548,7 +548,7 @@ public struct RedditExtractor: SiteExtractor {
         if cleanPath.hasSuffix("/") { cleanPath.removeLast() }
         let jsonEndpoint = "https://www.reddit.com\(cleanPath).json?raw_json=1"
 
-        if let arr = try? await client.fetchJSON(url: jsonEndpoint, headers: ["Accept": "application/json"]) as? [Any],
+        if let arr = try await ExtractorUtils.optionalRequest({ try await client.fetchJSON(url: jsonEndpoint, headers: ["Accept": "application/json"]) }) as? [Any],
            let firstListing = arr.first as? [String: Any],
            let children = ((firstListing["data"] as? [String: Any])?["children"] as? [[String: Any]]),
            var post = children.first?["data"] as? [String: Any] {
@@ -567,11 +567,11 @@ public struct RedditExtractor: SiteExtractor {
             var formats: [MediaFormat] = []
             if let rv {
                 if let hls = rv["hls_url"] as? String,
-                   let hlsFmts = try? await HLSEngine.extractFormats(client: client, playlistURL: hls) {
+                   let hlsFmts = try await ExtractorUtils.optionalRequest({ try await HLSEngine.extractFormats(client: client, playlistURL: hls) }) {
                     formats.append(contentsOf: hlsFmts)
                 }
                 if let dash = rv["dash_url"] as? String,
-                   let (dashFmts, _, _) = try? await DASHEngine.extractFormats(client: client, mpdURL: dash) {
+                   let (dashFmts, _, _) = try await ExtractorUtils.optionalRequest({ try await DASHEngine.extractFormats(client: client, mpdURL: dash) }) {
                     formats.append(contentsOf: dashFmts)
                 }
                 if let fb = rv["fallback_url"] as? String {
@@ -587,7 +587,7 @@ public struct RedditExtractor: SiteExtractor {
             }
         }
 
-        // Embed fallback when Reddit API returns 403
+        // Check the embed page when the API has no media, not when it refused the request.
         let embedURL = "https://embed.reddit.com\(cleanPath)"
         let (embedHTML, _) = try await client.fetchText(url: embedURL)
         if let hlsMatch = ExtractorUtils.firstMatch("(https://v\\.redd\\.it/[^\"'\\s]+HLSPlaylist\\.m3u8[^\"'\\s]*)", in: embedHTML) {
@@ -618,7 +618,7 @@ public struct TwitterExtractor: SiteExtractor {
         // 1. Official Twitter Syndication CDN JSON
         let token = Self.syndicationToken(for: tweetID)
         let syndURL = "https://cdn.syndication.twimg.com/tweet-result?id=\(tweetID)&lang=en&token=\(token)"
-        if let obj = try? await client.fetchJSON(url: syndURL, includeCookies: false) as? [String: Any],
+        if let obj = try await ExtractorUtils.optionalRequest({ try await client.fetchJSON(url: syndURL, includeCookies: false) }) as? [String: Any],
            let mediaDetails = obj["mediaDetails"] as? [[String: Any]], !mediaDetails.isEmpty {
             var formats: [MediaFormat] = []
             var thumb: String?
@@ -631,7 +631,7 @@ public struct TwitterExtractor: SiteExtractor {
                         guard let vurl = v["url"] as? String else { continue }
                         let ct = (v["content_type"] as? String) ?? ""
                         if ct.contains("mpegURL") || vurl.contains(".m3u8") {
-                            if let hls = try? await HLSEngine.extractFormats(client: client, playlistURL: vurl, idPrefix: "hls-\(mIdx)") {
+                            if let hls = try await ExtractorUtils.optionalRequest({ try await HLSEngine.extractFormats(client: client, playlistURL: vurl, idPrefix: "hls-\(mIdx)") }) {
                                 formats.append(contentsOf: hls)
                             }
                         } else if ct.contains("mp4") {
@@ -672,8 +672,8 @@ public struct TwitterExtractor: SiteExtractor {
             }
         }
 
-        // 2. Fallback to api.vxtwitter.com (handles NSFW/age-gated, cards, and multi-video carousels cleanly)
-        if let vx = try? await client.fetchJSON(url: "https://api.vxtwitter.com/Twitter/status/\(tweetID)", includeCookies: false) as? [String: Any],
+        // Check alternate metadata only when the optional request did not report a refusal.
+        if let vx = try await ExtractorUtils.optionalRequest({ try await client.fetchJSON(url: "https://api.vxtwitter.com/Twitter/status/\(tweetID)", includeCookies: false) }) as? [String: Any],
            let extMedia = vx["media_extended"] as? [[String: Any]] {
             var formats: [MediaFormat] = []
             var thumb: String?

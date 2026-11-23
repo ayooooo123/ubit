@@ -43,6 +43,8 @@ jobs:
           cp dist/ubit-*-darwin-arm64.tar.gz "$RUNNER_TEMP/first.tar.gz"
           (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/build.sh")
           cmp "$RUNNER_TEMP/first.tar.gz" dist/ubit-*-darwin-arm64.tar.gz
+      - name: Swift regression checks (offline fixtures)
+        run: ./tests/swift/run.sh
       - name: Upload macOS release archive
         uses: actions/upload-artifact@v4
         with:

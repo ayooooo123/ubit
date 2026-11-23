@@ -53,6 +53,8 @@ ubit get -a --to wav --no-library --quiet <url>                # zero-FFmpeg 16-
 ubit get --json <url>                                          # stream NDJSON events: start, info, progress, process, done
 ```
 
+**Provider refusals.** On the native macOS Swift CLI, HTTP 401, 403 (access denied), 407, 410, 429 or 451, or a playability or verification challenge, ends that URL's operation. This also applies to optional requests such as cover art and subtitles. uBit does not retry with another URL, client identity or route, and it does not claim that a provider verification check was completed. Sign-in cookies still authenticate ordinary requests; they do not justify a retry after a refusal. The Linux, Android and WASM builds and the Rust SDK use a separate C++ engine with its own rules.
+
 See **[`docs/agents.md`](docs/agents.md)** for full NDJSON schemas, exit codes (`0`, `1`, `2`, `130`), `UBIT_CONFIG_DIR` sandbox isolation, and authentication workflows.
 
 

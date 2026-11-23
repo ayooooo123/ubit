@@ -8,18 +8,18 @@
 | --- | --- |
 | `Sources/main.swift` | Dual-mode entry point: dispatches to `CLIRunner` when arguments are passed (ignoring macOS `-psn_*`/`-NS*` launch flags), otherwise starts `NSApplication` with `UBitAppDelegate` |
 | `Sources/Core/Models.swift` | Core types (`MediaInfo`, `MediaFormat`, `SubtitleTrack`, `Chapter`, `PlaylistEntry`, `Settings`, `LibraryItem`, `Subscription`, `SectionRange`, `AppPaths`, filename template sanitizer) |
-| `Sources/Core/Cookies.swift` | `CookieVault`: Netscape `cookies.txt` parser/writer, read-only Firefox `cookies.sqlite` importer (`libsqlite3`), and `WKHTTPCookieStore` exporter |
+| `Sources/Core/Cookies.swift` | `CookieVault`: Netscape `cookies.txt` parser/writer, read-only Firefox `cookies.sqlite` importer (`libsqlite3`), Safari `Cookies.binarycookies` reader (`SafariBinaryCookies`), and `WKHTTPCookieStore` exporter; Chromium-family names throw `CookieError.browserNotSupported` |
 | `Sources/Core/QueueAndSubs.swift` | Thread-safe `LibraryStore`, `SubscriptionStore`, `@MainActor QueueManager`, `IOKit` idle-sleep assertion (`IOPMAssertionCreateWithName`), Dock progress badge, and `AF_UNIX` socket IPC (`LocalIPC`) |
-| `Sources/Engine/HTTPClient.swift` | Ephemeral `URLSession` client (SOCKS5/HTTP proxy, token-bucket `RateLimiter`, retry/backoff) and `WorkStealingQueue` multi-connection HTTP `Range` downloader (`pwrite` into `.part` + `.part.json`) |
+| `Sources/Engine/HTTPClient.swift` | Ephemeral `URLSession` client (SOCKS5/HTTP proxy, token-bucket `RateLimiter`, 5xx retry/backoff; a refusal status (401, 403, 407, 410, 429, 451) or a failure before the status ends the request, except a failure that proves no connection) and `WorkStealingQueue` multi-connection HTTP `Range` downloader (`pwrite` into `.part` + `.part.json`) |
 | `Sources/Engine/HLS.swift` | Master & media M3U8 parser (`#EXT-X-STREAM-INF`, `#EXT-X-MEDIA` separate audio renditions, `#EXT-X-MAP`, `#EXT-X-BYTERANGE`, `CommonCrypto` `AES-128-CBC` decryption, parallel segment worker pool, live HLS recorder) |
 | `Sources/Engine/DASH.swift` | MPEG-DASH `.mpd` XML parser (`AdaptationSet`, `Representation`, `SegmentTemplate` `$Number$`/`$Time$`, `SegmentTimeline`), parallel segment fetcher |
 | `Sources/Mux/MP4Box.swift` | Zero-dependency ISO-BMFF reader/writer: parses `stbl` + fragmented `moof`/`traf`/`trun` + `sidx`, plans byte-range sections, trims at sync keyframes, excises SponsorBlock sample intervals, builds `tx3g` subtitle & `chap`/`chpl` chapter tracks, writes `ilst` metadata (`©nam`, `©ART`, `©day`, `©cmt`, `desc`, `covr`), and emits fast-start MP4/M4A (`ftyp` + `moov` + `mdat`) |
 | `Sources/Mux/TSDemuxer.swift` | Pure-Swift 188-byte MPEG-TS (`PAT`/`PMT`/`PES`) demuxer converting Annex-B H.264 (`SPS`/`PPS` → `avcC`) and ADTS AAC (`esds`) into `MP4Track`s |
 | `Sources/Engine/SponsorBlock.swift` | Privacy-preserving 4-hex SHA-256 prefix SponsorBlock client, description chapter parser, WebVTT/SRT/XML subtitle parser, and timeline squeezer |
 | `Sources/Engine/Converter.swift` | Native `AVFoundation`/`AudioToolbox` converter (`mov`, `m4a`, `wav`, `aiff`, `flac`), `ImageIO` baseline JPEG cover normalizer, `com.apple.metadata:kMDItemWhereFroms` binary plist `setxattr`, Music/TV AppleScript importer, and optional system `ffmpeg` passthrough (`mp3`, `opus`, `mkv`, `webm`) |
-| `Sources/Engine/DownloadEngine.swift` | Full download pipeline (`FormatSelector`, `sidx` fast section fetch, stale-URL 403/410 re-extraction, muxing, sidecars, `DownloadEventPayload` emission) |
+| `Sources/Engine/DownloadEngine.swift` | Full download pipeline (`FormatSelector`, `sidx` fast section fetch, provider-refusal handling: HTTP 401, 403, 407, 410, 429, 451 or a playability challenge ends the operation; no stale refresh, identity fallback or route fallback; muxing, sidecars, `DownloadEventPayload` emission) |
 | `Sources/Extractors/Extractor.swift` | `SiteExtractor` protocol, `ExtractorRegistry` (35 extractors + direct URLs + `ytsearch:`), balanced-JSON/HTML utilities, and `GenericExtractor` (OpenGraph, JSON-LD, `<video>`, inline `.m3u8`/`.mpd`) |
-| `Sources/Extractors/YouTubeExtractor.swift` | Multi-client InnerTube (`IOS` direct-URL fast path + `WEB` captions/playlists/channels/search + `TVHTML5_SIMPLY_EMBEDDED_PLAYER` fallback), `SAPISIDHASH` cookie auth, and `JavaScriptCore` `base.js` cipher solver |
+| `Sources/Extractors/YouTubeExtractor.swift` | Multi-client InnerTube (visionOS, TV, iOS and web player profiles; web playlists, channels and search), `SAPISIDHASH` cookie auth (from the `SAPISID` that the request sends, chosen by `CookieVault.effectiveCookies`), `JavaScriptCore` `base.js` cipher solver, and `YTGuard` (persisted visitor ID, 5.5 h metadata cache keyed by video and request context (cookies for `/watch` and `/player`, User-Agent, extra headers, proxy), permits at least 3 s apart for `/player` attempts including retries, no minimum gap between HTTP starts, a closed list of visible verification notices, and a provider challenge stop that tries no other client identity or route) |
 | `Sources/Extractors/SitesA.swift` | Vimeo (+ showcases), SoundCloud (dynamic `client_id` + sets/artists), Bilibili (BV/av/multi-part), Twitch (GQL live/VOD/clip), Kick, Reddit (`v.redd.it` + embed fallback), X/Twitter (syndication token + `api.vxtwitter.com` fallback) |
 | `Sources/Extractors/SitesB.swift` | Bluesky (ATProto), TikTok, Instagram, Facebook, Threads, Bandcamp, Mixcloud, Dailymotion, Rumble, Odysee, PeerTube, Internet Archive, Streamable, Loom, TED, Imgur, Tumblr, Pinterest, VK, Douyin, Kuaishou, Weibo, Xiaohongshu, GitHub, Mastodon, Coub, 9GAG |
 | `Sources/CLI/CLI.swift` | Complete CLI (`get`, `info`, `formats`, `list`, `subs`, `settings`, `sites`, `open`, `browse`, `version`, `--llms`) with NDJSON streaming, ANSI progress bar, and two-stage `SIGINT` handler |
@@ -28,6 +28,7 @@
 | `build.sh` | Compiles `arm64-apple-macos14.0` with `-Osize -whole-module-optimization -gnone -Xlinker -dead_strip`, strips non-global symbols, generates programmatic `AppIcon.icns`, ad-hoc signs `dist/uBit.app`, and packs `dist/ubit-0.3.3-darwin-arm64.tar.gz` with system `bsdtar`: entries owned by `root:wheel`, no macOS extended attributes and no AppleDouble (`._*`) files, every entry time set to the last commit of the checkout that holds `build.sh` (or `SOURCE_DATE_EPOCH`), entries in byte order and `gzip -n`, so that two builds of one commit give the same archive bytes from any current directory (CI compares two builds, the second started outside the checkout) |
 | `tests/home-paths.sh` | Fails when a binary or rlib holds the home-directory path of the machine that built it, or when it cannot read the file; CI runs it on the macOS, Linux and Android binaries and on the SDK rlibs. `tests/home-paths-selftest.sh` makes its own home directory and a symlink to it, and proves that the scan rejects both spellings, also for a file name that starts with `-`. The CI control build of the SDK without the remap must give at least one real path match and no unreadable file |
 | `sdk/cargo.sh` | Runs `cargo` with `--remap-path-prefix` (rustc) and `-ffile-prefix-map` plus `-fdebug-prefix-map` (C/C++ and the assembler; gcc before 12 needs the second for ring's `.S` files) for `$HOME` and the checkout, so that uBit and its dependencies build without home-directory paths |
+| `tests/swift/run.sh` | Builds `tests/swift/RegressionChecks.swift` with the app sources and runs each Swift regression case in its own process against a local `URLProtocol` fixture and loopback test servers (no external network) |
 
 ## Architectural Rules & Invariants
 
@@ -36,6 +37,8 @@
 3. **4-Byte Raw iTunes `ilst` Atoms**: QuickTime/iTunes metadata tags (`©nam`, `©ART`, `©day`, `©cmt`) start with byte `0xA9` (ISO-8859-1 `©`), NOT 2-byte UTF-8 `0xC2 0xA9`. Always write them via `BinaryBuffer.boxRaw([0xA9, ...])`.
 4. **Pure Swift CLI Formatting**: Never pass Swift `String` values to C `%s` in `String(format:)`; use pure Swift string interpolation and `pad(_:_:)`.
 5. **CLI Machine Contract Compatibility**: Keep NDJSON event names (`start`, `info`, `progress`, `process`, `stopping`, `done`, `stopped`, `error`) and exit codes (`0`, `1`, `2`, `130`) stable; update `ubit --llms`, `docs/agents.md`, and `skills/ubit/SKILL.md` together whenever CLI flags or JSON fields change.
+6. **Terminal Provider Refusals (macOS Swift CLI)**: An HTTP 401, 403 (access denied), 407, 410, 429 or 451, or a playability or verification challenge ends that URL's operation, also for optional requests. Do not add a retry with a different URL, client identity or route after a refusal. A failure before the status is repeated only when it proves that the request never reached the server. Only the closed list of notice sentences in `docs/agents.md` counts as a visible YouTube notice; do not add guesses about other wording. Do not present a byte-range probe as a completed provider verification. Sign-in cookies remain valid for ordinary authenticated requests.
+7. **Platform Scope**: The invariants above describe the Swift macOS app and CLI. `linux/src/` is a separate C++ engine for the Linux, Termux/Android and WASM builds and the Rust SDK. Do not copy macOS refusal guarantees into the C++ engine docs.
 
 ## Build & E2E Verification Commands
 
@@ -50,6 +53,9 @@
 # No home-directory path in the shipped binary (the self-test first proves that the scan can fail)
 ./tests/home-paths-selftest.sh
 ./tests/home-paths.sh dist/uBit.app/Contents/MacOS/ubit
+
+# Offline Swift regression checks (YouTube pacing/cache/sign-in, notices, provider refusals, proxy values, Safari cookies)
+./tests/swift/run.sh
 
 # Live E2E: sidx byte-range clip download + native ISO-BMFF MP4 mux + metadata
 UBIT_CONFIG_DIR=/tmp/ubit-e2e ./dist/ubit get -q 720 --section 0:05-0:15 --no-library --json -o /tmp/ubit-e2e 'https://www.youtube.com/watch?v=aqz-KE-bpKQ'

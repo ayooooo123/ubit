@@ -297,7 +297,10 @@ public final class DownloadEngine: @unchecked Sendable {
         var audioSectionBaseSec: Double = 0
         var videoSectionBase: SectionTimeBase?
         var audioSectionBase: SectionTimeBase?
-        var videoTrackStarts: [UInt32: UInt64] = [:], audioTrackStarts: [UInt32: UInt64] = [:]
+        // With a stream zero, sections count from the first presented time of the stream, and
+        // each track is placed by the stream time where its first sample decodes.
+        var sectionZero: SectionTimeBase?
+        var audioOrigin: HLSEngine.SectionOrigin?
         var videoIsTS = false
         var audioIsTS = false
 
@@ -308,13 +311,29 @@ public final class DownloadEngine: @unchecked Sendable {
         var sectionVideo: [MP4Track]?
         let clock = options.section != nil && separateAudio != nil && selected.video != nil ? MP4Muxer.SectionClock() : nil
 
-        func fetchStream(_ fmt: MediaFormat, to dest: URL, priorBytes: Int64, section: SectionRange?) async throws -> (base: SectionTimeBase?, baseSec: Double, isTS: Bool, trackStarts: [UInt32: UInt64]) {
+        func requestHeaders(_ fmt: MediaFormat) -> [String: String] {
             var mergedHeaders = fmt.headers ?? [:]
             if let ref = options.referer, mergedHeaders["Referer"] == nil { mergedHeaders["Referer"] = ref }
+            return mergedHeaders
+        }
+        /// The tracks of a downloaded stream and, when `timed`, where each first sample decodes.
+        func readStream(_ file: URL, isTS: Bool, sourceIndex: Int, timed: Bool) throws -> (tracks: [MP4Track], starts: [UInt32: SectionTimeBase]) {
+            if isTS {
+                let (tracks, starts) = TSDemuxer.demux(try Data(contentsOf: file, options: .mappedIfSafe))
+                return (tracks, timed ? starts : [:])
+            }
+            let tracks = try MP4Muxer.readTracks(from: file, sourceIndex: sourceIndex)
+            guard timed else { return (tracks, [:]) }
+            return (tracks, try MP4Muxer.decodeStarts(in: Data(contentsOf: file, options: .mappedIfSafe), tracks: tracks))
+        }
+
+        func fetchStream(_ fmt: MediaFormat, to dest: URL, priorBytes: Int64, section: SectionRange?,
+                         findZero: Bool = true, prepared: HLSEngine.SectionOrigin? = nil) async throws -> (base: SectionTimeBase?, baseSec: Double, isTS: Bool, zero: SectionTimeBase?) {
+            let mergedHeaders = requestHeaders(fmt)
 
             switch fmt.proto {
             case .hls:
-                let (isFMP4, _, startTime, trackStarts) = try await HLSEngine.downloadStream(
+                let (isFMP4, _, startTime, zero) = try await HLSEngine.downloadStream(
                     client: client,
                     playlistURL: fmt.url,
                     destination: dest,
@@ -322,7 +341,8 @@ public final class DownloadEngine: @unchecked Sendable {
                     section: section,
                     connections: options.connections,
                     renditions: renditions,
-                    separateTracks: clock != nil,
+                    findZero: findZero && fmt.ext != "mp3",
+                    prepared: prepared,
                     shouldStopLive: shouldStopLive
                 ) { done, est, frac, recSec in
                     Task {
@@ -340,7 +360,7 @@ public final class DownloadEngine: @unchecked Sendable {
                         }
                     }
                 }
-                return (nil, startTime, !isFMP4, trackStarts)
+                return (nil, startTime, !isFMP4, zero)
 
             case .dash:
                 try await DASHEngine.downloadRepresentation(
@@ -359,14 +379,14 @@ public final class DownloadEngine: @unchecked Sendable {
                         }
                     }
                 }
-                return (nil, 0, false, [:])
+                return (nil, 0, false, nil)
 
             case .http:
                 var lastIndexedByte: Int64?
                 let isMP4Section = section != nil && (fmt.ext == "mp4" || fmt.ext == "m4a")
                 if isMP4Section, let sec = section {
                     switch try await tryDownloadSectionViaSidx(client: client, fmt: fmt, headers: mergedHeaders, section: sec, destination: dest) {
-                    case .downloaded(let base): return (base, 0, false, [:])
+                    case .downloaded(let base): return (base, 0, false, nil)
                     case .wholeFile(let last): lastIndexedByte = last
                     }
                 }
@@ -396,7 +416,7 @@ public final class DownloadEngine: @unchecked Sendable {
                         throw error
                     }
                 }
-                return (nil, 0, false, [:])
+                return (nil, 0, false, nil)
             }
         }
 
@@ -413,26 +433,38 @@ public final class DownloadEngine: @unchecked Sendable {
             hasVFile = true
             videoSectionBase = res.base
             videoSectionBaseSec = res.baseSec
-            videoTrackStarts = res.trackStarts
             videoIsTS = res.isTS
+            sectionZero = res.zero
             vActualBytes = (try? FileManager.default.attributesOfItem(atPath: vTemp.path)[.size] as? Int64) ?? 0
+
+            // Paired renditions share one stream clock. Its zero is the earliest first presented
+            // time over picture and sound, so the sound's first segment is read now.
+            if let zero = sectionZero, let separateAudio {
+                if let renditions {
+                    audioOrigin = try await HLSEngine.prepareSection(client: client, playlistURL: separateAudio.url,
+                                                                     headers: requestHeaders(separateAudio), renditions: renditions)
+                }
+                sectionZero = (audioOrigin?.zero).map { min(zero, $0) }
+            }
 
             if let sec = options.section, let separateAudio, vFmt.ext != "webm", separateAudio.ext != "webm" {
                 // Choose the video start before fetching audio. Its playlist may use shorter
                 // segments, so a fetch starting at the requested time could omit needed sound.
-                let video = videoIsTS ? try TSDemuxer.demuxToTracks(tsFileURL: vTemp) : try MP4Muxer.readTracks(from: vTemp, sourceIndex: 0)
-                sectionVideo = MP4Muxer.trimTracks(video.filter { $0.kind != .audio }, section: sec, baseStartTimeSec: res.baseSec, baseStart: res.base, trackStartTicks: res.trackStarts, clock: clock)
+                let video = try readStream(vTemp, isTS: videoIsTS, sourceIndex: 0, timed: sectionZero != nil)
+                sectionVideo = MP4Muxer.trimTracks(video.tracks.filter { $0.kind != .audio }, section: sec, baseStartTimeSec: res.baseSec, baseStart: res.base,
+                                                   trackStarts: video.starts, zero: sectionZero, clock: clock)
             }
         }
         if let aFmt = separateAudio {
             var fetchSection = options.section
             if let start = clock?.fetchStart { fetchSection?.start = start }
-            let res = try await fetchStream(aFmt, to: aTemp, priorBytes: vActualBytes, section: fetchSection)
+            let res = try await fetchStream(aFmt, to: aTemp, priorBytes: vActualBytes, section: fetchSection,
+                                            findZero: selected.video == nil, prepared: audioOrigin)
             hasAFile = true
             audioSectionBase = res.base
             audioSectionBaseSec = res.baseSec
-            audioTrackStarts = res.trackStarts
             audioIsTS = res.isTS
+            if selected.video == nil { sectionZero = res.zero }
         }
 
         // Cover art, subtitles and SponsorBlock segments are optional, but a refusal of any of
@@ -510,9 +542,10 @@ public final class DownloadEngine: @unchecked Sendable {
                 if let sectionVideo {
                     vt = sectionVideo
                 } else {
-                    vt = videoIsTS ? try TSDemuxer.demuxToTracks(tsFileURL: vTemp) : try MP4Muxer.readTracks(from: vTemp, sourceIndex: srcIdx)
+                    let video = try readStream(vTemp, isTS: videoIsTS, sourceIndex: srcIdx, timed: options.section != nil && sectionZero != nil)
+                    vt = video.tracks
                     if let sec = options.section {
-                        vt = MP4Muxer.trimTracks(vt, section: sec, baseStartTimeSec: videoSectionBaseSec, baseStart: videoSectionBase, trackStartTicks: videoTrackStarts)
+                        vt = MP4Muxer.trimTracks(vt, section: sec, baseStartTimeSec: videoSectionBaseSec, baseStart: videoSectionBase, trackStarts: video.starts, zero: sectionZero)
                     }
                 }
                 if !sponsorCutIntervals.isEmpty {
@@ -525,10 +558,10 @@ public final class DownloadEngine: @unchecked Sendable {
             if hasAFile {
                 let srcIdx = sourceFiles.count
                 sourceFiles.append(aTemp)
-                var at = audioIsTS ? try TSDemuxer.demuxToTracks(tsFileURL: aTemp) : try MP4Muxer.readTracks(from: aTemp, sourceIndex: srcIdx)
-                at = at.filter { $0.kind == .audio }
+                let audio = try readStream(aTemp, isTS: audioIsTS, sourceIndex: srcIdx, timed: options.section != nil && sectionZero != nil)
+                var at = audio.tracks.filter { $0.kind == .audio }
                 if let sec = options.section {
-                    at = MP4Muxer.trimTracks(at, section: sec, baseStartTimeSec: audioSectionBaseSec, baseStart: audioSectionBase, trackStartTicks: audioTrackStarts, clock: clock)
+                    at = MP4Muxer.trimTracks(at, section: sec, baseStartTimeSec: audioSectionBaseSec, baseStart: audioSectionBase, trackStarts: audio.starts, zero: sectionZero, clock: clock)
                 }
                 if !sponsorCutIntervals.isEmpty {
                     at = MP4Muxer.removeIntervals(at, intervals: sponsorCutIntervals)
@@ -729,11 +762,16 @@ public final class DownloadEngine: @unchecked Sendable {
             case .needsWholeFile: return .wholeFile(lastIndexedByte: last.byteRange.end)
             }
         }
+        // Sample times count from the decode start of the first fetched fragment. The `sidx`
+        // start is a presentation time, which composition offsets move away from it.
+        guard let base = try MP4Muxer.decodeStarts(in: bodyBytes, tracks: Array(context.tracks.values))[firstSeg.trackID] else {
+            throw HTTPError.rangeUnsupported
+        }
         var combined = Data(capacity: initBytes.count + bodyBytes.count)
         combined.append(initBytes)
         combined.append(bodyBytes)
         try combined.write(to: destination, options: .atomic)
-        return .downloaded(base: SectionTimeBase(ticks: firstSeg.startTicks, timescale: firstSeg.timescale))
+        return .downloaded(base: base)
     }
 
     private func chooseSubtitles(available: [SubtitleTrack], langSpec: String) -> [SubtitleTrack] {

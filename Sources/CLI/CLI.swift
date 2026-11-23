@@ -872,7 +872,7 @@ public enum CLIRunner {
           -i, --input FILE              Read URLs one per line (- reads stdin)
               --playlist / --no-playlist
               --items 1,3,5-7           Select specific playlist items
-              --section 1:00-2:30       Keyframe-accurate byte-range clip trim
+              --section 1:00-2:30       Clip at the preceding sync picture; end is exclusive
               --sponsors-remove CATS    Excise SponsorBlock segments (default, all, or list)
               --sponsors-mark CATS      Mark SponsorBlock segments as MP4 chapters
               --keep-sponsors           Keep sponsors regardless of settings
@@ -926,7 +926,7 @@ public enum CLIRunner {
           - `{"event":"stopped","url":"..."}`
         - `--quiet` — Suppress progress bars; print ONLY saved absolute file paths to stdout (ideal for command substitution `FILE=$(ubit get --quiet ...)`).
         - `--no-library` — Ephemeral run; do not append agent scratch downloads to the user's GUI library.
-        - `--section START-END` — Keyframe-accurate clip trim (e.g. `0:30-1:15` or `90-135`). Uses `sidx` HTTP byte-range planning so a 15s clip from a 2h video downloads only ~2–4 MB.
+        - `--section START-END` — With the macOS Swift engine, start video at the last sync picture at or before START and show pictures strictly before END. A usable MP4 `sidx` can save bytes; a clip can require the full file. For VOD HLS on one timeline with media timestamps, the first presented time across picture and sound (including a separate rendition) sets time zero. uBit can fetch the first segment for timing and a preceding segment for decoding.
         - Provider refusals: HTTP 401, 403 (access denied), 407, 410, 429 or 451 ends the operation for that URL, also on optional requests. The status decides when URLSession hands over the response. uBit does not read a refused body, retry with another URL, client identity or route, or continue other connections after a range refusal. Sign-in cookies only authenticate ordinary requests.
         - Before a status is known, uBit retries only when the error proves that the request did not reach the server. A timeout or reset before a status gives a "No HTTP status" error. A refusal that sends only headers can take the 30 s request timeout and makes one request. A broken 2xx body keeps its ordinary retry. A `/player` retry needs a new pacing permit.
         - YouTube playability: Only the `/watch` and `/player` decisions count. A decision other than OK, or OK with a non-null error screen, ends extraction. A reason alone on OK is not a refusal. The embed page only supplies the player script URL.
@@ -942,7 +942,7 @@ public enum CLIRunner {
         - `0` — All requested URLs completed
         - `1` — Extraction, network, DRM, or muxing failure
         - `2` — Invalid CLI flags/arguments
-        - `130` — Interrupted (`SIGINT`); `.part` + `.part.json` state preserved for instant resume on identical re-run
+        - `130` — Interrupted (`SIGINT`). On the same command, a direct HTTP transfer can reuse `.part` and `.part.json` if the resource and its strong ETag still match. HLS and DASH start again.
         """)
     }
 }

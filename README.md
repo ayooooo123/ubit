@@ -1,6 +1,6 @@
 # uBit (`ubit` / `uBit.app`)
 
-Download video and audio from the web — a **~1 MB** native desktop app and **agent-ready CLI** for **macOS (`arm64`)** and **Linux (`x86_64` & `arm64`)**. No Python, no `yt-dlp`, no FFmpeg required for MP4/M4A, and zero Pro paywalls.
+Download video and audio from the web with a native macOS app and a CLI for macOS (`arm64`) and Linux (`x86_64` and `arm64`). MP4 and M4A do not require Python, `yt-dlp` or FFmpeg.
 
 - **[Agent & Automation Docs (`docs/agents.md`)](docs/agents.md)** · **[Agent Skill (`skills/ubit/SKILL.md`)](skills/ubit/SKILL.md)** · **[`llms.txt`](llms.txt)** · **[Architecture (`AGENTS.md`)](AGENTS.md)**
 
@@ -83,11 +83,11 @@ ubit browse <url>                       # open in the WebKit media-sniffer brows
 
 ## Engine Highlights
 
-- **Dynamic Work-Stealing Range Downloader (`Sources/Engine/HTTPClient.swift`)**: Splits files across up to 32 parallel HTTP `Range` connections, persists `.part` + `.part.json` byte maps for instant Ctrl-C/crash resume, and dynamically bisects the slowest worker's remaining byte span when fast workers finish early.
+- **Parallel HTTP Range Downloads (`Sources/Engine/HTTPClient.swift`)**: Splits files across up to 32 connections. A direct HTTP transfer can reuse bytes from `.part` and `.part.json` only when the resource and its strong ETag still match.
 - **Pure-Swift ISO-BMFF & MPEG-TS Muxer (`Sources/Mux/MP4Box.swift`, `TSDemuxer.swift`)**:
   - Reads progressive MP4 (`stbl`), fragmented DASH/HLS fMP4 (`moof`/`traf`/`trun`), and 188-byte MPEG-TS (`PAT`/`PMT`/`PES` H.264 Annex-B + ADTS AAC).
   - Writes fast-start (`moov` before `mdat`) MP4 and M4A containers with `tx3g` timed-text subtitles, QuickTime `chap` + Nero `chpl` chapters, iTunes metadata (`©nam`, `©ART`, `©day`, `©cmt`, `desc`, `covr` JPEG cover art), and macOS Finder `com.apple.metadata:kMDItemWhereFroms`.
-  - Uses `sidx` Segment Index boxes so `--section start-end` fetches only the `init` box and overlapping segment byte ranges.
+  - Uses a usable MP4 `sidx` to reduce downloaded bytes for `--section`. Some clips require the whole file. See [the section rules](docs/agents.md#pattern-b-extract-a-clip---section).
 - **Built-in Media-Sniffer Browser (`Sources/UI/BrowserWindow.swift`)**: `WKWebView` (`⌘B`) with document-start `fetch` / `XMLHttpRequest` / `<video>` inspection across all frames, `WKContentRuleList` ad/tracker blocking, and automatic cookie export to `~/Library/Application Support/uBit/cookies.txt`.
 
 ## Build from Source
@@ -96,7 +96,7 @@ ubit browse <url>                       # open in the WebKit media-sniffer brows
 ./build.sh
 ```
 
-Produces `dist/uBit.app`, `dist/ubit`, and `dist/ubit-0.3.0-darwin-arm64.tar.gz`.
+Produces `dist/uBit.app`, `dist/ubit`, and `dist/ubit-0.3.3-darwin-arm64.tar.gz`. The macOS executable must be under 2,000,000 bytes and the archive under 1,100,000 bytes.
 
 ## License
 

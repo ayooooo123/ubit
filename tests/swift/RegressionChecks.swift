@@ -39,7 +39,16 @@ final class FixtureProtocol: URLProtocol {
 
     static let firstVisitor = "CgtFixtureVisitorFirst00000000000000"
     static let secondVisitor = "CgtFixtureVisitorSecond0000000000000"
+    static let parallelBytes = Data((0..<614_400).map { UInt8(truncatingIfNeeded: ($0 / 1021) ^ $0) })
     static let mediaBytes = Data("fixture-media-payload-for-the-http-path".utf8)
+    /// An untagged object 1 MiB larger than the live recorder's 64 MiB copy budget. Its first
+    /// KiB holds "A" and its last KiB holds "Z".
+    static let oversized: Data = {
+        var bytes = Data(count: 65 << 20)
+        bytes.replaceSubrange(0..<1024, with: Data(repeating: 0x41, count: 1024))
+        bytes.replaceSubrange((bytes.count - 1024)..<bytes.count, with: Data(repeating: 0x5A, count: 1024))
+        return bytes
+    }()
     /// A fail-closed HTTP denial on one stage of the YouTube path. `deny` covers an HTTP status;
     /// `denyPlayability` covers an explicit playability status with usable streaming data.
     nonisolated(unsafe) private static var deniedStage = ""
@@ -107,6 +116,7 @@ final class FixtureProtocol: URLProtocol {
         var data = Data()
         var headers: [String: String] = [:]
         var failure: Error?
+        var redirect: URL?
         var lostAfterResponse = false
         var deliveredURL = url
 
@@ -289,6 +299,289 @@ final class FixtureProtocol: URLProtocol {
             } else {
                 data = Self.mediaBytes
             }
+        case ("media.invalid", "/hls.m3u8"):
+            // A VOD playlist of 15 segments, 4 s each.
+            let segments = (0..<15).map { "#EXTINF:4.0,\nseg-\($0).ts" }.joined(separator: "\n")
+            data = Data("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n\(segments)\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", let path) where path.hasPrefix("/partial/"):
+            status = 206
+            data = Data("bc".utf8)
+            switch path {
+            case "/partial/eof": headers["Content-Range"] = "bytes 1-2/3"
+            case "/partial/short": headers["Content-Range"] = "bytes 1-2/6"
+            case "/partial/shifted": headers["Content-Range"] = "bytes 2-3/4"
+            default: headers["Content-Range"] = "bytes 1-3/4"
+            }
+        case ("media.invalid", let path) where path.hasPrefix("/seg-"):
+            data = Data(path.utf8)
+        case ("media.invalid", "/clip.m3u8"):
+            // An HLS playlist of 15 fragmented MP4 segments, 4 s each, with four 1 s samples in each
+            // segment. The boxes are the smallest tree that uBit's reader accepts, not a file that
+            // a standard player can read (the stsd box is empty, and mvhd, tkhd and mfhd are missing).
+            let duration = mode == "hls-ntsc" ? "1.001" : (mode == "hls-decimal" ? "0.800000" : "4.0")
+            let count = mode == "hls-ntsc" ? 7 : 15
+            let segments = (0..<count).map { "#EXTINF:\(duration),\nclip-\($0).m4s" }.joined(separator: "\n")
+            data = Data("#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"clip-init.mp4\"\n\(segments)\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/short-map.m3u8"), ("media.invalid", "/short-segment.m3u8"):
+            let map = Bytes.clipInit(sampleTicks: 1000).count + 1
+            let segment = Bytes.clipSegment(0).count + 1
+            let mapRange = url.path == "/short-map.m3u8" ? ",BYTERANGE=\"\(map)@0\"" : ""
+            let mediaRange = mapRange.isEmpty ? "#EXT-X-BYTERANGE:\(segment)@0\n" : ""
+            data = Data("#EXTM3U\n#EXT-X-MAP:URI=\"clip-init.mp4\"\(mapRange)\n#EXTINF:4,\n\(mediaRange)clip-0.m4s\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/clip-init.mp4"):
+            data = Data(Bytes.clipInit(sampleTicks: mode == "hls-decimal" ? 200 : 1000))
+        case ("media.invalid", let path) where path.hasPrefix("/clip-"):
+            data = Data(Bytes.clipSegment(Int(path.dropFirst(6).dropLast(4)) ?? 0, sampleTicks: mode == "hls-decimal" ? 200 : 1000))
+        case ("media.invalid", let path) where ["/indexed.mp4", "/cut-200.mp4", "/cut-206.mp4", "/cut-unknown.mp4", "/cut-later.mp4", "/cut-padding.mp4", "/cut-empty.mp4", "/cut-stale.mp4", "/cut-duration.mp4"].contains(path):
+            // sidx-untagged-change: every read after the first comes from a second edition.
+            // sidx-untagged-grow: every read after the first comes from a longer second edition.
+            let later = Self.lock.withLock { Self.seen.contains { $0.url.path == path } }
+            let changed = mode == "sidx-untagged-change" && later
+            let grown = mode == "sidx-untagged-grow" && later
+            var bytes = mode == "sidx-fragments" || path == "/cut-later.mp4" || path == "/cut-padding.mp4" ? Bytes.fragmentIndexedClip
+                : (changed ? Bytes.changedIndexedClip : grown ? Bytes.grownIndexedClip : Bytes.indexedClip)
+            if mode == "sidx-padding" { bytes += Bytes.box("free", Array(repeating: 0, count: 24)) }
+            if ["/cut-empty.mp4", "/cut-stale.mp4", "/cut-duration.mp4"].contains(path) {
+                let table = MP4Muxer.parseSidx(in: Data(bytes))!.segments
+                let offset = Int(table[1].byteRange.start)
+                if path == "/cut-stale.mp4" {
+                    bytes.replaceSubrange(offset..<(offset + Bytes.clipSegment(1).count), with: Bytes.clipSegment(2))
+                } else {
+                    let count = bytes[offset...].firstRange(of: Array("trun".utf8))!.upperBound + 4
+                    bytes.replaceSubrange(count..<count + 4, with: Bytes.be32(path == "/cut-duration.mp4" ? 2 : 0))
+                }
+            } else if path == "/cut-later.mp4" || path == "/cut-padding.mp4" {
+                let data = Data(bytes)
+                let indexes = MP4Muxer.listBoxes(in: data, from: 0, to: data.count).filter { $0.type == "sidx" }
+                let offset = indexes[2].endOffset
+                if path == "/cut-later.mp4" {
+                    bytes.removeSubrange(offset...)
+                } else {
+                    let length = Bytes.clipSegment(2).count
+                    bytes.replaceSubrange(offset..<(offset + length), with: Bytes.box("free", Array(repeating: 0, count: length - 8)))
+                }
+            } else if path.hasPrefix("/cut-") { bytes.removeLast(13 * Bytes.clipSegment(0).count) }
+            if path != "/cut-200.mp4", let range, let dash = range.firstIndex(of: "-"),
+               let start = Int(range.dropFirst(6).prefix(while: { $0 != "-" })),
+               let end = Int(range[range.index(after: dash)...]), start < bytes.count {
+                let last = min(end, bytes.count - 1)
+                status = 206
+                let total = path == "/cut-unknown.mp4" && range == "bytes=0-65535" ? "*" : String(bytes.count)
+                headers["Content-Range"] = "bytes \(start)-\(last)/\(total)"
+                data = Data(bytes[start...last])
+            } else { data = Data(bytes) }
+        case ("media.invalid", "/live-editions.m3u8"):
+            let seq = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            let segment = mode.hasPrefix("hls-live-whole")
+                ? (seq == 0 ? "pack.ts" : "#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST")
+                : (seq == 0 ? "#EXT-X-BYTERANGE:2@0\npack.ts" : (seq == 1 ? "other.ts" : "#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST"))
+            data = Data("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:\(seq)\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n\(segment)\n".utf8)
+        case ("media.invalid", "/other.ts"): data = Data("xx".utf8)
+        case ("media.invalid", "/hop.m3u8"):
+            data = Data("#EXTM3U\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@0\nhop.ts\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@2\nhop.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/hop-live.m3u8"):
+            // The first poll lists the whole object; the second lists a range of it and ends.
+            let seq = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            let segment = seq == 0 ? "hop.ts" : "#EXT-X-BYTERANGE:2@2\nhop.ts\n#EXT-X-ENDLIST"
+            data = Data("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:\(seq)\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n\(segment)\n".utf8)
+        case ("media.invalid", "/hop.ts"), ("media.invalid", "/hop.bin"):
+            // A redirector that alternates between two mirrors. Both mirrors name their copy
+            // with the same ETag text, but the copies hold different bytes.
+            let n = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            redirect = URL(string: "https://media.invalid/mirror-\(n % 2 == 0 ? "a" : "b").\(url.pathExtension)")
+        case ("media.invalid", let path) where path.hasPrefix("/mirror-"):
+            let second = path.hasPrefix("/mirror-b")
+            let body = path.hasSuffix(".ts")
+                ? Data((second ? "BBBB" : "AAAA").utf8)
+                : (second ? Data(Self.parallelBytes.map { ~$0 }) : Self.parallelBytes)
+            headers["ETag"] = "\"same\""
+            if let range {
+                let bounds = range.dropFirst(6).split(separator: "-").compactMap { Int($0) }
+                guard bounds.count == 2 else { status = 400; break }
+                let high = min(bounds[1], body.count - 1)
+                status = 206
+                headers["Content-Range"] = "bytes \(bounds[0])-\(high)/\(body.count)"
+                data = body.subdata(in: bounds[0]..<(high + 1))
+            } else { data = body }
+        case ("media.invalid", "/event.m3u8"):
+            // An EVENT playlist keeps every past entry. The first poll lists three
+            // entries; the second lists all of them and ends the recording.
+            let poll = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            if mode == "hls-event-oversized" {
+                // One untagged object larger than the copy budget, read in two ranges at its ends.
+                let tail = "#EXTINF:1,\n#EXT-X-BYTERANGE:1024@\(Self.oversized.count - 1024)\nbig.bin\n#EXT-X-ENDLIST\n"
+                data = Data(("#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n"
+                    + "#EXTINF:1,\n#EXT-X-BYTERANGE:1024@0\nbig.bin\n" + (poll == 0 ? "" : tail)).utf8)
+                break
+            }
+            let ranged = mode == "hls-event-ranged"
+            let count = poll == 0 ? 3 : (ranged ? 70 : 64)
+            var text = "#EXTM3U\n#EXT-X-PLAYLIST-TYPE:EVENT\n#EXT-X-TARGETDURATION:1\n#EXT-X-MEDIA-SEQUENCE:0\n"
+            for i in 0..<count { text += "#EXTINF:1,\n" + (ranged ? "#EXT-X-BYTERANGE:1024@0\n" : "") + "ev-\(i).bin\n" }
+            if poll > 0 {
+                if ranged { text += "#EXTINF:1,\n#EXT-X-BYTERANGE:1024@1024\nev-0.bin\n" }
+                text += "#EXT-X-ENDLIST\n"
+            }
+            data = Data(text.utf8)
+        case ("media.invalid", "/big.bin"):
+            if let range {
+                let bounds = range.dropFirst(6).split(separator: "-").compactMap { Int($0) }
+                guard bounds.count == 2 else { status = 400; break }
+                status = 206
+                headers["Content-Range"] = "bytes \(bounds[0])-\(bounds[1])/\(Self.oversized.count)"
+                data = Self.oversized.subdata(in: bounds[0]..<(bounds[1] + 1))
+            } else { data = Self.oversized }
+        case ("media.invalid", let path) where path.hasPrefix("/ev-"):
+            // 1 MiB untagged objects; object N holds only the byte N.
+            let body = Data(repeating: UInt8(Int(path.dropFirst(4).dropLast(4)) ?? 255), count: 1 << 20)
+            if let range {
+                let bounds = range.dropFirst(6).split(separator: "-").compactMap { Int($0) }
+                guard bounds.count == 2 else { status = 400; break }
+                status = 206
+                headers["Content-Range"] = "bytes \(bounds[0])-\(bounds[1])/\(body.count)"
+                data = body.subdata(in: bounds[0]..<(bounds[1] + 1))
+            } else { data = body }
+        case ("media.invalid", "/clock/master.m3u8"):
+            data = Data("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"main\",DEFAULT=YES,URI=\"audio.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=700000,RESOLUTION=128x96,CODECS=\"avc1.42c00a,mp4a.40.2\",AUDIO=\"a\"\nvideo.m3u8\n".utf8)
+        case ("media.invalid", let path) where path.hasPrefix("/clock/"):
+            let name = url.deletingPathExtension().lastPathComponent
+            let audio = name.hasPrefix("audio"), mux = name.hasPrefix("mux")
+            switch url.pathExtension {
+            case "m3u8":
+                let durations = audio ? ["0.618667", "0.597333", "0.597333", "0.597333", "1.6"] : ["2", "2"]
+                var text = "#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXT-X-MAP:URI=\"\(name).mp4\"\n"
+                for (i, duration) in durations.enumerated() { text += "#EXTINF:\(duration),\n\(name)-\(i).m4s\n" }
+                data = Data((text + "#EXT-X-ENDLIST\n").utf8)
+            case "mp4":
+                let tracks = (audio ? [] : Bytes.clipTrak(timescale: 10, video: true, id: 1))
+                    + (audio || mux ? Bytes.clipTrak(timescale: 48000, video: false, id: 2) : [])
+                data = Data(Bytes.ftyp + Bytes.box("moov", tracks))
+            case "m4s":
+                let i = Int(name.split(separator: "-").last!)!
+                func fragment(_ range: Range<Int>, _ id: UInt32, _ duration: UInt32) -> [UInt8] {
+                    // Both tracks start at 3 s in the same stream clock.
+                    let epoch: UInt32 = id == 1 ? 30 : 144_000
+                    let time = epoch + UInt32(range.lowerBound) * duration
+                    return Bytes.renditionFragment(range.map(UInt8.init), video: id == 1, trackID: id, ticks: duration, start: time)
+                }
+                let bounds = audio ? [0, 29, 57, 85, 113, 188] : [0, 94, 188]
+                let pictures = audio ? [] : fragment(i*20..<(i+1)*20, 1, 1)
+                let sound = audio || mux ? fragment(bounds[i]..<bounds[i+1], 2, 1024) : []
+                data = Data(pictures + sound)
+            default: status = 404
+            }
+        case ("media.invalid", "/paired.m3u8"):
+            data = Data("#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"a\",NAME=\"main\",DEFAULT=YES,URI=\"sound.m3u8\"\n#EXT-X-STREAM-INF:BANDWIDTH=700000,RESOLUTION=128x96,CODECS=\"avc1.42c00a,mp4a.40.2\",AUDIO=\"a\"\npicture.m3u8\n".utf8)
+        case ("media.invalid", "/picture.m3u8"), ("media.invalid", "/sound.m3u8"):
+            let picture = url.path == "/picture.m3u8"
+            let first = Bytes.renditionFragment([0, 1, 2, 3], video: true).count
+            let unit = Bytes.renditionFragment([40], video: false).count
+            var list = "#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXT-X-MAP:URI=\"\(picture ? "picture" : "sound").mp4\"\n"
+            for i in 0..<(picture ? 1 : 4) {
+                list += "#EXTINF:\(picture ? 4 : 1),\n#EXT-X-BYTERANGE:\(picture ? first : unit)@\(picture ? 0 : first + unit*i)\npaired.pack\n"
+            }
+            data = Data((list + "#EXT-X-ENDLIST\n").utf8)
+        case ("media.invalid", "/picture.mp4"), ("media.invalid", "/sound.mp4"):
+            data = Data(Bytes.clipInit(sampleTicks: 1000, video: url.path == "/picture.mp4"))
+        case ("media.invalid", "/paired.pack"):
+            let changed = mode.contains("changed") && Self.lock.withLock { Self.seen.contains { $0.url.path == "/sound.m3u8" } }
+            let base: UInt8 = changed || mode.hasSuffix("-b") ? 100 : 0
+            let body = Bytes.renditionFragment((0..<4).map { base + $0 }, video: true)
+                + (40..<44).flatMap { Bytes.renditionFragment([base + $0], video: false) }
+            if mode.contains("tagged") { headers["ETag"] = "\"\(base)\"" }
+            if let range {
+                let bounds = range.dropFirst(6).split(separator: "-").compactMap { Int($0) }
+                guard bounds.count == 2, bounds[0] < body.count else { status = 416; break }
+                let last = min(bounds[1], body.count - 1)
+                headers["Content-Range"] = "bytes \(bounds[0])-\(last)/\(body.count)"
+                status = 206
+                data = Data(body[bounds[0]...last])
+            } else { data = Data(body) }
+        case ("media.invalid", "/editions.m3u8"):
+            data = Data("#EXTM3U\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@0\npack.ts\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@2\npack.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/repeat.m3u8"):
+            data = Data("#EXTM3U\n#EXTINF:2,\npack.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:2,\npack.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/alias.m3u8"):
+            // Four spellings of one HTTP resource: a fragment, empty user information and a default port.
+            data = Data("#EXTM3U\n#EXTINF:2,\npack.ts\n#EXTINF:2,\npack.ts#\n#EXTINF:2,\nhttps://@media.invalid/pack.ts\n#EXTINF:2,\nhttps://media.invalid:443/pack.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/alias-userinfo.m3u8"):
+            // Empty user information does not reach the origin: both lines request one resource.
+            data = Data("#EXTM3U\n#EXTINF:2,\npack.ts\n#EXT-X-DISCONTINUITY\n#EXTINF:2,\nhttps://@media.invalid/pack.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/live-alias.m3u8"):
+            let seq = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            let segment = seq == 0 ? "pack.ts" : "https://@media.invalid/pack.ts\n#EXT-X-ENDLIST"
+            data = Data("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:\(seq)\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n\(segment)\n".utf8)
+        case ("media.invalid", "/routes.m3u8"):
+            data = Data("#EXTM3U\n#EXTINF:2,\nroute.ts?object=ab%2fCD\n#EXTINF:2,\nroute.ts?object=ab%2FCD\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/route.ts"):
+            // Two request targets that differ only in the case of an escape hold different objects.
+            switch URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedQuery {
+            case "object=ab%2fCD": data = Data("AAAA".utf8)
+            case "object=ab%2FCD": data = Data("BBBB".utf8)
+            default: status = 404
+            }
+        case ("media.invalid", "/dots.m3u8"):
+            data = Data("#EXTM3U\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@0\nhttps://media.invalid/a/../dots.ts\n#EXTINF:2,\n#EXT-X-BYTERANGE:2@0\ndots.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/live-dots.m3u8"):
+            let seq = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            let segment = seq == 0 ? "#EXT-X-BYTERANGE:2@0\nhttps://media.invalid/a/../dots.ts" : "#EXT-X-BYTERANGE:2@0\ndots.ts\n#EXT-X-ENDLIST"
+            data = Data("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:\(seq)\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n\(segment)\n".utf8)
+        case ("media.invalid", "/v6.m3u8"):
+            // hls-v6-scope reads one loopback address with and without a zone, whole. hls-v6-forms
+            // reads byte ranges from two spellings of one address that send different Host fields.
+            let (first, second, range) = mode == "hls-v6-scope" ? ("[::1]", "[::1%25lo0]", "") : ("[::1]", "[0:0:0:0:0:0:0:1]", "#EXT-X-BYTERANGE:2@0\n")
+            data = Data("#EXTM3U\n#EXTINF:2,\n\(range)https://\(first)/v6.ts\n#EXTINF:2,\n\(range)https://\(second)/v6.ts\n#EXT-X-ENDLIST\n".utf8)
+        case ("media.invalid", "/live-v6.m3u8"):
+            let seq = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+            let segment = seq == 0 ? "https://[::1]/v6.ts" : "https://[::1%25lo0]/v6.ts\n#EXT-X-ENDLIST"
+            data = Data("#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:\(seq)\n#EXT-X-TARGETDURATION:1\n#EXTINF:1,\n\(segment)\n".utf8)
+        case ("media.invalid", "/dots.ts"), ("media.invalid", "/a/../dots.ts"), (_, "/v6.ts"):
+            // URLSession sends an absolute path with dot segments as written, so this origin
+            // routes the two targets separately. Neither object changes; only hls-live-dot-tagged
+            // sends an ETag. Under a scoped and an unscoped address, /v6.ts is one object that
+            // changes after its first read; under two Host forms, it is two fixed objects.
+            let object: Data
+            if url.path == "/v6.ts" {
+                let reads = Self.lock.withLock { Self.seen.filter { $0.url.path == url.path }.count }
+                object = Data((mode == "hls-v6-forms" ? url.host == "::1" : reads == 0) ? "AAAA".utf8 : "BBBB".utf8)
+            } else {
+                object = Data((url.path == "/dots.ts" && ["hls-dot-routes", "hls-live-dot-routes"].contains(mode) ? "BBBB" : "AAAA").utf8)
+            }
+            if mode == "hls-live-dot-tagged" { headers["ETag"] = "\"A\"" }
+            if let range {
+                let bounds = range.dropFirst(6).split(separator: "-").compactMap { Int($0) }
+                guard bounds.count == 2 else { status = 400; break }
+                status = 206
+                headers["Content-Range"] = "bytes \(bounds[0])-\(bounds[1])/4"
+                data = object.subdata(in: bounds[0]..<(bounds[1]+1))
+            } else { data = object }
+        case ("media.invalid", "/pack.ts"):
+            // hls-live-whole-changed: every read after the first comes from a new edition.
+            let changed = range == "bytes=2-3" || Self.lock.withLock {
+                (mode == "hls-live-changed" && Self.seen.contains { $0.url.path == url.path && $0.range == nil })
+                    || (["hls-live-whole-changed", "hls-repeat-changed", "hls-alias-changed", "hls-userinfo-changed", "hls-live-userinfo"].contains(mode) && Self.seen.contains { $0.url.path == url.path })
+            }
+            let edition = Data((changed ? "BBBB" : "AAAA").utf8)
+            if mode != "hls-untagged-edition" && !mode.hasPrefix("hls-live-") { headers["ETag"] = changed ? "\"B\"" : "\"A\"" }
+            if let range {
+                let bounds = range.dropFirst(6).split(separator: "-").compactMap { Int($0) }
+                guard bounds.count == 2 else { status = 400; break }
+                status = 206
+                headers["Content-Range"] = "bytes \(bounds[0])-\(bounds[1])/4"
+                data = edition.subdata(in: bounds[0]..<(bounds[1]+1))
+            } else { data = edition }
+        case ("media.invalid", "/parallel.bin"):
+            if mode == "parallel-unvalidated", range == nil { data = Self.parallelBytes; break }
+            if mode != "parallel-unvalidated" { headers["ETag"] = "\"stable-fixture\"" }
+            guard let bounds = range?.dropFirst(6).split(separator: "-"), bounds.count == 2,
+                  let low = Int(bounds[0]), let requested = Int(bounds[1]) else { status = 400; break }
+            if mode == "parallel-cancel" && requested > 0 { failure = URLError(.cancelled); break }
+            let high = mode == "parallel-short" ? min(low + 65_535, requested) : requested
+            status = 206
+            headers["Content-Range"] = "bytes \(low)-\(high)/\(Self.parallelBytes.count)"
+            if mode == "parallel-unvalidated" && low > 0 {
+                data = Data(repeating: 0, count: high - low + 1)
+            } else { data = Self.parallelBytes.subdata(in: low..<(high + 1)) }
         case ("media.invalid", let path) where path.hasSuffix(".m3u8"):
             // An HLS playlist of 15 fragmented MP4 segments, 4 s each. Extraction reads only the playlist.
             let segments = (0..<15).map { "#EXTINF:4.0,\nclip-\($0).m4s" }.joined(separator: "\n")
@@ -304,6 +597,13 @@ final class FixtureProtocol: URLProtocol {
                 range: range, status: failure == nil ? status : -1,
                 authorization: request.value(forHTTPHeaderField: "Authorization") != nil
             ))
+        }
+        if let redirect {
+            var next = request
+            next.url = redirect
+            let response = HTTPURLResponse(url: url, statusCode: 302, httpVersion: "HTTP/1.1", headerFields: ["Location": redirect.absoluteString])!
+            client!.urlProtocol(self, wasRedirectedTo: next, redirectResponse: response)
+            return
         }
         if let failure {
             client!.urlProtocol(self, didFailWithError: failure)
@@ -614,6 +914,72 @@ enum Bytes {
         let page: [UInt8] = [0, 0, 1, 0] + le32(1) + le32(16) + le32(0) + record
         return Data(Array("cook".utf8) + be32(1) + be32(UInt32(page.count)) + page)
     }
+
+    static let ftyp = be32(16) + Array("ftypisom".utf8) + be32(0)
+
+    static func box(_ type: String, _ payload: [UInt8]) -> [UInt8] { be32(UInt32(8 + payload.count)) + Array(type.utf8) + payload }
+
+    /// The track uses 1000 ticks per second and one byte per sample.
+    static func clipInit(sampleTicks: UInt32, timescale: UInt32 = 1000, video: Bool = false) -> [UInt8] {
+        let trak = clipTrak(timescale: timescale, video: video, id: 1)
+        let trex = box("trex", be32(0) + be32(1) + be32(1) + be32(sampleTicks) + be32(1) + be32(0))
+        return ftyp + box("moov", trak + box("mvex", trex))
+    }
+
+    static func clipTrak(timescale: UInt32, video: Bool, id: UInt32) -> [UInt8] {
+        let mdhd = box("mdhd", be32(0) + be32(0) + be32(0) + be32(timescale) + be32(0) + be32(0))
+        let hdlr = box("hdlr", be32(0) + be32(0) + Array((video ? "vide" : "soun").utf8) + [UInt8](repeating: 0, count: 13))
+        let stbl = box("stbl", box("stsd", be32(0) + be32(0)))
+        let header = id == 1 ? [] : box("tkhd", Array(repeating: 0, count: 12) + be32(id) + Array(repeating: 0, count: 68))
+        return box("trak", header + box("mdia", mdhd + hdlr + box("minf", stbl)))
+    }
+
+    /// Media segment `n`: one `moof` with four samples, and an `mdat` whose four bytes are the
+    /// stream seconds 4n to 4n+3. The data offset includes the fragment and the media header.
+    static func clipSegment(_ n: Int, sampleBase: Int = 0, sampleTicks: UInt32 = 1000) -> [UInt8] {
+        let tfhd = box("tfhd", be32(0x020000) + be32(1))
+        let tfdt = box("tfdt", be32(0) + be32(UInt32(n) * 4 * sampleTicks))
+        let trun = box("trun", be32(0x000001) + be32(4) + be32(76))
+        return box("moof", box("traf", tfhd + tfdt + trun)) + box("mdat", (0..<4).map { UInt8(sampleBase + 4 * n + $0) })
+    }
+
+    // The first picture is a keyframe. Each payload byte identifies the source second and edition.
+    static func renditionFragment(_ bytes: [UInt8], video: Bool, trackID: UInt32 = 1, ticks: UInt32? = nil, start: UInt32? = nil) -> [UInt8] {
+        let defaults = ticks.map { be32($0) + be32(1) } ?? []
+        let tfhd = box("tfhd", be32(ticks == nil ? 0x020000 : 0x020018) + be32(trackID) + defaults)
+        let tfdt = start.map { box("tfdt", be32(0) + be32($0)) } ?? []
+        let entries = bytes.indices.flatMap { be32(video && $0 != 0 ? 0x10000 : 0) }
+        let trun = box("trun", be32(0x401) + be32(UInt32(bytes.count)) + be32(UInt32(60 + entries.count + defaults.count + tfdt.count)) + entries)
+        return box("moof", box("traf", tfhd + tfdt + trun)) + box("mdat", bytes)
+    }
+
+    static let indexedClip: [UInt8] = makeIndexedClip(timescale: 1000, sampleBase: 0)
+    /// A second edition of `indexedClip` with the same size and box offsets, but a different
+    /// track timescale and different sample bytes.
+    static let changedIndexedClip: [UInt8] = makeIndexedClip(timescale: 2000, sampleBase: 100)
+    /// A second edition of `indexedClip` with the same first 64 KiB and index, different sample
+    /// bytes, and one more fragment after the last indexed one, as when the file grows.
+    static let grownIndexedClip: [UInt8] = makeIndexedClip(timescale: 1000, sampleBase: 100) + clipSegment(15, sampleBase: 100)
+
+    static func makeIndexedClip(timescale: UInt32, sampleBase: Int) -> [UInt8] {
+        let segments = (0..<15).map { clipSegment($0, sampleBase: sampleBase) }
+        // Place the media after the initial 64 KiB probe, as in a larger real file.
+        let padding = box("free", [UInt8](repeating: 0, count: 65_536))
+        var index = be32(0) + be32(1) + be32(1000) + be32(0) + be32(UInt32(padding.count)) + be32(UInt32(segments.count))
+        for segment in segments { index += be32(UInt32(segment.count)) + be32(4000) + be32(0) }
+        return clipInit(sampleTicks: 1000, timescale: timescale) + box("sidx", index) + padding + segments.flatMap { $0 }
+    }
+
+    static let fragmentIndexedClip: [UInt8] = {
+        var bytes = clipInit(sampleTicks: 1000)
+        for n in 0..<15 {
+            let fragment = clipSegment(n)
+            let prefix = be32(0) + be32(1) + be32(1000) + be32(UInt32(n * 4000))
+            let reference = be32(UInt32(fragment.count)) + be32(4000) + be32(0)
+            bytes += box("sidx", prefix + be32(0) + be32(1) + reference) + fragment
+        }
+        return bytes
+    }()
 }
 
 // MARK: - Cases
@@ -625,6 +991,16 @@ struct RegressionChecks {
     static func check(_ ok: Bool, _ message: String) {
         print("\(ok ? "PASS" : "FAIL") \(FixtureProtocol.mode): \(message)")
         if !ok { exit(1) }
+    }
+
+    /// The highest physical memory footprint of this process so far.
+    static func peakFootprint() -> Int64 {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count) }
+        }
+        return result == KERN_SUCCESS ? info.ledger_phys_footprint_peak : 0
     }
 
     static func extract(_ id: String = "Fixture0001", client: HTTPClient = HTTPClient()) async throws -> MediaInfo {
@@ -756,8 +1132,8 @@ struct RegressionChecks {
                 catch { failure = error }
                 let seen = FixtureProtocol.requests().dropFirst(before)
                 let wanted = stage == "sponsors" ? seen.last?.url.host == "sponsor.ajay.app" : seen.last?.url.path == "/" + stage
-                check(httpStatus(failure) == 403 && wanted && seen.dropLast().allSatisfy { $0.url.host == "media.invalid" } && finalOutputs().isEmpty,
-                      "no final file or later request after denied \(stage): \(seen.map { $0.url.path }), output=\(finalOutputs())")
+                check(httpStatus(failure) == 403 && wanted && seen.dropLast().allSatisfy { $0.url.host == "media.invalid" } && savedOutputs().isEmpty,
+                      "no file or later request after denied \(stage): \(seen.map { $0.url.path }), output=\(savedOutputs())")
             }
         case "optional-refusal":
             let out = AppPaths.appSupportDir.appendingPathComponent("out")
@@ -939,7 +1315,7 @@ struct RegressionChecks {
                         && paths == ["/watch", "/youtubei/v1/player", "/media", "/media", "/media"] && players == 1,
                       "HTTP \(code) on the download stream stops without a new player request; error=\(String(describing: error)), paths=\(paths), players=\(players)")
             }
-            check(finalOutputs().isEmpty, "download stream denials save no final file; saved=\(finalOutputs())")
+            check(savedOutputs().isEmpty, "download stream denials leave no files; saved=\(savedOutputs())")
 
         // Any explicit non-OK playability status fails closed even with usable streaming data.
         case "playability-status":
@@ -1180,6 +1556,14 @@ struct RegressionChecks {
             let probeFile = AppPaths.appSupportDir.appendingPathComponent("headers-only-probe.bin")
             let streamFile = AppPaths.appSupportDir.appendingPathComponent("headers-only-stream.bin")
             try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            for target in [file, probeFile, streamFile] {
+                try Data("resume prefix".utf8).write(to: target.appendingPathExtension("part"))
+                try Data("{}".utf8).write(to: target.appendingPathExtension("part.json"))
+            }
+            func leftovers(_ target: URL) -> [String] {
+                [target, target.appendingPathExtension("part"), target.appendingPathExtension("part.json")]
+                    .filter { FileManager.default.fileExists(atPath: $0.path) }.map(\.lastPathComponent)
+            }
             async let fetchFailure: Error? = {
                 do { _ = try await HTTPClient().fetchData(url: "http://127.0.0.1:\(single.port)/unavailable", retries: 3) } catch { return error }
                 return nil
@@ -1204,12 +1588,12 @@ struct RegressionChecks {
             check(unknownStatus(first) && single.requests == 1,
                   "fetchData does not repeat a request whose headers arrived without a body; requests=\(single.requests), error=\(String(describing: first))")
             let seen = ranges.all
-            check(unknownStatus(second) && !seen.isEmpty && seen.values.allSatisfy { $0 == 1 },
-                  "a range worker does not repeat a range whose headers arrived without a body; ranges=\(seen), error=\(String(describing: second))")
-            check(unknownStatus(third) && probe.requests == 1,
-                  "a probe whose status is unknown is not repeated; requests=\(probe.requests), error=\(String(describing: third))")
-            check(unknownStatus(fourth) && stream.requests == 2,
-                  "a single stream whose status is unknown is not repeated; requests=\(stream.requests), error=\(String(describing: fourth))")
+            check(unknownStatus(second) && !seen.isEmpty && seen.values.allSatisfy { $0 == 1 } && leftovers(file).isEmpty,
+                  "a range worker does not repeat a range whose headers arrived without a body, and keeps no resume files; ranges=\(seen), files=\(leftovers(file)), error=\(String(describing: second))")
+            check(unknownStatus(third) && probe.requests == 1 && leftovers(probeFile).isEmpty,
+                  "a probe whose status is unknown keeps no resume files; requests=\(probe.requests), files=\(leftovers(probeFile)), error=\(String(describing: third))")
+            check(unknownStatus(fourth) && stream.requests == 2 && leftovers(streamFile).isEmpty,
+                  "a single stream whose status is unknown keeps no resume files; requests=\(stream.requests), files=\(leftovers(streamFile)), error=\(String(describing: fourth))")
         // A 403 whose connection is lost before uBit reads the status is not repeated.
         case "lost-after-headers":
             var failure: Error?
@@ -1399,6 +1783,554 @@ struct RegressionChecks {
             check((error as? URLError)?.code == .cancelled && file == nil && finalOutputs().isEmpty
                     && paths == ["/watch", "/youtubei/v1/player", "/media", "/media"],
                   "transport cancellation stops the download, makes no later request and saves no final output; error=\(String(describing: error)), paths=\(paths), saved=\(finalOutputs())")
+        case "hls-section-base":
+            // The saved HLS timeline starts at 0, so the engine must know where the first kept
+            // segment starts in the stream, or the trim cuts the wrong seconds.
+            let dest = AppPaths.appSupportDir.appendingPathComponent("hls-section.ts")
+            let result = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/hls.m3u8",
+                                                            destination: dest, section: SectionRange(start: 20, end: 26))
+            let fetched = FixtureProtocol.requests().map(\.url.path).filter { $0.hasPrefix("/seg-") }.sorted()
+            check(result.startTime == 16 && result.zero == nil && fetched == ["/seg-0.ts", "/seg-4.ts", "/seg-5.ts", "/seg-6.ts"],
+                  "the 20–26 s clip fetches two overlapping segments, one for preroll and the first one for the clock; media that cannot be timed keeps the playlist clock; startTime=\(result.startTime), segments=\(fetched)")
+        case "hls-clock-mux", "hls-clock-short":
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.connections = 1
+            options.cookieSource = "none"
+            options.section = SectionRange(start: 2.25, end: 4)
+            options.outputDir = AppPaths.appSupportDir.appendingPathComponent("out").path
+            let stem = mode == "hls-clock-mux" ? "mux" : "master"
+            let file = try await DownloadEngine().downloadSingle(url: "https://media.invalid/clock/\(stem).m3u8", settings: settings, options: options)
+            let tracks = try MP4Muxer.readTracks(from: file), media = try Data(contentsOf: file)
+            let pictures = tracks.first { $0.kind == .video }?.samples.map { media[Int($0.offset)] }
+            let sound = tracks.first { $0.kind == .audio }
+            let first = sound?.samples.first.map { media[Int($0.offset)] }
+            check(pictures == Array(20..<40).map(UInt8.init) && first == 93 && sound?.editMediaTimeTicks == 768,
+                  "cut at keyframe 20 keeps packet 93 and skips 768 audio ticks; first=\(String(describing: first)), edit=\(String(describing: sound?.editMediaTimeTicks))")
+        case "paired-plain-a", "paired-plain-b", "paired-tagged-a", "paired-tagged-b", "paired-plain-changed", "paired-tagged-changed", "paired-clock":
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.connections = 1
+            options.cookieSource = "none"
+            let out = AppPaths.appSupportDir.appendingPathComponent("out")
+            options.outputDir = out.path
+            let cut = mode == "paired-clock"
+            if cut { options.section = SectionRange(start: 1, end: 3) }
+            do {
+                let file = try await DownloadEngine().downloadSingle(url: "https://media.invalid/paired.m3u8", settings: settings, options: options)
+                let tracks = try MP4Muxer.readTracks(from: file)
+                let media = try Data(contentsOf: file)
+                func bytes(_ kind: MP4TrackKind) -> [UInt8] {
+                    tracks.first { $0.kind == kind }?.samples.map { media[Int($0.offset)] } ?? []
+                }
+                let first: UInt8 = mode.hasSuffix("-b") ? 100 : 0
+                let picture = (0..<(cut ? 3 : 4)).map { first + UInt8($0) }
+                check(bytes(.video) == picture && bytes(.audio) == picture.map { $0 + 40 },
+                      "picture and audio sample identifiers on the movie clock: video=\(bytes(.video)), audio=\(bytes(.audio))")
+            } catch HTTPError.rangeUnsupported where mode.contains("changed") {
+                let files = try FileManager.default.contentsOfDirectory(atPath: out.path)
+                check(files.isEmpty, "a changed cross-rendition edition leaves no output: \(files)")
+            }
+        case "hls-section-clip":
+            // The whole engine (playlist, segments, demux, trim, mux) must save the samples of
+            // stream seconds 20 to 25. Each sample is one byte: its second.
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.cookieSource = "none"
+            options.connections = 1
+            options.outputDir = AppPaths.appSupportDir.appendingPathComponent("out").path
+            options.section = SectionRange(start: 20, end: 26)
+            let file = try await DownloadEngine().downloadSingle(url: "https://media.invalid/clip.m3u8", settings: settings, options: options)
+            let saved = try Data(contentsOf: file)
+            let seconds = saved.range(of: Data("mdat".utf8)).map { saved[$0.upperBound...].map { Int($0) } } ?? []
+            let fetched = FixtureProtocol.requests().map(\.url.path).filter { $0.hasSuffix(".m4s") }.sorted()
+            check(seconds == [20, 21, 22, 23, 24, 25] && fetched == ["/clip-0.m4s", "/clip-4.m4s", "/clip-5.m4s", "/clip-6.m4s"],
+                  "the clip saves seconds 20 through 25 without writing the segment that sets the clock; saved seconds=\(seconds), segments=\(fetched)")
+        case "hls-section-outside":
+            // Seventh review: a section after the end of a 60 s stream is an error. No media
+            // segment is fetched, and no file is saved.
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.cookieSource = "none"
+            options.connections = 1
+            let outDir = AppPaths.appSupportDir.appendingPathComponent("out")
+            options.outputDir = outDir.path
+            var rejected: [Int] = []
+            for start in [60, 65] {
+                options.section = SectionRange(start: Double(start), end: Double(start + 5))
+                do {
+                    _ = try await DownloadEngine().downloadSingle(url: "https://media.invalid/clip.m3u8", settings: settings, options: options)
+                } catch where error.localizedDescription.contains("outside the stream") {
+                    rejected.append(start)
+                }
+            }
+            let fetched = FixtureProtocol.requests().map(\.url.path).filter { $0.hasSuffix(".m4s") }
+            let saved = ((try? FileManager.default.contentsOfDirectory(atPath: outDir.path)) ?? []).filter { !$0.hasPrefix(".") }
+            check(rejected == [60, 65] && fetched.isEmpty && saved.isEmpty,
+                  "sections at and past EOF fail without fetching or saving media; rejected=\(rejected), segments=\(fetched), saved=\(saved)")
+        case "range-ignored":
+            // Seventh review: a server that ignores Range answers 200 with the whole file. The
+            // fixture's /seg- route does that, and its body is its own path.
+            let client = HTTPClient()
+            let part = try await client.fetchRangeBytes(url: "https://media.invalid/seg-whole.mp3", range: ByteRange(start: 5, end: 9))
+            var pastEnd = false
+            do {
+                _ = try await client.fetchRangeBytes(url: "https://media.invalid/seg-whole.mp3", range: ByteRange(start: 100, end: 200))
+            } catch HTTPError.rangeUnsupported {
+                pastEnd = true
+            }
+            let suffix = try await client.fetchRangeBytes(url: "https://media.invalid/seg-whole.mp3", range: ByteRange(start: 5, end: .max))
+            let before = FixtureProtocol.requests().count
+            var refused = 0
+            for bounds in [ByteRange(start: -1, end: 5), ByteRange(start: 5, end: 2)] {
+                do {
+                    _ = try await client.fetchRangeBytes(url: "https://media.invalid/seg-whole.mp3", range: bounds)
+                } catch HTTPError.rangeUnsupported { refused += 1 }
+            }
+            let text = String(decoding: part, as: UTF8.self)
+            check(text == "whole" && pastEnd && String(decoding: suffix, as: UTF8.self) == "whole.mp3"
+                  && refused == 2 && FixtureProtocol.requests().count == before,
+                  "valid ranges return the requested bytes through EOF; invalid bounds make no request")
+            let bounds = ByteRange(start: 1, end: 3)
+            let atEOF = try await client.fetchRangeBytes(url: "https://media.invalid/partial/eof", range: bounds)
+            check(atEOF == Data("bc".utf8), "a partial answer can end at the actual file end")
+            for route in ["short", "shifted", "truncated"] {
+                var rejected = false
+                do {
+                    _ = try await client.fetchRangeBytes(url: "https://media.invalid/partial/\(route)", range: bounds)
+                } catch HTTPError.rangeUnsupported { rejected = true }
+                check(rejected, "refuse an incomplete or misaligned partial answer: \(route)")
+            }
+        case "hls-raw-section", "http-raw-section":
+            // A raw MP3 stream (the shape that the SoundCloud extractor returns) with a 0:20-0:26
+            // section is not trimmed. Over plain HTTP it is saved whole; over HLS, the segments that
+            // overlap the section (4 to 6 of 15, 4 s each) are saved as they are.
+            let overHLS = FixtureProtocol.mode == "hls-raw-section"
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.cookieSource = "none"
+            options.audioOnly = true
+            options.connections = 1
+            options.targetFormat = "mp3"
+            options.outputDir = AppPaths.appSupportDir.appendingPathComponent("out").path
+            options.section = SectionRange(start: 20, end: 26)
+            let format = overHLS
+                ? MediaFormat(id: "hls-mp3", url: "https://media.invalid/hls.m3u8", ext: "mp3", proto: .hls, vcodec: "none", acodec: "mp3", bitrate: 128_000)
+                : MediaFormat(id: "http-mp3", url: "https://media.invalid/seg-whole.mp3", ext: "mp3", proto: .http, vcodec: "none", acodec: "mp3", bitrate: 128_000)
+            let info = MediaInfo(id: "x", title: "x", site: "Fixture", webpageURL: "https://media.invalid/page", formats: [format])
+            let file = try await DownloadEngine().downloadSingle(url: "https://media.invalid/page", preExtracted: info, settings: settings, options: options)
+            let saved = String(decoding: try Data(contentsOf: file), as: UTF8.self)
+            let expected = overHLS ? "/seg-4.ts/seg-5.ts/seg-6.ts" : "/seg-whole.mp3"
+            check(saved == expected, "raw MP3 is not trimmed: HTTP saves the file and HLS saves the selected segments, including preroll; saved=\(saved), expected=\(expected)")
+        case "hls-ntsc":
+            let url = "https://media.invalid/clip.m3u8"
+            let dest = AppPaths.appSupportDir.appendingPathComponent("unexpected.mp4")
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: url, destination: dest,
+                                                       section: SectionRange(start: 7.007, end: 8))
+                check(false, "a section starting at decimal EOF produced a stream")
+            } catch where error.localizedDescription.contains("outside the stream") {}
+            let parts = FixtureProtocol.requests().filter { $0.url.path.hasPrefix("/clip-") }
+            check(parts.isEmpty && !FileManager.default.fileExists(atPath: dest.path), "decimal EOF needs neither init nor media")
+        case "trim-display-end":
+            // Decode order: a sync picture shown at 0, a reference picture shown at 0.3, and a
+            // picture shown at 0.1 whose decode duration (0.3) reaches past 0.3.
+            let track = MP4Track(trackID: 1, kind: .video, timescale: 10, stsdPayload: Data(), samples: [
+                MP4Sample(offset: 0, size: 1, duration: 1, isSync: true),
+                MP4Sample(offset: 1, size: 1, duration: 1, ctsOffset: 2, isSync: false),
+                MP4Sample(offset: 2, size: 1, duration: 3, ctsOffset: -1, isSync: false),
+            ])
+            let exact = MP4Muxer.trimTracks([track], section: SectionRange(start: 0, end: 0.3)).first
+            check(exact?.samples.count == 3 && exact?.editSegmentTicks == 3,
+                  "an end at 0.3 keeps the reference picture for decoding but shows pictures until 0.3 only: edit=\(String(describing: exact?.editSegmentTicks))")
+            let after = MP4Muxer.trimTracks([track], section: SectionRange(start: 0, end: 0.300001)).first
+            check(after?.samples.count == 3 && after?.editSegmentTicks == nil,
+                  "an end just after 0.3 shows the picture at 0.3: edit=\(String(describing: after?.editSegmentTicks))")
+        case "trim-boundaries", "trim-keyframe":
+            func samples(scale: UInt32, ticks: UInt32, count: Int, group: Int, base: Double, start: Double, end: Double) -> [UInt64] {
+                let track = MP4Track(trackID: 1, kind: .video, timescale: scale, stsdPayload: Data(),
+                                     samples: (0..<count).map { MP4Sample(offset: UInt64($0), size: 1, duration: ticks, isSync: $0 % group == 0) })
+                return MP4Muxer.trimTracks([track], section: SectionRange(start: start, end: end), baseStartTimeSec: base).first?.samples.map(\.offset) ?? []
+            }
+            if mode == "trim-keyframe" {
+                let got = samples(scale: 1, ticks: 1, count: 12, group: 4, base: 0, start: 7.9995, end: 7.9999)
+                check(got == [4, 5, 6, 7], "a section before a sync frame uses the preceding keyframe: \(got)")
+                let vfr = MP4Track(trackID: 1, kind: .video, timescale: 10, stsdPayload: Data(), samples: [
+                    MP4Sample(offset: 0, size: 1, duration: 1, isSync: true),
+                    MP4Sample(offset: 1, size: 1, duration: 3, ctsOffset: 2, isSync: false),
+                    MP4Sample(offset: 2, size: 1, duration: 1, isSync: true),
+                ])
+                let cut = MP4Muxer.trimTracks([vfr], section: SectionRange(start: 0.4, end: 0.5))
+                check(cut.first?.samples.map(\.offset) == [2], "the preceding picture ends at the next displayed sync picture, not at its decode duration")
+                return
+            }
+            for (end, frames) in [(1.701699, 21), (1.7017, 21), (1.701701, 22)] {
+                let got = samples(scale: 30000, ticks: 1001, count: 30, group: 30, base: 1.001, start: 1.2, end: end)
+                check(got == Array(0..<UInt64(frames)), "exclusive end \(end): \(got)")
+            }
+            // At 2 s the video is at a sync picture, but the 48 kHz audio is 768 ticks
+            // into packet 93. Reopen the output to check both its packet and its edit.
+            let pictures = MP4Track(trackID: 1, kind: .video, timescale: 1, stsdPayload: Data(), samples:
+                (0..<4).map { MP4Sample(size: 1, duration: 1, isSync: $0 % 2 == 0, inlineData: Data([UInt8($0)])) })
+            let packets = MP4Track(trackID: 2, kind: .audio, timescale: 48000, stsdPayload: Data(), samples:
+                (0..<150).map { MP4Sample(size: 1, duration: 1024, inlineData: Data([UInt8($0)])) })
+            let section = SectionRange(start: 2.25, end: 2.56)
+            for separate in [false, true] {
+                let clock = MP4Muxer.SectionClock()
+                let tracks = separate
+                    ? MP4Muxer.trimTracks([pictures], section: section, clock: clock) + MP4Muxer.trimTracks([packets], section: section, clock: clock)
+                    : MP4Muxer.trimTracks([pictures, packets], section: section)
+                let url = AppPaths.appSupportDir.appendingPathComponent("packet-clock-\(separate).mp4")
+                try MP4Muxer.writeMP4(tracks: tracks, sourceFiles: [], destination: url)
+                let saved = try MP4Muxer.readTracks(from: url)
+                let data = try Data(contentsOf: url)
+                let audio = saved.first { $0.kind == .audio }
+                let packet = audio?.samples.first.map { data[Int($0.offset)] }
+                let picture = saved.first { $0.kind == .video }?.samples.first.map { data[Int($0.offset)] }
+                check(picture == 2 && packet == 93 && audio?.editMediaTimeTicks == 768 && audio?.editSegmentTicks == 26880,
+                      "separate=\(separate): picture 2 starts at tick 768 of audio packet 93; packet=\(String(describing: packet)), edit=\(String(describing: audio?.editMediaTimeTicks)), duration=\(String(describing: audio?.editSegmentTicks))")
+            }
+            let video = MP4Track(trackID: 1, kind: .video, timescale: 30, stsdPayload: Data(), samples:
+                (0..<10).map { MP4Sample(offset: UInt64($0 + 10), size: 1, duration: 1, isSync: $0 == 0) })
+            let fromThird = MP4Muxer.trimTracks([video], section: SectionRange(start: 0.4, end: 0.5),
+                                                 baseStart: SectionTimeBase(ticks: 1, timescale: 3))
+            check(fromThird.first?.samples.map(\.offset) == [10, 11, 12, 13, 14], "the exclusive end omits frame 15 after a one-third-second fragment start")
+            let offsets: [Int32] = [0, 2, -1, -1]
+            let decode = offsets.enumerated().map { i, offset -> MP4Sample in
+                let byte = Data([UInt8(i)])
+                return MP4Sample(offset: 0, size: 1, duration: 1, ctsOffset: offset, isSync: i == 0, inlineData: byte)
+            }
+            var reordered = video
+            reordered.samples = decode
+            let display = MP4Muxer.trimTracks([reordered], section: SectionRange(start: 0, end: 0.1)).first
+            check(display?.samples.count == 4 && display?.editSegmentTicks == 3, "the clip retains the fourth decode sample but presents only the first three pictures")
+            let file = AppPaths.appSupportDir.appendingPathComponent("reordered.mp4")
+            if let display {
+                try MP4Muxer.writeMP4(tracks: [display], sourceFiles: [], destination: file)
+                let reopened = try MP4Muxer.readTracks(from: file)
+                let open = MP4Muxer.trimTracks(reopened, section: SectionRange(start: 0, end: nil))
+                let eof = MP4Muxer.trimTracks(reopened, section: SectionRange(start: 0.1, end: nil))
+                check(open.first?.editSegmentTicks == 3 && open.first?.samples.count == 4 && eof.isEmpty,
+                      "reopening the clip cannot present the hidden reference picture or create a clip at displayed EOF")
+            }
+        case "edit-delay":
+            // FFmpeg writes a two-entry edit list for a delayed track: an empty edit, then the
+            // media. Ten 1024-tick packets at 48 kHz start 2048 ticks into the presentation.
+            var packets = MP4Track(trackID: 1, kind: .audio, timescale: 48000, stsdPayload: Data(), samples:
+                (0..<10).map { MP4Sample(size: 1, duration: 1024, inlineData: Data([UInt8($0)])) })
+            packets.editDelayTicks = 2048
+            packets.editMediaTimeTicks = 0
+            packets.editSegmentTicks = 10240
+            let url = AppPaths.appSupportDir.appendingPathComponent("delayed.m4a")
+            try MP4Muxer.writeMP4(tracks: [packets], sourceFiles: [], destination: url, isAudioOnlyM4A: true)
+            let reopened = try MP4Muxer.readTracks(from: url).first
+            check(reopened?.editDelayTicks == 2048 && reopened?.editMediaTimeTicks == 0 && reopened?.editSegmentTicks == 10240,
+                  "the empty edit survives a write and a read; delay=\(String(describing: reopened?.editDelayTicks)), media=\(String(describing: reopened?.editMediaTimeTicks))")
+            // Packets are shown at 2048, 3072, 4096 and later, so an end at 0.1 s (4800) keeps three.
+            let cut = reopened.flatMap { MP4Muxer.trimTracks([$0], section: SectionRange(start: 0, end: 0.1)).first }
+            check(cut?.samples.count == 3 && cut?.editDelayTicks == 2048,
+                  "a section counts presented time, after the empty edit; packets=\(String(describing: cut?.samples.count)), delay=\(String(describing: cut?.editDelayTicks))")
+        case "edit-negative-cts":
+            // Composition offsets of `ctts` version 1: the sync picture at decode 3 is shown at 2,
+            // and the reference picture at decode 4 is shown at 5, after the 0.2–0.4 s section.
+            let offsets: [Int32] = [-1, -1, -1, -1, 1, -2, -2]
+            let pictures = MP4Track(trackID: 1, kind: .video, timescale: 10, stsdPayload: Data(), samples: offsets.enumerated().map { i, cts in
+                MP4Sample(size: 1, duration: 1, ctsOffset: cts, isSync: i == 0 || i == 3, inlineData: Data([UInt8(i)]))
+            })
+            let cut = MP4Muxer.trimTracks([pictures], section: SectionRange(start: 0.2, end: 0.4)).first
+            check(cut?.samples.map(\.ctsOffset) == [0, 2, -1] && cut?.editMediaTimeTicks == 0 && cut?.editSegmentTicks == 2,
+                  "an edit cannot start before media time 0, so the clip's composition times move later and the edit hides the reference picture; cts=\(String(describing: cut?.samples.map(\.ctsOffset))), media=\(String(describing: cut?.editMediaTimeTicks))")
+        case "edit-sponsor-cut":
+            // Ten 1000-tick samples; the edit hides the first and shows the next nine.
+            var track = MP4Track(trackID: 1, kind: .video, timescale: 1000, stsdPayload: Data(), samples:
+                (0..<10).map { MP4Sample(size: 1, duration: 1000, isSync: true, inlineData: Data([UInt8($0)])) })
+            track.editMediaTimeTicks = 1000
+            track.editSegmentTicks = 9000
+            let cut = MP4Muxer.removeIntervals([track], intervals: [(start: 2.0, end: 6.0)]).first
+            check(cut?.samples.count == 6 && cut?.editMediaTimeTicks == 1000 && cut?.editSegmentTicks == 5000,
+                  "a removed interval shortens the shown part of the edit; media=\(String(describing: cut?.editMediaTimeTicks)), segment=\(String(describing: cut?.editSegmentTicks))")
+        case "section-zero":
+            // The first sample decodes at 2/30 s of the stream, and the stream's first picture is
+            // shown at 1/30 s, which is section time 0. Sample i is at section time (i + 1)/30.
+            let frames = MP4Track(trackID: 1, kind: .video, timescale: 30, stsdPayload: Data(), samples:
+                (0..<10).map { MP4Sample(offset: UInt64($0), size: 1, duration: 1, isSync: true) })
+            let cut = MP4Muxer.trimTracks([frames], section: SectionRange(start: 0.1, end: 0.2),
+                                          trackStarts: [1: SectionTimeBase(ticks: 2, timescale: 30)], zero: SectionTimeBase(ticks: 1, timescale: 30))
+            check(cut.first?.samples.map(\.offset) == [2, 3, 4], "section time counts from the stream's first presented time: \(String(describing: cut.first?.samples.map(\.offset)))")
+            check(SectionTimeBase(ticks: 1, timescale: 2) == SectionTimeBase(ticks: 2, timescale: 4) && SectionTimeBase(ticks: -1, timescale: 3) < SectionTimeBase(ticks: 0, timescale: 7),
+                  "two spellings of one time are equal, and a negative time is earlier")
+        case "hls-decimal", "sidx-boundaries", "sidx-fragments", "sidx-padding":
+            let hls = mode == "hls-decimal"
+            let path = hls ? "/clip.m3u8" : "/indexed.mp4"
+            let url = "https://media.invalid" + path
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.cookieSource = "none"
+            options.connections = 1
+            let out = AppPaths.appSupportDir.appendingPathComponent("out")
+            options.outputDir = out.path
+            let eof = hls ? 12.0 : 60.0
+            options.section = SectionRange(start: eof, end: eof + 1)
+            do {
+                _ = try await DownloadEngine().downloadSingle(url: url, settings: settings, options: options)
+                check(false, "a section starting at EOF produced a file")
+            } catch where error.localizedDescription.contains("outside the stream") {}
+            let media = FixtureProtocol.requests().filter { $0.url.path == path || $0.url.path.hasPrefix("/clip-") }
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: out.path)) ?? []
+            var onlyMetadata = hls ? !media.isEmpty && media.allSatisfy { $0.url.path == path }
+                                   : media.count == 1 && media[0].range == "bytes=0-65535"
+            if mode == "sidx-padding" {
+                let next = Bytes.indexedClip.count
+                onlyMetadata = media.map(\.range) == ["bytes=0-65535", "bytes=\(next)-\(next + 7)"]
+            }
+            check(files.isEmpty && (mode == "sidx-fragments" || onlyMetadata),
+                  "at EOF no file is saved; a complete index needs no media request; paths=\(media.map(\.url.path)), files=\(files)")
+
+            let clips: [(Double, Double, [Int], [String])] = hls ? [
+                (8, 9.6, Array(40..<48), ["/clip-0.m4s", "/clip-9.m4s", "/clip-10.m4s", "/clip-11.m4s"]),
+                (11.999999, 12, [59], ["/clip-0.m4s", "/clip-14.m4s"])
+            ] : mode == "sidx-fragments" ? [(4, 12, Array(4..<12), []), (2, 6, Array(2..<6), [])]
+                                         : [(56, 60, Array(56..<60), [])]
+            for (start, end, expected, parts) in clips {
+                let before = FixtureProtocol.requests().count
+                options.section = SectionRange(start: start, end: end)
+                let file = try await DownloadEngine().downloadSingle(url: url, settings: settings, options: options)
+                let data = try Data(contentsOf: file)
+                let samples = data.range(of: Data("mdat".utf8)).map { data[$0.upperBound...].map(Int.init) } ?? []
+                let fetched = FixtureProtocol.requests().dropFirst(before).map(\.url.path).filter { $0.hasSuffix(".m4s") }
+                check(samples == expected && fetched == parts, "section \(start)-\(end): samples=\(samples), parts=\(fetched)")
+            }
+        case "sidx-untagged-change", "sidx-untagged-grow":
+            // The server names no edition and changes the file after the first read. The saved
+            // clip must come from one edition (timescale and samples agree), or no file is saved.
+            // When the file grows, an open-ended clip must not stop at the end of the first edition.
+            let grow = mode == "sidx-untagged-grow"
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            options.cookieSource = "none"
+            options.connections = 1
+            let out = AppPaths.appSupportDir.appendingPathComponent("out")
+            options.outputDir = out.path
+            options.section = grow ? SectionRange(start: 56, end: nil) : SectionRange(start: 8, end: 12)
+            var file: URL?
+            var failure: Error?
+            do {
+                file = try await DownloadEngine().downloadSingle(url: "https://media.invalid/indexed.mp4", settings: settings, options: options)
+            } catch { failure = error }
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: out.path)) ?? []
+            if let file {
+                let data = try Data(contentsOf: file)
+                let samples = data.range(of: Data("mdat".utf8)).map { data[$0.upperBound...].map(Int.init) } ?? []
+                let timescale = try MP4Muxer.readTracks(from: file).first?.timescale
+                let oneEdition = grow ? (samples == Array(56..<60) || samples == Array(156..<164))
+                    : (timescale == 1000 && samples == Array(8..<12)) || (timescale == 2000 && samples.allSatisfy { $0 >= 100 })
+                check(oneEdition, "a saved clip comes from one edition: timescale=\(String(describing: timescale)), samples=\(samples)")
+            } else {
+                check(files.isEmpty, "a changed edition fails without a file: error=\(String(describing: failure)), files=\(files)")
+            }
+        case "parallel-redirect":
+            // Two connections and a redirector that alternates between mirrors whose different
+            // copies carry the same ETag text: every range must come from the probed mirror.
+            let file = AppPaths.appSupportDir.appendingPathComponent("hop.bin")
+            var failure: Error?
+            do {
+                try await HTTPClient().downloadFile(url: "https://media.invalid/hop.bin", destination: file, connections: 2)
+            } catch { failure = error }
+            let saved = try? Data(contentsOf: file)
+            let sources = Set(FixtureProtocol.requests().filter { $0.url.path.hasPrefix("/mirror-") }.map(\.url.path))
+            check(failure == nil && saved == FixtureProtocol.parallelBytes && sources == ["/mirror-a.bin"],
+                  "a parallel download reads one mirror: failure=\(String(describing: failure)), sources=\(sources.sorted()), intact=\(saved == FixtureProtocol.parallelBytes)")
+        case "hls-redirect-vod", "hls-redirect-live":
+            // The same redirector for one playlist URI: two ranges (VOD), or a whole read and
+            // then a range (live), must come from the mirror that answered first.
+            let file = AppPaths.appSupportDir.appendingPathComponent("hop.ts")
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            let live = mode == "hls-redirect-live"
+            var failure: Error?
+            do {
+                if live {
+                    _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/hop-live.m3u8", destination: file)
+                } else {
+                    _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/hop.m3u8", destination: file, connections: 2)
+                }
+            } catch { failure = error }
+            let saved = try? Data(contentsOf: file)
+            check(failure == nil && saved == Data((live ? "AAAAAA" : "AAAA").utf8),
+                  "every read of a redirected URI uses the first mirror: failure=\(String(describing: failure)), saved=\(String(decoding: saved ?? Data(), as: UTF8.self))")
+        case "parallel-cancel", "parallel-short", "parallel-intact", "parallel-unvalidated":
+            let file = AppPaths.appSupportDir.appendingPathComponent("result.bin")
+            var failure: Error?
+            do {
+                try await HTTPClient().downloadFile(url: "https://media.invalid/parallel.bin", destination: file, connections: 2)
+            } catch { failure = error }
+            let ranges = FixtureProtocol.requests().filter { $0.url.path == "/parallel.bin" && $0.range != "bytes=0-0" }.compactMap(\.range)
+            let saved = try? Data(contentsOf: file)
+            switch mode {
+            case "parallel-intact", "parallel-unvalidated": check(failure == nil && saved == FixtureProtocol.parallelBytes, "all source bytes are present")
+            case "parallel-cancel": check((failure as? URLError)?.code == .cancelled && saved == nil && !ranges.isEmpty && Set(ranges).count == ranges.count, "a cancelled range is not retried: \(ranges)")
+            default: check(failure != nil && saved == nil && !ranges.isEmpty, "a short range cannot publish a preallocated file")
+            }
+        case "hls-live-stable", "hls-live-changed", "hls-live-whole", "hls-live-whole-changed":
+            let file = AppPaths.appSupportDir.appendingPathComponent("live.ts")
+            // The CLI creates the output folder before a live recording starts.
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            var rejected = false
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/live-editions.m3u8", destination: file)
+            } catch HTTPError.rangeUnsupported { rejected = true }
+            let saved = try? Data(contentsOf: file)
+            switch mode {
+            case "hls-live-changed", "hls-live-whole-changed":
+                check(rejected && saved == nil, "a returning or ranged URI with new content stops the recording: saved=\(String(describing: saved))")
+            case "hls-live-whole":
+                // A whole read and a later range of the same unchanged URI form one edition.
+                check(saved == Data("AAAAAA".utf8), "a range after a whole read uses the same edition: \(String(decoding: saved ?? Data(), as: UTF8.self))")
+            default:
+                check(saved == Data("AAxxAA".utf8), "a returning untagged URI contributes the original bytes: \(String(decoding: saved ?? Data(), as: UTF8.self))")
+            }
+        case "hls-event-whole", "hls-event-ranged":
+            let file = AppPaths.appSupportDir.appendingPathComponent("event.ts")
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            let before = Self.peakFootprint()
+            _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/event.m3u8", destination: file)
+            let growth = Self.peakFootprint() - before
+            let saved = try Data(contentsOf: file, options: .alwaysMapped)
+            if mode == "hls-event-whole" {
+                // 64 whole 1 MiB segments: the recorder must not keep the recording in memory.
+                let intact = saved.count == 64 << 20 && saved[saved.count - 1] == 63
+                check(intact && growth < 32 << 20, "an EVENT recording keeps no copy of whole segments: \(saved.count) bytes saved, peak grew \(growth >> 20) MiB")
+            } else {
+                // 70 ranged 1 MiB objects exceed the 64 MiB copy budget, so the first object
+                // lost its copy; its later range must come from a new complete read that matches.
+                let full = FixtureProtocol.requests().filter { $0.url.path == "/ev-0.bin" && $0.range == nil }.count
+                let expected = (0..<70).reduce(into: Data()) { $0.append(Data(repeating: UInt8($1), count: 1024)) } + Data(repeating: 0, count: 1024)
+                check(saved == expected && full == 2, "an evicted copy is replaced by a matching complete read: \(saved.count) bytes, \(full) complete reads of the first object")
+            }
+        case "hls-event-oversized":
+            // One untagged object larger than the 64 MiB copy budget: after its first range the
+            // copy is released, and the later range comes from a new complete read that matches.
+            let file = AppPaths.appSupportDir.appendingPathComponent("event.ts")
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/event.m3u8", destination: file)
+            let saved = try Data(contentsOf: file)
+            let full = FixtureProtocol.requests().filter { $0.url.path == "/big.bin" && $0.range == nil }.count
+            check(saved == Data(repeating: 0x41, count: 1024) + Data(repeating: 0x5A, count: 1024) && full == 2,
+                  "a copy over the budget is not kept between playlist updates: \(saved.count) bytes, \(full) complete reads")
+        case "hls-changed-edition", "hls-untagged-edition":
+            let file = AppPaths.appSupportDir.appendingPathComponent("clip.ts")
+            var rejected = false
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/editions.m3u8", destination: file, connections: 2)
+            } catch HTTPError.rangeUnsupported { rejected = true }
+            let saved = try? Data(contentsOf: file)
+            check(mode == "hls-changed-edition" ? rejected && saved == nil : saved == Data("AAAA".utf8),
+                  "two playlist ranges must not publish bytes from different editions")
+        // Two whole reads of one URI in one selection give one edition: a changed object fails
+        // without a clip, and an unchanged object is saved twice.
+        case "hls-repeat-stable", "hls-repeat-changed", "hls-alias-stable", "hls-alias-changed":
+            let alias = mode.hasPrefix("hls-alias")
+            let file = AppPaths.appSupportDir.appendingPathComponent("repeat.ts")
+            var rejected = false
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/\(alias ? "alias" : "repeat").m3u8", destination: file, connections: 1)
+            } catch HTTPError.rangeUnsupported { rejected = true }
+            let saved = try? Data(contentsOf: file)
+            check(mode.hasSuffix("-changed") ? rejected && saved == nil : saved == Data(String(repeating: "AAAA", count: alias ? 4 : 2).utf8),
+                  "whole reads of one HTTP resource, also under other spellings, must not publish bytes from different editions; saved=\(saved.map { String(decoding: $0, as: UTF8.self) } ?? "none")")
+        // Spellings whose requests are identical on the wire read one resource: a VOD selection
+        // and a live recording both stop when its second read is a new edition.
+        case "hls-userinfo-changed", "hls-live-userinfo":
+            let live = mode == "hls-live-userinfo"
+            let file = AppPaths.appSupportDir.appendingPathComponent("alias.ts")
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            var rejected = false
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/\(live ? "live-alias" : "alias-userinfo").m3u8", destination: file, connections: 1)
+            } catch HTTPError.rangeUnsupported { rejected = true }
+            let saved = try? Data(contentsOf: file)
+            check(rejected && saved == nil, "empty user information names the same resource, so a changed second read stops without a clip; saved=\(saved.map { String(decoding: $0, as: UTF8.self) } ?? "none")")
+        // Request targets that differ only in the case of an escape are requested as written.
+        case "hls-raw-routes":
+            let file = AppPaths.appSupportDir.appendingPathComponent("routes.ts")
+            _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/routes.m3u8", destination: file, connections: 1)
+            let saved = try? Data(contentsOf: file)
+            let queries = FixtureProtocol.requests().filter { $0.url.path == "/route.ts" }.map { URLComponents(url: $0.url, resolvingAgainstBaseURL: false)?.percentEncodedQuery ?? "" }
+            check(saved == Data("AAAABBBB".utf8) && queries == ["object=ab%2fCD", "object=ab%2FCD"],
+                  "each playlist URI is requested as written; saved=\(saved.map { String(decoding: $0, as: UTF8.self) } ?? "none"), queries=\(queries)")
+        // Two spellings that the edition key joins can still be separate routes. Each spelling is
+        // requested, and spellings that give different bytes stop the download.
+        case "hls-dot-routes", "hls-dot-same", "hls-live-dot-routes", "hls-live-dot-tagged":
+            let file = AppPaths.appSupportDir.appendingPathComponent("dots.ts")
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            var rejected = false
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/\(mode.hasPrefix("hls-live-") ? "live-dots" : "dots").m3u8", destination: file, connections: 1)
+            } catch HTTPError.rangeUnsupported { rejected = true }
+            let saved = try? Data(contentsOf: file)
+            let targets = Set(FixtureProtocol.requests().map(\.url.path).filter { $0.hasSuffix("dots.ts") })
+            let outcome = ["hls-dot-same", "hls-live-dot-tagged"].contains(mode) ? !rejected && saved == Data("AAAA".utf8) : rejected && saved == nil
+            check(outcome && targets == ["/a/../dots.ts", "/dots.ts"],
+                  "a pinned copy serves only the spelling that it read; saved=\(saved.map { String(decoding: $0, as: UTF8.self) } ?? "none"), rejected=\(rejected), targets=\(targets.sorted())")
+        // A scoped and an unscoped loopback address send the same request, so they are one
+        // resource. Two Host forms of one address can be separate routes, so each is requested.
+        case "hls-v6-scope", "hls-live-v6-scope", "hls-v6-forms":
+            let file = AppPaths.appSupportDir.appendingPathComponent("v6.ts")
+            try FileManager.default.createDirectory(at: AppPaths.appSupportDir, withIntermediateDirectories: true)
+            var rejected = false
+            do {
+                _ = try await HLSEngine.downloadStream(client: HTTPClient(), playlistURL: "https://media.invalid/\(mode == "hls-live-v6-scope" ? "live-v6" : "v6").m3u8", destination: file, connections: 1)
+            } catch HTTPError.rangeUnsupported { rejected = true }
+            let saved = try? Data(contentsOf: file)
+            let hosts = Set(FixtureProtocol.requests().filter { $0.url.path == "/v6.ts" }.compactMap(\.url.host))
+            check(rejected && saved == nil && hosts.count == 2,
+                  "two spellings of one IPv6 address give one edition or no file; saved=\(saved.map { String(decoding: $0, as: UTF8.self) } ?? "none"), rejected=\(rejected), hosts=\(hosts.sorted())")
+        case "hls-short-range":
+            let folder = AppPaths.appSupportDir.appendingPathComponent("out")
+            var options = DownloadRequestOptions()
+            options.outputDir = folder.path
+            options.cookieSource = "none"
+            for path in ["short-map", "short-segment"] {
+                do {
+                    _ = try await DownloadEngine().downloadSingle(url: "https://media.invalid/\(path).m3u8", settings: Settings(), options: options)
+                    check(false, "an incomplete HLS range must not publish a clip")
+                } catch HTTPError.rangeUnsupported {}
+            }
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+            check(names.isEmpty, "a short segment or map leaves no media or temporary files: \(names)")
+        case "sidx-cut":
+            var settings = Settings()
+            settings.embedMetadata = false
+            settings.saveThumbnail = false
+            var options = DownloadRequestOptions()
+            let start = 4.0
+            options.connections = 1
+            options.cookieSource = "none"
+            let out = AppPaths.appSupportDir.appendingPathComponent("out")
+            options.outputDir = out.path
+            let scenarios: [(String, Double?)] = [("200", 10), ("206", 10), ("206", 61), ("unknown", 61), ("unknown", nil), ("later", 12), ("padding", 12), ("empty", 8), ("stale", 8), ("duration", 8)]
+            for (status, end) in scenarios {
+                options.section = SectionRange(start: start, end: end)
+                do {
+                    _ = try await DownloadEngine().downloadSingle(url: "https://media.invalid/cut-\(status).mp4", settings: settings, options: options)
+                    check(false, "a file cut between indexed fragments produced a clip")
+                } catch HTTPError.rangeUnsupported {}
+            }
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: out.path)) ?? []
+            check(files.isEmpty, "a short indexed file is not saved, including after a full download with an unknown initial size")
         case "hls-fallback", "hls-fallback-nowatch", "hls-fallback-watchlist", "hls-fallback-lateprofile":
             // The fallback uses an ordinary empty format list or a not-found direct format, never a
             // denial. Player data and a playlist can come from the watch page or a /player response.
@@ -1433,9 +2365,12 @@ struct RegressionChecks {
             }
             do { try await transfer("denied"); check(false, "DASH accepted a denied segment") }
             catch HTTPError.status(403, _) {}
-            let afterFailure = try FileManager.default.contentsOfDirectory(atPath: dir.path).filter { !$0.hasPrefix(".") }
+            let afterFailure = try FileManager.default.contentsOfDirectory(atPath: dir.path)
             let requests = FixtureProtocol.requests().filter { $0.url.host == "segments.invalid" }.map(\.url.path)
-            check(afterFailure.isEmpty && requests == ["/denied/clip.mpd", "/denied/piece-1.m4s", "/denied/piece-2.m4s"], "DASH stops at the denied segment without a final file: \(requests), \(afterFailure)")
+            check(afterFailure.isEmpty && requests == ["/denied/clip.mpd", "/denied/piece-1.m4s", "/denied/piece-2.m4s"], "DASH stops at the denied segment without leaving output: \(requests), \(afterFailure)")
+            try await transfer("allowed")
+            let bytes = try Data(contentsOf: file)
+            check(String(decoding: bytes, as: UTF8.self) == "/allowed/piece-1.m4s/allowed/piece-2.m4s/allowed/piece-3.m4s", "a later operation assembles only its own three segments")
         case "cli-flags":
             let unknown = await CLIRunner.run(arguments: ["ubit", "info", "--bogus", "value", "https://fixture.invalid/video"])
             let before = FixtureProtocol.requests().count

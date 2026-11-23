@@ -152,6 +152,9 @@ public struct MP4Track: Sendable {
     public var editMediaTimeTicks: Int64?
     /// Presented duration of the kept media, in this track's timescale.
     public var editSegmentTicks: UInt64?
+    /// Presented time before the first media, in this track's timescale: an `elst` empty
+    /// edit (media time -1), which FFmpeg writes for a track that starts later than another.
+    public var editDelayTicks: UInt64
 
     public init(
         trackID: UInt32,
@@ -164,7 +167,8 @@ public struct MP4Track: Sendable {
         samples: [MP4Sample],
         sourceURL: URL? = nil,
         editMediaTimeTicks: Int64? = nil,
-        editSegmentTicks: UInt64? = nil
+        editSegmentTicks: UInt64? = nil,
+        editDelayTicks: UInt64 = 0
     ) {
         self.trackID = trackID
         self.kind = kind
@@ -177,6 +181,7 @@ public struct MP4Track: Sendable {
         self.sourceURL = sourceURL
         self.editMediaTimeTicks = editMediaTimeTicks
         self.editSegmentTicks = editSegmentTicks
+        self.editDelayTicks = editDelayTicks
     }
 
     public var totalTicks: UInt64 {
@@ -187,24 +192,63 @@ public struct MP4Track: Sendable {
         Double(totalTicks) / Double(max(1, timescale))
     }
 
-    /// The interval a player presents, which excludes reference pictures that the
-    /// trim kept for decoding but hid with an edit list.
+    /// The interval a player presents: the empty edit, then the kept media without the
+    /// reference pictures that the trim kept for decoding but hid with an edit list.
     public var presentationDurationSeconds: Double {
-        if let editSegmentTicks { return Double(editSegmentTicks) / Double(max(1, timescale)) }
-        return durationSeconds
+        Double(editDelayTicks + (editSegmentTicks ?? totalTicks)) / Double(max(1, timescale))
+    }
+
+    /// The value to add to a media composition time to get its presentation time.
+    var presentationOffsetTicks: Int64 {
+        let (offset, overflow) = Int64(clamping: editDelayTicks).subtractingReportingOverflow(editMediaTimeTicks ?? 0)
+        return overflow ? .min : offset
+    }
+
+    /// The end of the presented interval when an edit sets one.
+    var presentedEndTicks: Int64? {
+        editSegmentTicks.map { Int64(clamping: editDelayTicks).addingReportingOverflow(Int64(clamping: $0)) }
+            .map { $0.overflow ? .max : $0.partialValue }
+    }
+
+    /// The first presented time of the samples when the first one decodes at `decodeStart`,
+    /// after the edit list. An edit hides media before its media time, so presentation
+    /// cannot start before the empty edit ends.
+    func earliestPresentedTicks(decodeStart: Int64 = 0) -> Int64? {
+        var dts = decodeStart, earliest: Int64?
+        for sample in samples {
+            let (pts, overflow) = dts.addingReportingOverflow(Int64(sample.ctsOffset))
+            guard !overflow else { return nil }
+            earliest = min(earliest ?? pts, pts)
+            let (next, endOverflow) = dts.addingReportingOverflow(Int64(sample.duration))
+            guard !endOverflow else { return nil }
+            dts = next
+        }
+        guard let earliest else { return nil }
+        let (shown, overflow) = earliest.addingReportingOverflow(presentationOffsetTicks)
+        guard !overflow else { return nil }
+        return editMediaTimeTicks == nil ? shown : max(Int64(clamping: editDelayTicks), shown)
     }
 }
 
-/// A section start kept in exact media ticks (the fragment start from a `sidx`),
-/// so a decimal section boundary never has to round it through `Double`.
-public struct SectionTimeBase: Sendable, Equatable {
-    public var ticks: UInt64
-    public var timescale: UInt32
+/// A time kept as exact ticks of its own timescale. A section boundary can use it
+/// without rounding a decode start or a presentation start through `Double`.
+public struct SectionTimeBase: Sendable, Equatable, Comparable {
+    public let ticks: Int64
+    public let timescale: UInt32
 
-    public init(ticks: UInt64, timescale: UInt32) {
+    public init(ticks: Int64, timescale: UInt32) {
         self.ticks = ticks
         self.timescale = max(1, timescale)
     }
+
+    public static func < (a: SectionTimeBase, b: SectionTimeBase) -> Bool {
+        let left = a.ticks.multipliedFullWidth(by: Int64(b.timescale))
+        let right = b.ticks.multipliedFullWidth(by: Int64(a.timescale))
+        return (left.high, left.low) < (right.high, right.low)
+    }
+
+    /// Two spellings of one time, such as 1/2 and 2/4, are equal.
+    public static func == (a: SectionTimeBase, b: SectionTimeBase) -> Bool { !(a < b) && !(b < a) }
 }
 
 public struct MP4Metadata: Sendable {
@@ -319,6 +363,63 @@ public enum MP4Muxer {
         }
         guard !times.isEmpty else { throw HTTPError.rangeUnsupported }
         return times
+    }
+
+    /// The decode start of each track in fragmented media, as exact times. Sample times
+    /// in tracks read from that media count from these starts.
+    static func decodeStarts(in media: Data, tracks: [MP4Track]) throws -> [UInt32: SectionTimeBase] {
+        var starts: [UInt32: SectionTimeBase] = [:]
+        for (id, ticks) in try firstDecodeTimes(in: media) {
+            guard let track = tracks.first(where: { $0.trackID == id }) else { continue }
+            guard let value = Int64(exactly: ticks) else { throw HTTPError.rangeUnsupported }
+            starts[id] = SectionTimeBase(ticks: value, timescale: track.timescale)
+        }
+        return starts
+    }
+
+    /// The first presented time of a fragmented media segment over all its tracks, as FFmpeg
+    /// reports `start_time`: each track's decode start plus its earliest composition time,
+    /// moved by the edit list of the initialization data.
+    static func presentationStart(of segment: Data, initialization: Data) throws -> SectionTimeBase {
+        guard let moov = listBoxes(in: initialization, from: 0, to: initialization.count).first(where: { $0.type == "moov" }) else {
+            throw HTTPError.rangeUnsupported
+        }
+        // The samples are only timed here, never read, so no file holds them.
+        let context = try fragmentContext(initialization, moov: moov, fileURL: URL(fileURLWithPath: "/dev/null"))
+        var tracks = context.tracks
+        for id in tracks.keys { tracks[id]?.samples.removeAll() }
+        for moof in listBoxes(in: segment, from: 0, to: segment.count) where moof.type == "moof" {
+            parseMoof(data: segment, moof: moof, trexDefaults: context.defaults, sourceIndex: 0, tracks: &tracks)
+        }
+        let parsed = Array(tracks.values)
+        return try presentationStart(of: parsed, starts: decodeStarts(in: segment, tracks: parsed))
+    }
+
+    /// The first presented time over `tracks`, whose first samples decode at `starts`.
+    static func presentationStart(of tracks: [MP4Track], starts: [UInt32: SectionTimeBase]) throws -> SectionTimeBase {
+        var first: SectionTimeBase?
+        for track in tracks {
+            guard let start = starts[track.trackID] else { continue }
+            let time: SectionTimeBase
+            if start.timescale == track.timescale {
+                guard let ticks = track.earliestPresentedTicks(decodeStart: start.ticks) else { continue }
+                time = SectionTimeBase(ticks: ticks, timescale: start.timescale)
+            } else {
+                // Add the start and the track's own presented offset on a shared clock.
+                guard let local = track.earliestPresentedTicks() else { continue }
+                var a = start.timescale, b = track.timescale
+                while b != 0 { (a, b) = (b, a % b) }
+                let (scale, o1) = (start.timescale / a).multipliedReportingOverflow(by: track.timescale)
+                let (left, o2) = start.ticks.multipliedReportingOverflow(by: Int64(scale / start.timescale))
+                let (right, o3) = local.multipliedReportingOverflow(by: Int64(scale / track.timescale))
+                let (ticks, o4) = left.addingReportingOverflow(right)
+                guard !o1, !o2, !o3, !o4 else { throw HTTPError.rangeUnsupported }
+                time = SectionTimeBase(ticks: ticks, timescale: scale)
+            }
+            first = min(first ?? time, time)
+        }
+        guard let first else { throw HTTPError.rangeUnsupported }
+        return first
     }
 
     /// Parses `sidx` (Segment Index box) from the header bytes of a DASH/YouTube stream
@@ -509,6 +610,14 @@ public enum MP4Muxer {
         return result.quotient < .max && result.remainder * 2 >= divisor ? result.quotient + 1 : result.quotient
     }
 
+    /// The empty edit, the media edit and their sum, in movie ticks.
+    private static func presentedMovieTicks(_ track: MP4Track, movieTimescale: UInt32) -> (delay: UInt64, segment: UInt64, total: UInt64) {
+        let delay = rescale(track.editDelayTicks, from: track.timescale, to: movieTimescale)
+        let segment = rescale(track.editSegmentTicks ?? track.totalTicks, from: track.timescale, to: movieTimescale)
+        let (total, overflow) = delay.addingReportingOverflow(segment)
+        return (delay, segment, overflow ? .max : total)
+    }
+
     /// Reads all video and audio tracks from either a standard MP4/M4A or a fragmented fMP4 file.
     public static func readTracks(from fileURL: URL, sourceIndex: Int = 0) throws -> [MP4Track] {
         let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
@@ -646,22 +755,31 @@ public enum MP4Muxer {
 
         // An edit maps a visible interval onto raw media timestamps. Keep both
         // coordinates; decode-only pictures still belong in the sample table.
-        var editStart: Int64?, editDuration: UInt64?
+        // One empty edit (media time -1) may come first: it delays the track.
+        var editStart: Int64?, editDuration: UInt64?, editDelay: UInt64 = 0
         if let edts = children.first(where: { $0.type == "edts" }),
            let edit = listBoxes(in: data, from: edts.payloadOffset, to: edts.endOffset).first(where: { $0.type == "elst" }) {
             let p = edit.payloadOffset
             let unsupported = NSError(domain: "MP4Muxer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Unsupported MP4 edit list"])
             guard edit.payloadSize >= 8 else { throw unsupported }
-            let count = data.beU32(p + 4)
+            let count = Int(data.beU32(p + 4))
             if count != 0 {
                 let version = data[p], wide = version == 1
-                guard count == 1, version <= 1, edit.payloadSize >= (wide ? 28 : 20),
-                      data.beU32(p + (wide ? 24 : 16)) == 0x0001_0000, movieTimescale > 0 else { throw unsupported }
-                let start = wide ? Int64(bitPattern: data.beU64(p + 16)) : Int64(data.beI32(p + 12))
-                guard start >= 0 else { throw unsupported }
-                editStart = start
-                let duration = wide ? data.beU64(p + 8) : UInt64(data.beU32(p + 8))
-                if duration != 0 { editDuration = rescale(duration, from: movieTimescale, to: timescale) }
+                let entrySize = wide ? 20 : 12
+                guard count <= 2, version <= 1, edit.payloadSize >= 8 + count * entrySize, movieTimescale > 0 else { throw unsupported }
+                func entry(_ i: Int) -> (duration: UInt64, start: Int64)? {
+                    let e = p + 8 + i * entrySize
+                    guard data.beU32(e + entrySize - 4) == 0x0001_0000 else { return nil }
+                    return wide ? (data.beU64(e), Int64(bitPattern: data.beU64(e + 8)))
+                        : (UInt64(data.beU32(e)), Int64(data.beI32(e + 4)))
+                }
+                guard let media = entry(count - 1), media.start >= 0 else { throw unsupported }
+                if count == 2 {
+                    guard let empty = entry(0), empty.start == -1 else { throw unsupported }
+                    editDelay = rescale(empty.duration, from: movieTimescale, to: timescale)
+                }
+                editStart = media.start
+                if media.duration != 0 { editDuration = rescale(media.duration, from: movieTimescale, to: timescale) }
             }
         }
         let samples = parseStblSamples(data: data, stblBoxes: stblBoxes, sourceIndex: sourceIndex)
@@ -674,7 +792,7 @@ public enum MP4Muxer {
             languageISO639_2: lang,
             stsdPayload: stsdPayload,
             samples: samples,
-            sourceURL: sourceURL, editMediaTimeTicks: editStart, editSegmentTicks: editDuration
+            sourceURL: sourceURL, editMediaTimeTicks: editStart, editSegmentTicks: editDuration, editDelayTicks: editDelay
         )
     }
 
@@ -925,8 +1043,10 @@ public enum MP4Muxer {
     /// video start as a ratio until it is converted to the audio track's ticks.
     public final class SectionClock {
         fileprivate var start: (ticks: Decimal, scale: Decimal)?
+        fileprivate var zero = Decimal(0)
+        /// The section time of the video start, for choosing the sound to fetch.
         var fetchStart: Double? {
-            start.map { max(0, NSDecimalNumber(decimal: $0.ticks / $0.scale).doubleValue.nextDown) }
+            start.map { max(0, NSDecimalNumber(decimal: $0.ticks / $0.scale - zero).doubleValue.nextDown) }
         }
     }
 
@@ -936,13 +1056,16 @@ public enum MP4Muxer {
     ///
     /// `baseStart` carries a `sidx` fragment start as exact ticks. The same start
     /// passed as `baseStartTimeSec` is rounded through `Double`, which can move the
-    /// exclusive end across a sample boundary.
+    /// exclusive end across a sample boundary. `trackStarts` gives the stream time where
+    /// a track's first sample decodes, and `zero` the stream time where the section
+    /// time 0 is (the first presented time of the stream); both are in one stream clock.
     public static func trimTracks(
         _ tracks: [MP4Track],
         section: SectionRange,
         baseStartTimeSec: Double = 0,
         baseStart: SectionTimeBase? = nil,
-        trackStartTicks: [UInt32: UInt64] = [:],
+        trackStarts: [UInt32: SectionTimeBase] = [:],
+        zero: SectionTimeBase? = nil,
         clock: SectionClock? = nil
     ) -> [MP4Track] {
         // Section and playlist times are decimal seconds. Compare them as decimals
@@ -954,18 +1077,23 @@ public enum MP4Muxer {
         let startBoundary = decimal(section.start ?? 0)
         let endBoundary = section.end.map(decimal)
         let legacyBase = baseStart == nil && baseStartTimeSec != 0 ? decimal(baseStartTimeSec) : nil
+        let zeroTicks = Decimal(zero?.ticks ?? 0), zeroScale = Decimal(zero?.timescale ?? 1)
+        if let clock, zero != nil { clock.zero = zeroTicks / zeroScale }
 
         // Round each boundary once per track. Integer comparisons in the sample loop
         // keep the requested end exclusive, including for rates such as 30 fps.
         func base(of track: MP4Track) -> SectionTimeBase? {
-            trackStartTicks[track.trackID].map { SectionTimeBase(ticks: $0, timescale: track.timescale) } ?? baseStart
+            trackStarts[track.trackID] ?? baseStart
         }
         func boundaryTicks(_ boundary: Decimal, _ track: MP4Track, _ rounding: Decimal.RoundingMode) -> Int64 {
             let scale = track.timescale
             var ticks: Decimal
             if let baseStart = base(of: track) {
-                ticks = (boundary * Decimal(baseStart.timescale) - Decimal(baseStart.ticks))
-                    * Decimal(scale) / Decimal(baseStart.timescale)
+                // (boundary + zero - base) in track ticks, divided once so that an exact
+                // integer result stays exact.
+                let baseScale = Decimal(baseStart.timescale)
+                ticks = (boundary * baseScale * zeroScale + zeroTicks * baseScale - Decimal(baseStart.ticks) * zeroScale)
+                    * Decimal(scale) / (baseScale * zeroScale)
             } else {
                 ticks = (boundary - (legacyBase ?? 0)) * Decimal(scale)
             }
@@ -977,7 +1105,7 @@ public enum MP4Muxer {
         }
 
         func presentedTime(_ raw: Int64, on track: MP4Track) -> Int64 {
-            let (result, overflow) = raw.subtractingReportingOverflow(track.editMediaTimeTicks ?? 0)
+            let (result, overflow) = raw.addingReportingOverflow(track.presentationOffsetTicks)
             return overflow ? .min : result
         }
 
@@ -992,7 +1120,7 @@ public enum MP4Muxer {
                 if sample.isSync && pts <= start { chosen = max(chosen ?? pts, pts) }
                 dts += Int64(sample.duration)
             }
-            if let duration = video.editSegmentTicks { lastEnd = min(lastEnd, Int64(clamping: duration)) }
+            if let end = video.presentedEndTicks { lastEnd = min(lastEnd, end) }
             if lastEnd > start {
                 let origin = base(of: video)
                 let scale = Decimal(origin?.timescale ?? 1)
@@ -1016,7 +1144,7 @@ public enum MP4Muxer {
             } else {
                 start = boundaryTicks(startBoundary, track, .down)
             }
-            let visibleEnd = track.editSegmentTicks.map { Int64(clamping: $0) } ?? Int64.max
+            let visibleEnd = track.presentedEndTicks ?? Int64.max
             let end = min(visibleEnd, endBoundary.map { boundaryTicks($0, track, .up) } ?? Int64.max)
             guard end > start else { return nil }
             // A video picture is displayed until the next presentation time. In a variable-rate
@@ -1048,7 +1176,7 @@ public enum MP4Muxer {
                         first = track.kind == .video ? syncIndex : i
                         mediaOrigin = track.kind == .video ? syncDTS : dts
                     }
-                    shownStart = min(shownStart, track.editMediaTimeTicks == nil ? pts : max(0, pts))
+                    shownStart = min(shownStart, track.editMediaTimeTicks == nil ? pts : max(Int64(clamping: track.editDelayTicks), pts))
                     shownEnd = max(shownEnd, min(visibleEnd, next))
                     last = i
                 }
@@ -1070,13 +1198,27 @@ public enum MP4Muxer {
                 hiddenEnd = max(hiddenEnd, pts + Int64(sample.duration))
                 dts += Int64(sample.duration)
             }
-            let mediaStart = shownStart - mediaOrigin + (track.editMediaTimeTicks ?? 0)
-            if mediaStart > 0 || firstPTS < shownStart || hiddenEnd > shownEnd {
+            // The clip starts at `start` in every track. A track whose first shown media comes
+            // later (the source had an empty edit) keeps that gap as an empty edit.
+            let delay = max(0, shownStart - start)
+            var mediaStart = shownStart - track.presentationOffsetTicks - mediaOrigin
+            if mediaStart < 0, let shift = Int32(exactly: -mediaStart) {
+                // An edit cannot start before media time 0. Negative composition offsets
+                // (`ctts` version 1) can put the first shown picture there, so every composition
+                // time of the clip moves later by the same amount. The decode order stays.
+                for i in copy.samples.indices {
+                    copy.samples[i].ctsOffset = Int32(clamping: Int64(copy.samples[i].ctsOffset) + Int64(shift))
+                }
+                mediaStart = 0
+            }
+            if mediaStart > 0 || firstPTS < shownStart || hiddenEnd > shownEnd || delay > 0 {
                 copy.editMediaTimeTicks = mediaStart
                 copy.editSegmentTicks = UInt64(shownEnd - shownStart)
+                copy.editDelayTicks = UInt64(delay)
             } else {
                 copy.editMediaTimeTicks = nil
                 copy.editSegmentTicks = nil
+                copy.editDelayTicks = 0
             }
             return copy
         }
@@ -1085,25 +1227,38 @@ public enum MP4Muxer {
     public static func removeIntervals(_ tracks: [MP4Track], intervals: [(start: Double, end: Double)]) -> [MP4Track] {
         guard !intervals.isEmpty else { return tracks }
         return tracks.map { track in
+            // An edit hides media before its media time and shows its segment after it.
+            // Each removed sample shortens the part of the decode timeline that it was in.
+            let hiddenEnd = UInt64(max(0, track.editMediaTimeTicks ?? 0))
+            let (sum, overflow) = hiddenEnd.addingReportingOverflow(track.editSegmentTicks ?? .max)
+            let shownEnd = overflow ? UInt64.max : sum
+            func overlap(_ start: UInt64, _ end: UInt64, _ low: UInt64, _ high: UInt64) -> UInt64 {
+                let a = max(start, low), b = min(end, high)
+                return a < b ? b - a : 0
+            }
             var kept: [MP4Sample] = []
             var accTicks: UInt64 = 0
+            var hiddenRemoved: UInt64 = 0, shownRemoved: UInt64 = 0
             var dropUntilNextSync = false
             for s in track.samples {
+                let start = accTicks
                 let sec = Double(accTicks) / Double(track.timescale)
                 accTicks += UInt64(s.duration)
                 let inCut = intervals.contains { sec >= $0.start && sec < $0.end }
-                if inCut {
-                    if track.kind == .video { dropUntilNextSync = true }
+                if inCut && track.kind == .video { dropUntilNextSync = true }
+                if !inCut && dropUntilNextSync && s.isSync { dropUntilNextSync = false }
+                if inCut || dropUntilNextSync {
+                    hiddenRemoved += overlap(start, accTicks, 0, hiddenEnd)
+                    shownRemoved += overlap(start, accTicks, hiddenEnd, shownEnd)
                     continue
-                }
-                if dropUntilNextSync {
-                    if s.isSync { dropUntilNextSync = false }
-                    else { continue }
                 }
                 kept.append(s)
             }
             var copy = track
-            if !kept.isEmpty { copy.samples = kept }
+            guard !kept.isEmpty else { return copy }
+            copy.samples = kept
+            if let mediaTime = track.editMediaTimeTicks { copy.editMediaTimeTicks = mediaTime - Int64(hiddenRemoved) }
+            if let segment = track.editSegmentTicks { copy.editSegmentTicks = segment - shownRemoved }
             return copy
         }
     }
@@ -1277,11 +1432,12 @@ public enum MP4Muxer {
             return x
         }
         for t in tracks {
-            guard let duration = t.editSegmentTicks else { continue }
-            let denominator = t.timescale / gcd(t.timescale, UInt32(duration % UInt64(t.timescale)))
-            let (clock, overflow) = (movieTimescale / gcd(movieTimescale, denominator)).multipliedReportingOverflow(by: denominator)
-            guard !overflow else { throw NSError(domain: "MP4Muxer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Track edit durations cannot share an exact movie timescale"]) }
-            movieTimescale = clock
+            for duration in [t.editSegmentTicks, t.editDelayTicks > 0 ? t.editDelayTicks : nil].compactMap({ $0 }) {
+                let denominator = t.timescale / gcd(t.timescale, UInt32(duration % UInt64(t.timescale)))
+                let (clock, overflow) = (movieTimescale / gcd(movieTimescale, denominator)).multipliedReportingOverflow(by: denominator)
+                guard !overflow else { throw NSError(domain: "MP4Muxer", code: 1, userInfo: [NSLocalizedDescriptionKey: "Track edit durations cannot share an exact movie timescale"]) }
+                movieTimescale = clock
+            }
         }
         if movieTimescale < 1000 { movieTimescale *= (999 / movieTimescale + 1) }
 
@@ -1356,7 +1512,7 @@ public enum MP4Muxer {
         chapterTrackID: UInt32?
     ) -> Data {
         let movieDurTicks = tracks.reduce(UInt64(0)) { duration, track in
-            max(duration, rescale(track.editSegmentTicks ?? track.totalTicks, from: track.timescale, to: movieTimescale))
+            max(duration, presentedMovieTicks(track, movieTimescale: movieTimescale).total)
         }
         let wide = movieDurTicks > UInt32.max
 
@@ -1398,7 +1554,7 @@ public enum MP4Muxer {
         chapterTrackID: UInt32?
     ) {
         let mediaDuration = track.totalTicks
-        let trackDurMovie = rescale(track.editSegmentTicks ?? mediaDuration, from: track.timescale, to: movieTimescale)
+        let (delayMovie, segmentMovie, trackDurMovie) = presentedMovieTicks(track, movieTimescale: movieTimescale)
         let wideTrack = trackDurMovie > UInt32.max
         let isChapter = (track.kind == .text && chapterTrackID == track.trackID)
         // tkhd flags: enabled=1, in_movie=2, in_preview=4 -> 3 (disabled for hidden chapter reference track)
@@ -1427,23 +1583,27 @@ public enum MP4Muxer {
                 }
             }
 
-            // Edit list: present only the trim's displayed interval, so reference
-            // pictures kept for decoding do not appear as extra frames.
-            if let mediaTime = track.editMediaTimeTicks, let segmentTicks = track.editSegmentTicks,
-               mediaTime >= 0, segmentTicks > 0 {
-                let movieDuration = trackDurMovie
-                let useVersion1 = movieDuration > UInt64(UInt32.max) || mediaTime > Int64(Int32.max)
+            // Edit list: an empty edit for a track that starts late, then the kept media
+            // without the reference pictures that the trim kept only for decoding.
+            let mediaTime = track.editMediaTimeTicks ?? 0
+            if (track.editMediaTimeTicks != nil || delayMovie > 0) && mediaTime >= 0 && segmentMovie > 0 {
+                let useVersion1 = trackDurMovie > UInt64(UInt32.max) || mediaTime > Int64(Int32.max)
                 tr.box("edts") { edts in
                     edts.fullBox("elst", version: useVersion1 ? 1 : 0, flags: 0) { b in
-                        b.u32(1) // entry_count
-                        if useVersion1 {
-                            b.u64(movieDuration)
-                            b.u64(UInt64(mediaTime))
-                        } else {
-                            b.u32(UInt32(movieDuration))
-                            b.i32(Int32(mediaTime))
+                        var entries: [(duration: UInt64, start: Int64)] = []
+                        if delayMovie > 0 { entries.append((delayMovie, -1)) }
+                        entries.append((segmentMovie, mediaTime))
+                        b.u32(UInt32(entries.count)) // entry_count
+                        for entry in entries {
+                            if useVersion1 {
+                                b.u64(entry.duration)
+                                b.u64(UInt64(bitPattern: entry.start))
+                            } else {
+                                b.u32(UInt32(entry.duration))
+                                b.i32(Int32(entry.start))
+                            }
+                            b.u32(0x0001_0000) // media_rate 1.0
                         }
-                        b.u32(0x0001_0000) // media_rate 1.0
                     }
                 }
             }

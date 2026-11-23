@@ -12,6 +12,9 @@ public struct HLSVals {
         public var keyURL: String?
         public var iv: Data?
         public var mediaSequence: UInt64
+        /// The number of `#EXT-X-DISCONTINUITY` tags before this segment. Media times
+        /// of two segments compare only when this number is the same.
+        public var discontinuity: Int
     }
 
     public struct MediaPlaylist: Sendable {
@@ -241,6 +244,7 @@ public enum HLSEngine {
         var curKeyURL: String?
         var curIV: Data?
         var mediaSeq: UInt64 = 0
+        var discontinuities = 0
         var targetDur: Double = 4.0
 
         for line in lines {
@@ -272,6 +276,8 @@ public enum HLSEngine {
                 }
             } else if line.hasPrefix("#EXT-X-BYTERANGE:") {
                 curRange = parseByteRange(String(line.dropFirst("#EXT-X-BYTERANGE:".count)), prevEnd: &prevRangeEnd)
+            } else if line == "#EXT-X-DISCONTINUITY" {
+                discontinuities += 1
             } else if line.hasPrefix("#EXTINF:") {
                 let body = line.dropFirst("#EXTINF:".count)
                 let comma = body.firstIndex(of: ",") ?? body.endIndex
@@ -285,7 +291,8 @@ public enum HLSEngine {
                     byteRange: curRange,
                     keyURL: curKeyURL,
                     iv: curIV,
-                    mediaSequence: segSeq
+                    mediaSequence: segSeq,
+                    discontinuity: discontinuities
                 ))
                 curDur = 0
                 curRange = nil
@@ -303,7 +310,7 @@ public enum HLSEngine {
 
     /// Multiple playlist entries for one URI must read one edition of the object: the same
     /// strong ETag from the same answering URL, or one complete copy.
-    private enum RangeSource: Sendable {
+    fileprivate enum RangeSource: Sendable {
         case tagged(HTTPClient.Edition)
         case snapshot(Data)
 
@@ -346,6 +353,51 @@ public enum HLSEngine {
                 seen[key] = (edition, digest)
             }
         }
+
+        /// What an earlier rendition used to prove one edition of this resource.
+        fileprivate func evidence(_ key: String) -> (edition: HTTPClient.Edition?, digest: SHA256.Digest?)? {
+            seen[key]
+        }
+    }
+
+    // A resource that an earlier rendition proved by its ETag must give that ETag again.
+    // Otherwise, several spellings must give the same complete copy.
+    private static func pin(_ key: String, urls: [String], sources: inout [String: RangeSource],
+                            client: HTTPClient, headers: [String: String]?, renditions: RenditionEditions?) async throws {
+        guard urls.contains(where: { sources[$0] == nil }) else { return }
+        let earlier = await renditions?.evidence(key)
+        let tagged = earlier.map { $0.edition != nil } ?? (urls.count == 1)
+        var first: SHA256.Digest?
+        for url in urls {
+            let source: RangeSource
+            if let saved = sources[url] {
+                if renditions != nil { continue } // This source already supplied its evidence.
+                source = saved
+            } else if tagged {
+                source = try await RangeSource.open(url, client: client, headers: headers)
+            } else {
+                source = .snapshot(try await RangeSource.snapshotOf(url, client: client, headers: headers))
+            }
+            if let renditions {
+                try await source.observe(in: renditions, key: key)
+            } else if urls.count > 1, case .snapshot(let copy) = source {
+                let digest = SHA256.hash(data: copy)
+                if let first, digest != first { throw HTTPError.rangeUnsupported }
+                first = digest
+            }
+            sources[url] = source
+        }
+    }
+
+    /// The playlist and bytes that supplied the clock for a paired rendition.
+    public struct SectionOrigin: Sendable {
+        fileprivate let playlist: HLSVals.MediaPlaylist
+        fileprivate let finalURL: URL
+        fileprivate var initialization: Data?
+        fileprivate var first: Data?
+        fileprivate var key: Data?
+        fileprivate var sources: [String: RangeSource] = [:]
+        var zero: SectionTimeBase?
     }
 
     private static func fetchPart(_ url: String, range: ByteRange?, client: HTTPClient, headers: [String: String]?, source: RangeSource? = nil, renditions: RenditionEditions? = nil) async throws -> Data {
@@ -439,12 +491,18 @@ public enum HLSEngine {
         section: SectionRange? = nil,
         connections: Int = 8,
         renditions: RenditionEditions? = nil,
-        separateTracks: Bool = false,
+        findZero: Bool = true,
+        prepared: SectionOrigin? = nil,
         shouldStopLive: (@Sendable () -> Bool)? = nil,
         onProgress: (@Sendable (_ downloaded: Int64, _ estTotal: Int64, _ fraction: Double, _ recordedSec: Double) -> Void)? = nil
-    ) async throws -> (isFMP4: Bool, duration: Double, startTime: Double, trackStartTicks: [UInt32: UInt64]) {
-        let (text, finalURL) = try await client.fetchText(url: playlistURL, headers: headers)
-        let pl = parseMediaPlaylist(text, baseURL: finalURL)
+    ) async throws -> (isFMP4: Bool, duration: Double, startTime: Double, zero: SectionTimeBase?) {
+        let pl: HLSVals.MediaPlaylist, finalURL: URL
+        if let prepared {
+            (pl, finalURL) = (prepared.playlist, prepared.finalURL)
+        } else {
+            let (text, url) = try await client.fetchText(url: playlistURL, headers: headers)
+            (pl, finalURL) = (parseMediaPlaylist(text, baseURL: url), url)
+        }
 
         if pl.isLive && section == nil {
             let (isFMP4, recorded) = try await recordLiveStream(
@@ -457,7 +515,7 @@ public enum HLSEngine {
                 shouldStop: shouldStopLive,
                 onProgress: onProgress
             )
-            return (isFMP4, recorded, 0, [:])
+            return (isFMP4, recorded, 0, nil)
         }
 
         // Filter segments if section range was requested. The demuxers start the saved timeline
@@ -481,12 +539,16 @@ public enum HLSEngine {
                 if filtered.isEmpty {
                     var base = segStart
                     // Keep the previous segment for keyframe preroll at an exact boundary,
-                    // but only after finding a segment with media inside the section.
-                    if segStart == start, index > 0 {
-                        filtered.append(pl.segments[index - 1])
-                        base = previousStart
-                    } else if index > 0, pl.initURL != nil {
-                        preceding = (pl.segments[index - 1], Double(previousStart.description)!)
+                    // but only after finding a segment with media inside the section. A
+                    // segment after a discontinuity has its own clock, so it gets no preroll.
+                    let previous = index > 0 ? pl.segments[index - 1] : nil
+                    if let previous, previous.discontinuity == seg.discontinuity {
+                        if segStart == start {
+                            filtered.append(previous)
+                            base = previousStart
+                        } else if pl.initURL != nil {
+                            preceding = (previous, Double(previousStart.description)!)
+                        }
                     }
                     startTime = Double(base.description)!
                 }
@@ -535,69 +597,73 @@ public enum HLSEngine {
             if spellings[key]?.contains(url) != true { spellings[key, default: []].append(url) }
             if isRanged { ranged.insert(key) }
         }
-        // If an extra clock or preroll read shares the init URI, its edition must be
-        // pinned before reading the init, not after inspecting the track layout.
-        let origin = pl.initURL != nil && selected.first?.index != 0 ? pl.segments.first : nil
+        // Section times count from the first presented time of the stream, which the first
+        // segment gives. That time compares with the selection only on the same timeline.
+        let origin = findZero && section != nil && selected.first?.index != 0
+            && pl.segments.first?.discontinuity == selected.first?.discontinuity ? pl.segments.first : nil
         let initKey = pl.initURL.map(resourceKey)
-        if let url = pl.initURL {
-            note(url, ranged: pl.initByteRange != nil)
-            for seg in [origin, preceding?.segment].compactMap({ $0 }) where resourceKey(seg.url) == initKey {
-                note(seg.url, ranged: seg.byteRange != nil)
-            }
+        // An origin stored in the init's resource close to the init is read with the init in
+        // one response, so that the two reads need no pinned edition.
+        var joined: ByteRange?
+        if let origin, let initRange = pl.initByteRange, let range = origin.byteRange, origin.url == pl.initURL {
+            let start = min(initRange.start, range.start), end = max(initRange.end, range.end)
+            let gap = max(initRange.start, range.start) - min(initRange.end, range.end)
+            if gap <= 65_537 { joined = ByteRange(start: start, end: end) }
         }
+        if let url = pl.initURL { note(url, ranged: pl.initByteRange != nil) }
+        if let origin, joined == nil { note(origin.url, ranged: origin.byteRange != nil) }
         for seg in selected { note(seg.url, ranged: seg.byteRange != nil) }
         // A range used only once here may occur again in the other rendition.
         func pinnedKeys() -> Set<String> { renditions == nil ? repeated.intersection(ranged) : ranged }
-        var sources: [String: RangeSource] = [:]
-        // One spelling keeps a strong ETag or a complete copy. Several spellings each give a
-        // complete copy, and all copies must be the same bytes.
-        func pin(_ key: String) async throws {
-            let urls = spellings[key] ?? []
-            if urls.count == 1 {
-                let source = try await RangeSource.open(urls[0], client: client, headers: headers)
-                if let renditions { try await source.observe(in: renditions, key: key) }
-                sources[urls[0]] = source
-                return
-            }
-            var first: SHA256.Digest?
-            for url in urls {
-                let copy = try await RangeSource.snapshotOf(url, client: client, headers: headers)
-                let digest = SHA256.hash(data: copy)
-                if let first, digest != first { throw HTTPError.rangeUnsupported }
-                first = digest
-                try await renditions?.observe(key, digest: digest)
-                sources[url] = .snapshot(copy)
-            }
+        var sources = prepared?.sources ?? [:]
+        func pinSelection(_ key: String) async throws {
+            try await pin(key, urls: spellings[key] ?? [], sources: &sources,
+                          client: client, headers: headers, renditions: renditions)
         }
-        var initData: Data?
-        if let initU = pl.initURL {
-            let key = resourceKey(initU)
-            if pinnedKeys().contains(key) { try await pin(key) }
-            let data = try await fetchPart(initU, range: pl.initByteRange, client: client, headers: headers, source: sources[initU], renditions: renditions)
-            initData = data
+        func readInit(_ url: String) async throws -> (initial: Data, origin: Data?) {
+            guard let joined, let initRange = pl.initByteRange, let range = origin?.byteRange else {
+                return (try await fetchPart(url, range: pl.initByteRange, client: client, headers: headers, source: sources[url], renditions: renditions), nil)
+            }
+            let both = try await fetchPart(url, range: joined, client: client, headers: headers, source: sources[url], renditions: renditions)
+            func slice(_ part: ByteRange) -> Data { both.subdata(in: Int(part.start - joined.start)..<Int(part.end - joined.start + 1)) }
+            return (slice(initRange), slice(range))
+        }
+        var initData: Data?, originData: Data?
+        if let prepared, prepared.first != nil {
+            initData = prepared.initialization
+        } else if let initU = pl.initURL {
+            if let initKey, pinnedKeys().contains(initKey) { try await pinSelection(initKey) }
+            (initData, originData) = try await readInit(initU)
+        }
+        // Muxed media keeps the previous segment, so that the sound before the first picture
+        // of the selection is there.
+        if let initData, let preceding, MP4Muxer.hasPictureAndSound(initData) {
+            selected.insert(preceding.segment, at: 0)
+            startTime = preceding.start
+            if preceding.segment.index != origin?.index {
+                note(preceding.segment.url, ranged: preceding.segment.byteRange != nil)
+            }
+            // Preroll can add a range or a new spelling of the init's resource. Reopen
+            // all its spellings together and check that the earlier reads still agree.
+            if let initKey, let initU = pl.initURL, pinnedKeys().contains(initKey),
+               let urls = spellings[initKey], urls.contains(where: { sources[$0] == nil }) {
+                if renditions == nil {
+                    for url in urls { sources.removeValue(forKey: url) }
+                }
+                try await pinSelection(initKey)
+                let pinnedInit = try await readInit(initU)
+                guard pinnedInit.initial == initData, pinnedInit.origin == originData else { throw HTTPError.rangeUnsupported }
+            }
         }
         var clockOnly = false
-        if let origin, let initData {
-            let muxed = MP4Muxer.hasPictureAndSound(initData)
-            if muxed || separateTracks {
-                func prepend(_ segment: HLSVals.Segment) {
-                    selected.insert(segment, at: 0)
-                    if resourceKey(segment.url) != initKey { note(segment.url, ranged: segment.byteRange != nil) }
-                }
-                if muxed, let preceding {
-                    prepend(preceding.segment)
-                    startTime = preceding.start
-                }
-                if selected.first?.index != origin.index {
-                    prepend(origin)
-                    clockOnly = true
-                }
-            }
+        if let origin, selected.first?.index != origin.index {
+            selected.insert(origin, at: 0)
+            clockOnly = true
         }
         let shared = pinnedKeys()
         let wholeReads = WholeReads(renditions == nil ? repeated.subtracting(shared) : [])
         if let initKey, let initData { try await wholeReads.check(initKey, initData) }
-        for key in shared where key != initKey { try await pin(key) }
+        for key in shared { try await pinSelection(key) }
         let pinned = sources
 
         actor KeyStore {
@@ -625,6 +691,8 @@ public enum HLSEngine {
             func currentBytes() -> Int64 { totalBytes }
         }
 
+        let firstKey = prepared?.key
+        let firstKeyURL = prepared?.playlist.segments.first?.keyURL
         let keyStore = KeyStore()
         let tracker = ProgressTracker(totalSegs: selected.count)
         let concurrency = max(1, min(16, connections))
@@ -650,11 +718,23 @@ public enum HLSEngine {
                         let seg = selected[pos]
                         let segFile = segWorkDir.appendingPathComponent(String(format: "%06d.seg", pos))
                         let resource = resourceKey(seg.url)
-                        var raw = try await fetchPart(seg.url, range: seg.byteRange, client: client, headers: headers, source: pinned[seg.url], renditions: renditions)
+                        var raw: Data
+                        if pos == 0, seg.index == origin?.index, let originData {
+                            raw = originData
+                        } else if seg.index == 0, let first = prepared?.first {
+                            raw = first
+                        } else {
+                            raw = try await fetchPart(seg.url, range: seg.byteRange, client: client, headers: headers, source: pinned[seg.url], renditions: renditions)
+                        }
                         try await wholeReads.check(resource, raw)
                         if let kurl = seg.keyURL {
                             try Task.checkCancellation()
-                            let key = try await keyStore.get(kurl, client: client, headers: headers)
+                            let key: Data
+                            if let firstKey, kurl == firstKeyURL {
+                                key = firstKey
+                            } else {
+                                key = try await keyStore.get(kurl, client: client, headers: headers)
+                            }
                             raw = try decryptAES128(data: raw, key: key, iv: seg.iv, sequence: seg.mediaSequence)
                         }
                         try raw.write(to: segFile, options: .atomic)
@@ -678,23 +758,17 @@ public enum HLSEngine {
             firstBytes = initData.prefix(16)
         }
         var totalDur: Double = 0
-        var firstTimes: [UInt32: UInt64] = [:], trackStartTicks: [UInt32: UInt64] = [:]
+        var zero = prepared?.zero
         for pos in 0..<selected.count {
             try Task.checkCancellation()
             if !clockOnly || pos > 0 { totalDur += selected[pos].duration }
             let segFile = segWorkDir.appendingPathComponent(String(format: "%06d.seg", pos))
             let d = try Data(contentsOf: segFile, options: .mappedIfSafe)
-            if clockOnly {
-                if pos == 0 { firstTimes = try MP4Muxer.firstDecodeTimes(in: d); continue }
-                if pos == 1 {
-                    let starts = try MP4Muxer.firstDecodeTimes(in: d)
-                    guard starts.keys == firstTimes.keys else { throw HTTPError.rangeUnsupported }
-                    for (id, ticks) in starts {
-                        guard let first = firstTimes[id], ticks >= first else { throw HTTPError.rangeUnsupported }
-                        trackStartTicks[id] = ticks - first
-                    }
-                }
+            if findZero, pos == 0, section != nil, selected[0].index == 0 {
+                // Media that cannot be timed keeps the playlist clock (`startTime`).
+                zero = try? presentationStart(of: d, initialization: initData)
             }
+            if clockOnly && pos == 0 { continue }
             if firstBytes.isEmpty { firstBytes = d.prefix(16) }
             try fh.write(contentsOf: d)
         }
@@ -705,7 +779,49 @@ public enum HLSEngine {
         try FileManager.default.moveItem(at: partOut, to: destination)
 
         let isFMP4 = initData != nil || (firstBytes.count >= 8 && String(decoding: firstBytes[4..<8], as: UTF8.self) == "ftyp") || (firstBytes.first != 0x47)
-        return (isFMP4, totalDur, startTime, trackStartTicks)
+        return (isFMP4, totalDur, startTime, zero)
+    }
+
+    /// The first presented time of one segment over its tracks, as FFmpeg reports `start_time`.
+    private static func presentationStart(of segment: Data, initialization: Data?) throws -> SectionTimeBase {
+        if let initialization { return try MP4Muxer.presentationStart(of: segment, initialization: initialization) }
+        guard segment.first == 0x47 else { throw HTTPError.rangeUnsupported }
+        let (tracks, starts) = TSDemuxer.demux(segment)
+        return try MP4Muxer.presentationStart(of: tracks, starts: starts)
+    }
+
+    /// Read the sound's clock before choosing the clip. Keep the playlist and bytes
+    /// so that the later fetch uses the same edition and does not repeat these reads.
+    static func prepareSection(client: HTTPClient, playlistURL: String, headers: [String: String]?,
+                               renditions: RenditionEditions) async throws -> SectionOrigin {
+        let (text, finalURL) = try await client.fetchText(url: playlistURL, headers: headers)
+        let pl = parseMediaPlaylist(text, baseURL: finalURL)
+        var origin = SectionOrigin(playlist: pl, finalURL: finalURL)
+        guard !pl.isLive, let first = pl.segments.first, pl.segments.last?.discontinuity == 0 else { return origin }
+
+        if let url = pl.initURL, resourceKey(url) == resourceKey(first.url), pl.initByteRange != nil || first.byteRange != nil {
+            // Even a whole read must use the pinned edition when it shares a ranged resource.
+            try await pin(resourceKey(url), urls: url == first.url ? [url] : [url, first.url],
+                          sources: &origin.sources, client: client, headers: headers, renditions: renditions)
+        }
+        func read(_ url: String, _ range: ByteRange?) async throws -> Data {
+            if range != nil, origin.sources[url] == nil {
+                try await pin(resourceKey(url), urls: [url], sources: &origin.sources,
+                              client: client, headers: headers, renditions: renditions)
+            }
+            return try await fetchPart(url, range: range, client: client, headers: headers, source: origin.sources[url], renditions: renditions)
+        }
+        if let url = pl.initURL { origin.initialization = try await read(url, pl.initByteRange) }
+        let raw = try await read(first.url, first.byteRange)
+        origin.first = raw
+        var data = raw
+        if let keyURL = first.keyURL {
+            let (key, _) = try await client.fetchData(url: keyURL, headers: headers)
+            origin.key = key
+            data = try decryptAES128(data: raw, key: key, iv: first.iv, sequence: first.mediaSequence)
+        }
+        origin.zero = try? presentationStart(of: data, initialization: origin.initialization)
+        return origin
     }
 
     private static func recordLiveStream(

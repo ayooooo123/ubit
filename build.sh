@@ -140,9 +140,10 @@ ln -sf "$MACOS/ubit" "$DIST/ubit"
 # System bsdtar, owned by root:wheel, so that the archive does not hold the
 # account name of the person who built it or macOS extended attributes.
 # AppleDouble (._*) files are left out. Every entry gets the time of the last
-# commit (or SOURCE_DATE_EPOCH), the entries go in byte order and gzip -n
-# writes no time, so the same build gives the same archive bytes.
-EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || echo 0)}"
+# commit of this checkout (or SOURCE_DATE_EPOCH), whatever the caller's current
+# directory is. The entries go in byte order and gzip -n writes no time, so the
+# same build gives the same archive bytes.
+EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 0)}"
 STAMP=$(date -u -r "$EPOCH" +%Y-%m-%dT%H:%M:%SZ)
 (cd "$DIST" && find uBit.app -name '._*' -prune -o -exec touch -h -d "$STAMP" {} + \
   && find uBit.app -name '._*' -prune -o -print | LC_ALL=C sort > .pack-list \

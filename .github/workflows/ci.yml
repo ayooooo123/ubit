@@ -38,10 +38,10 @@ jobs:
           test -z "$others" || { echo "$others"; exit 1; }
           # macOS tar hides ._ entries when it lists an archive, so Python reads the names.
           python3 -c 'import sys, tarfile; bad = [n for n in tarfile.open(sys.argv[1]).getnames() if n.rsplit("/", 1)[-1].startswith("._")]; print(*bad, sep="\n"); sys.exit(1 if bad else 0)' dist/ubit-*-darwin-arm64.tar.gz
-      - name: A second build gives the same archive bytes
+      - name: A second build, started outside the checkout, gives the same archive bytes
         run: |
           cp dist/ubit-*-darwin-arm64.tar.gz "$RUNNER_TEMP/first.tar.gz"
-          ./build.sh
+          (cd "$RUNNER_TEMP" && "$GITHUB_WORKSPACE/build.sh")
           cmp "$RUNNER_TEMP/first.tar.gz" dist/ubit-*-darwin-arm64.tar.gz
       - name: Upload macOS release archive
         uses: actions/upload-artifact@v4
@@ -86,11 +86,14 @@ jobs:
           sdk/cargo.sh build --locked --offline
           find target -name '*.rlib' -print0 | xargs -0 ./tests/home-paths.sh
           # Control: the same build without the remap must hold home paths, or the scan proves nothing.
+          # Only real path matches count; a file that the scan cannot read fails the control.
           cargo build --locked --offline --target-dir plain-target
-          if find plain-target -name '*.rlib' -print0 | xargs -0 ./tests/home-paths.sh > plain-scan.log; then
-            echo "the scan passed an SDK built without the remap"; exit 1
-          fi
-          echo "$(grep -c '^FAIL' plain-scan.log) of $(wc -l < plain-scan.log) unremapped rlibs hold a home path"
+          find plain-target -name '*.rlib' -print0 | xargs -0 ./tests/home-paths.sh > plain-scan.log || true
+          unread=$(grep -c -e ': no such readable file$' -e ': grep could not read the file$' plain-scan.log || true)
+          matches=$(grep -c ': [0-9]* lines with a home-directory path$' plain-scan.log || true)
+          echo "$matches of $(wc -l < plain-scan.log) unremapped rlibs hold a home path; $unread could not be read"
+          test "$unread" -eq 0 || { grep -e 'no such readable' -e 'could not read' plain-scan.log; exit 1; }
+          test "$matches" -gt 0 || { echo "the scan found no home path in an SDK built without the remap"; exit 1; }
           sdk/cargo.sh test --locked --offline
       - name: Upload Linux & Android release archives
         uses: actions/upload-artifact@v4

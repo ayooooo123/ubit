@@ -162,43 +162,59 @@ public enum SponsorAndSubtitles {
         s.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
     }
 
-    /// Named references that page text uses for punctuation and spaces.
-    private static let namedEntities: [String: Character] = [
-        "amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": " ",
-        "rsquo": "\u{2019}", "lsquo": "\u{2018}", "rdquo": "\u{201D}", "ldquo": "\u{201C}",
-        "ndash": "\u{2013}", "mdash": "\u{2014}", "hellip": "\u{2026}",
+    /// Named references for the whitespace and punctuation used by captions and notices.
+    private static let namedEntities: [Substring: Unicode.Scalar] = [
+        "amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'",
+        "AMP": "&", "LT": "<", "GT": ">", "QUOT": "\"",
+        "nbsp": "\u{A0}", "NonBreakingSpace": "\u{A0}", "Tab": "\t", "NewLine": "\n",
+        "ensp": "\u{2002}", "emsp": "\u{2003}", "emsp13": "\u{2004}", "emsp14": "\u{2005}",
+        "numsp": "\u{2007}", "puncsp": "\u{2008}", "thinsp": "\u{2009}", "ThinSpace": "\u{2009}",
+        "hairsp": "\u{200A}", "VeryThinSpace": "\u{200A}", "MediumSpace": "\u{205F}",
+        "rsquo": "’", "rsquor": "’", "CloseCurlyQuote": "’", "lsquo": "‘", "OpenCurlyQuote": "‘",
+        "rdquo": "”", "ldquo": "“", "ndash": "–", "mdash": "—", "hellip": "…",
+        "period": ".", "excl": "!", "quest": "?",
     ]
 
-    /// Decodes decimal (`&#8217;`) and hexadecimal (`&#x2019;`) character references and the
-    /// names in `namedEntities`, in one pass, so `&amp;#39;` stays `&#39;`. A reference that is
-    /// unknown, malformed or names no valid character stays as it is.
+    /// Decode once. HTML numeric references start with ASCII digits, never a sign.
     public static func decodeHTMLEntities(_ s: String) -> String {
-        guard s.contains("&") else { return s }
-        var out = ""
-        out.reserveCapacity(s.count)
-        var i = s.startIndex
-        while i < s.endIndex {
-            guard s[i] == "&", let semi = s[i...].prefix(12).firstIndex(of: ";") else {
-                out.append(s[i])
-                i = s.index(after: i)
-                continue
+        let bytes = s.utf8
+        guard var amp = bytes.firstIndex(of: 0x26) else { return s }
+        var out = String(s[..<amp])
+        while amp < bytes.endIndex {
+            let start = bytes.index(after: amp)
+            var end = start
+            var scalar: Unicode.Scalar?
+            if end < bytes.endIndex, bytes[end] == 0x23 {
+                bytes.formIndex(after: &end)
+                let hex = end < bytes.endIndex && (bytes[end] == 0x78 || bytes[end] == 0x58)
+                if hex { bytes.formIndex(after: &end) }
+                let digits = end
+                while end < bytes.endIndex {
+                    let c = bytes[end]
+                    guard (0x30...0x39).contains(c) || (hex && (0x41...0x46).contains(c & 0xDF)) else { break }
+                    bytes.formIndex(after: &end)
+                }
+                if end > digits, let code = UInt32(s[digits..<end], radix: hex ? 16 : 10) {
+                    // HTML maps these two Windows-1252 values to their Unicode quotes.
+                    scalar = Unicode.Scalar(code == 145 ? 0x2018 : code == 146 ? 0x2019 : code)
+                    if end < bytes.endIndex, bytes[end] == 0x3B { bytes.formIndex(after: &end) }
+                }
+            } else if let semicolon = bytes[start...].prefix(17).firstIndex(of: 0x3B),
+                      let named = namedEntities[s[start..<semicolon]] {
+                scalar = named
+                end = bytes.index(after: semicolon)
+            } else if bytes[start...].starts(with: "nbsp".utf8) {
+                scalar = "\u{A0}"
+                end = bytes.index(start, offsetBy: 4)
             }
-            let body = s[s.index(after: i)..<semi]
-            var decoded: Character?
-            if body.hasPrefix("#x") || body.hasPrefix("#X") {
-                decoded = UInt32(body.dropFirst(2), radix: 16).flatMap(Unicode.Scalar.init).map(Character.init)
-            } else if body.hasPrefix("#") {
-                decoded = UInt32(body.dropFirst(), radix: 10).flatMap(Unicode.Scalar.init).map(Character.init)
+            if let scalar {
+                out.unicodeScalars.append(scalar)
             } else {
-                decoded = namedEntities[String(body)]
+                out.append("&")
+                end = start
             }
-            if let decoded {
-                out.append(decoded)
-                i = s.index(after: semi)
-            } else {
-                out.append(s[i])
-                i = s.index(after: i)
-            }
+            amp = bytes[end...].firstIndex(of: 0x26) ?? bytes.endIndex
+            out.append(contentsOf: s[end..<amp])
         }
         return out
     }

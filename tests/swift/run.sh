@@ -1,6 +1,6 @@
 #!/bin/sh
 # Compiles tests/swift/RegressionChecks.swift with the app sources (without Sources/main.swift)
-# and runs each case in its own process with its own UBIT_CONFIG_DIR. No case uses the network.
+# and runs each case in its own process with its own UBIT_CONFIG_DIR. Network fixtures use loopback only.
 # Usage: tests/swift/run.sh [case ...]   (default: every case)
 set -eu
 
@@ -37,7 +37,18 @@ swiftc \
 
 # visitor-first and visitor-reuse share one config directory: the second process must reuse
 # the visitor ID that the first one stored. Naming visitor-reuse alone runs visitor-first first.
-CASES="${*:-optional-refusal metadata-refusal embed-disabled imgur-405 imgur-reset watch-gate notice-bot notice-bot-text notice-entity notice-entity-number notice-age notice-traffic notice-summary notice-widget plain-inert plain-no-state plain-hidden plain-closed-details plain-secondary-summary plain-unlisted plain-lessons ok-reason redirect-google redirect-ordinary player-gate watch-status player-status probe-status download-status download-stream-status playability-status watch-challenge-cookie player-challenge-cookie visitor-first visitor-reuse pace-concurrent pace-retry player-body-lost player-timeout retry-5xx retry-429 refusal-body-reset refusal-body-stall range-refusal refusal-headers-only lost-after-headers transport-unreached transport-timeout lost-before-response cancel-slots cancel-middle pace-late-wake wall-unusable-cookie auth-header cache cache-context cache-scope cache-cancelled normal watch-flags cancel-download dash-refusal cancel-watch cancel-player cancel-probe hls-fallback hls-fallback-nowatch hls-fallback-watchlist hls-fallback-lateprofile cli-flags sigint-info sigint-formats sigint-get proxy-values proxy-stored safari-values safari-expiry-sentinels safari-infinite-expiry chromium}"
+CASES="${*:-optional-refusal metadata-refusal embed-disabled imgur-405 imgur-reset watch-gate
+    notice-bot notice-bot-text notice-entity notice-entity-number notice-entity-alias notice-entity-space notice-entity-legacy
+    notice-age notice-traffic notice-summary notice-widget plain-inert plain-no-state plain-hidden plain-closed-details
+    plain-secondary-summary plain-unlisted plain-lessons plain-entity-sign plain-entity-split plain-script-inline plain-raw-closer
+    ok-reason ok-null-screen ok-error-screen redirect-google redirect-sorry-root redirect-ordinary redirect-visitor redirect-visitor-ordinary
+    player-gate watch-status player-status probe-status download-status download-stream-status playability-status watch-challenge-cookie player-challenge-cookie
+    visitor-first visitor-reuse pace-concurrent pace-retry player-body-lost player-body-reset player-timeout retry-5xx retry-429
+    refusal-body-reset refusal-body-stall range-refusal range-start-cancel refusal-headers-only lost-after-headers transport-unreached
+    transport-timeout lost-before-response cancel-slots cancel-middle pace-late-wake wall-unusable-cookie auth-header cache
+    cache-context cache-scope cache-cancelled normal watch-flags cancel-download dash-refusal cancel-watch cancel-player cancel-probe
+    hls-fallback hls-fallback-nowatch hls-fallback-watchlist hls-fallback-lateprofile cli-flags sigint-info sigint-formats sigint-get
+    proxy-values proxy-port-overflow proxy-stored safari-values safari-expiry-sentinels safari-infinite-expiry chromium}"
 
 failed=""
 for case in $CASES; do

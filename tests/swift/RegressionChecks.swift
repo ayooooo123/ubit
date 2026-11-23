@@ -2,9 +2,8 @@
 //
 // `tests/swift/run.sh` compiles this file together with every app source except
 // `Sources/main.swift` and runs one case per process, each with its own UBIT_CONFIG_DIR.
-// A local URLProtocol answers every HTTP request, so no case reaches the network. The
-// protocol is put into each ephemeral URLSession configuration (HTTPClient uses
-// `URLSessionConfiguration.ephemeral`), and every case first checks that it is in place.
+// A local URLProtocol answers fixture URLs. Cases that test the real transport use
+// a loopback server. Every case first checks that the fixture protocol is installed.
 //
 // Exit codes: 0 pass, 1 fail, 2 setup failure. A trap (signal) also counts as a failure.
 
@@ -153,6 +152,11 @@ final class FixtureProtocol: URLProtocol {
         case ("i.imgur.com", "/abcreset.mp4"):
             // A connection reset before the status that URLSession reports as a POSIX error.
             failure = NSError(domain: NSPOSIXErrorDomain, code: Int(ECONNRESET))
+        case (_, "/sw.js_data") where mode.hasPrefix("redirect-visitor"):
+            deliveredURL = URL(string: mode == "redirect-visitor"
+                               ? "https://accounts.google.com/ServiceLogin"
+                               : "https://fixture.invalid/sorry/article")!
+            data = Data("visitor data is absent".utf8)
         case (_, let path) where path.hasPrefix("/embed/"):
             // Embedding is disabled, so the page carries its own UNPLAYABLE decision.
             let decision = #"{"playabilityStatus":{"status":"UNPLAYABLE","reason":"Playback on other websites has been disabled by the video owner."}}"#
@@ -180,6 +184,9 @@ final class FixtureProtocol: URLProtocol {
                     player = nil
                 case "ok-reason":
                     player = Self.playerPayload(status: "OK", reason: "Sign in to confirm your age", streaming: nil, title: title)
+                case "ok-null-screen", "ok-error-screen":
+                    let screen: Any = mode == "ok-null-screen" ? NSNull() : ["playerErrorMessageRenderer": ["reason": "fixture"]]
+                    player?["playabilityStatus"] = ["status": "OK", "reason": "Sign in to confirm your age", "errorScreen": screen]
                 default:
                     break
                 }
@@ -194,6 +201,7 @@ final class FixtureProtocol: URLProtocol {
                 let omitVisitor = forcedStage == "watch"
                     || ["watch-gate", "wall-unusable-cookie", "watch-challenge-cookie"].contains(mode)
                     || mode.hasPrefix("notice-")
+                    || mode.hasPrefix("redirect-visitor")
                 let visitor = omitVisitor ? nil : (mode == "visitor-reuse" ? Self.secondVisitor : Self.firstVisitor)
                 switch mode {
                 case let notice where notice.hasPrefix("notice-"):
@@ -205,6 +213,7 @@ final class FixtureProtocol: URLProtocol {
                 }
                 if mode == "cancel-watch" { failure = URLError(.cancelled) }
                 if mode == "redirect-google" { deliveredURL = URL(string: "https://accounts.google.com/ServiceLogin")! }
+                if mode == "redirect-sorry-root" { deliveredURL = URL(string: "https://www.google.com/sorry/?continue=fixture")! }
                 if mode == "redirect-ordinary" { deliveredURL = URL(string: "https://fixture.invalid/sorry/article")! }
             }
         case (_, let path) where path.hasSuffix("/player"):
@@ -233,7 +242,7 @@ final class FixtureProtocol: URLProtocol {
                     streaming: Self.directStreaming(playerNumber, hls: true),
                     title: "\(title)-\(playerNumber)"
                 ))
-            } else if mode == "player-body-lost" && playerNumber == 1 {
+            } else if ["player-body-lost", "player-body-reset"].contains(mode) && playerNumber == 1 {
                 // HTTP 200 and half of an ordinary body, then the connection breaks. Trailing
                 // spaces make the half larger than the 512 bytes that URLSession can hold back to
                 // sniff the content type.
@@ -311,8 +320,10 @@ final class FixtureProtocol: URLProtocol {
             // Half of the body, then the connection breaks a moment later, after URLSession has
             // handed over the response.
             client!.urlProtocol(self, didLoad: data.prefix(data.count / 2))
+            let error: Error = mode == "player-body-reset" ? NSError(domain: NSPOSIXErrorDomain, code: Int(ECONNRESET))
+                : URLError(.networkConnectionLost)
             DispatchQueue.global().asyncAfter(deadline: .now() + 0.35) {
-                self.client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+                self.client?.urlProtocol(self, didFailWithError: error)
             }
             return
         }
@@ -424,6 +435,12 @@ final class FixtureProtocol: URLProtocol {
             html += "<p>Sign in to confirm you&rsquo;re not a bot.</p>"
         case "notice-entity-number":
             html += "<p>Sign&#32;in to confirm you&#x2019;re not a bot.</p>"
+        case "notice-entity-alias":
+            html += "<p>Sign in to confirm you&CloseCurlyQuote;re not a bot.</p>"
+        case "notice-entity-space":
+            html += "<p>Sign&ensp;in to confirm your age.</p>"
+        case "notice-entity-legacy":
+            html += "<p>Sign&nbspin to confirm you&#146re not a bot.</p>"
         case "notice-bot-text":
             html += "<div>Sign in to confirm you're not a bot</div>"
         case "notice-age":
@@ -480,6 +497,14 @@ final class FixtureProtocol: URLProtocol {
             html += "<p>Playback is blocked? Check your speaker mute switch.</p>"
             html += "<p>This lesson explains why a server displays the text: sign in to confirm you're not a bot.</p>"
             html += "<p>This tutorial explains why shared NAT networks trigger a detected unusual traffic alert.</p></article>"
+        case "plain-entity-sign":
+            html += "<p>Sign in to confirm you&#x+27;re not a bot.</p>"
+        case "plain-entity-split":
+            html += "<p>Sign in to confirm you&r<span></span>squo;re not a bot.</p>"
+        case "plain-script-inline":
+            html += "<p>This lesson explains why a page says <script>var sample = 1;</script>sign in to confirm your age.</p>"
+        case "plain-raw-closer":
+            html += "<script>var sample = '</scriptor><p>Sign in to confirm your age.</p>';</script>"
         case "plain-hidden":
             html += "<!-- Optional g-recaptcha component not loaded. -->"
             html += "<div hidden><p>Sign in to confirm your age.</p></div>"
@@ -776,31 +801,41 @@ struct RegressionChecks {
             if case HTTPError.noStatus? = failure as? HTTPError { unknown = true }
             check(unknown && hosts == ["i.imgur.com"],
                   "a POSIX reset before the status is an unknown status that allows no later request; error=\(String(describing: failure)), hosts=\(hosts)")
-        // An OK playability status allows playback. A listed sentence as its reason is only
-        // information, so extraction goes on to the player.
-        case "ok-reason":
+        case "ok-reason", "ok-null-screen", "ok-error-screen":
             let error = await extractError()
-            check(error == nil && FixtureProtocol.playerCount() == 1,
-                  "OK with a listed reason and no visible notice is not a challenge; error=\(String(describing: error)), players=\(FixtureProtocol.playerCount())")
-        // A watch page that ends on Google's sign-in host is a challenge. A `/sorry/` path on
-        // another host is an ordinary page.
-        case "redirect-google", "redirect-ordinary":
-            let error = await extractError()
-            let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
-            if mode == "redirect-google" {
-                check(closedByBotGate(error) && paths == ["/watch"],
-                      "a watch page that ends on accounts.google.com stops at once; error=\(String(describing: error)), paths=\(paths)")
+            if mode == "ok-error-screen" {
+                var denied = false
+                if case ExtractorError.playbackDenied? = error as? ExtractorError { denied = true }
+                let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
+                check(denied && paths == ["/watch"],
+                      "a real error screen with OK stops at the watch page; error=\(String(describing: error)), paths=\(paths)")
             } else {
                 check(error == nil && FixtureProtocol.playerCount() == 1,
+                      "a reason and an absent or null error screen do not turn OK into a refusal; error=\(String(describing: error))")
+            }
+        // A watch page that ends on Google's sign-in host is a challenge. A `/sorry/` path on
+        // another host is an ordinary page.
+        case "redirect-google", "redirect-sorry-root", "redirect-ordinary", "redirect-visitor", "redirect-visitor-ordinary":
+            let error = await extractError()
+            let paths = FixtureProtocol.requests().map(\.url.path).filter { $0 != "/sanity" }
+            switch mode {
+            case "redirect-google", "redirect-sorry-root":
+                check(closedByBotGate(error) && paths == ["/watch"],
+                      "a listed final URL stops after the watch page; error=\(String(describing: error)), paths=\(paths)")
+            case "redirect-visitor":
+                check(closedByBotGate(error) && paths == ["/watch", "/sw.js_data"],
+                      "the visitor request can end extraction even when its body has no visitor data; error=\(String(describing: error)), paths=\(paths)")
+            default:
+                check(error == nil && FixtureProtocol.playerCount() == 1 && paths.contains("/sw.js_data") == (mode == "redirect-visitor-ordinary"),
                       "a /sorry/ path on a host that is not Google is not a challenge; error=\(String(describing: error)), paths=\(paths)")
             }
         // A /player body that breaks off after HTTP 200 had a known status, so the player tries
         // again in its next pacing slot. A timeout before the status is not tried again.
-        case "player-body-lost", "player-timeout":
+        case "player-body-lost", "player-body-reset", "player-timeout":
             let start = now()
             let error = await extractError()
             let offsets = playerOffsets(from: start)
-            if mode == "player-body-lost" {
+            if mode != "player-timeout" {
                 check(error == nil && offsets.count == 2 && keepsSlots(offsets),
                       "a broken 2xx body is tried again in the next 3 s slot; error=\(String(describing: error)), offsets from the start=\(offsets)")
             } else {
@@ -1073,6 +1108,25 @@ struct RegressionChecks {
             let refused = ranges.refused ?? ""
             check(httpStatus(failure) == 403 && seen[refused] == 1 && !FileManager.default.fileExists(atPath: file.path),
                   "a refused range is requested once and ends the transfer without a final file; refused=\(refused), ranges=\(seen), error=\(String(describing: failure))")
+        case "range-start-cancel":
+            let size = 1 << 20
+            let origin = WireOrigin { connection, _, _ in
+                WireOrigin.transmit(connection, "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-0/\(size)\r\nETag: \"fixture\"\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx")
+                close(connection)
+            }
+            let file = AppPaths.appSupportDir.appendingPathComponent("cancel-at-start.bin")
+            let transfer = Task {
+                try await HTTPClient().downloadFile(url: "http://127.0.0.1:\(origin.port)/file.bin", destination: file, connections: 2) { done, _ in
+                    if done == 0 { withUnsafeCurrentTask { $0?.cancel() } }
+                }
+            }
+            do {
+                try await transfer.value
+                check(false, "the cancelled transfer returned success")
+            } catch is CancellationError {
+                check(origin.requests == 1 && !FileManager.default.fileExists(atPath: file.path),
+                      "cancel at first progress leaves no final file and starts no range workers; requests=\(origin.requests)")
+            }
         // URLSession can hold a response until some of its body arrives. A 403 that sends its
         // headers and then no body reaches uBit as a timeout, so its status is unknown; neither
         // fetchData, a probe, a parallel range worker nor a single stream sends that request
@@ -1450,6 +1504,13 @@ struct RegressionChecks {
                     && added == 0 && !leaked && stderrText.contains("invalid")
                     && !storedBad && !storedSocks4a && !storedHighPort && storedGood && routed && capitalPort,
                   "invalid proxies exit 2 before any request without repeating the value, settings refuse them, valid ones are installed and a capital SOCKS5 scheme gets port 1080; formats=\(formats), info=\(info), get=\(get), socks4=\(socks4), socks4a=\(socks4a), getSocks4=\(getSocks4), settings=\(settingsSocks4a), port 65536=\(highPort), port 0=\(zeroPort), requests=\(added), password in stderr=\(leaked), storedBad=\(storedBad), storedSocks4a=\(storedSocks4a), storedHighPort=\(storedHighPort), resolved=\(resolved)")
+        case "proxy-port-overflow":
+            let before = FixtureProtocol.requests().count
+            let value = "http://[::1]:\(UInt64.max)"
+            let code = await CLIRunner.run(arguments: ["ubit", "info", "--no-cookies", "--proxy", value, "https://fixture.invalid/video"])
+            let count = FixtureProtocol.requests().count - before
+            check(code == 2 && count == 0 && HTTPClient.isValidProxy("http://[::1]"),
+                  "a port that cannot be represented is invalid; an omitted IPv6 port is valid; exit=\(code), requests=\(count)")
         case "proxy-stored":
             // A proxy that was stored before validation existed (or typed into settings.json)
             // must fail the command, not send the request without a proxy. Its error must not

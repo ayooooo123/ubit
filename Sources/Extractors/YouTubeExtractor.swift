@@ -232,9 +232,11 @@ public struct YouTubeExtractor: SiteExtractor {
               let status = decision["status"] as? String else {
             throw ExtractorError.playbackDenied("YouTube did not confirm playback.")
         }
-        // An OK status allows playback; a reason next to it is only information.
+        // A reason is informational on OK. A non-null error screen still denies playback.
         if status == "OK" {
-            if decision["errorScreen"] != nil { throw ExtractorError.playbackDenied("YouTube declined playback.") }
+            if let screen = decision["errorScreen"], !(screen is NSNull) {
+                throw ExtractorError.playbackDenied("YouTube declined playback.")
+            }
             return
         }
         let reason = decision["reason"] as? String ?? ""
@@ -255,7 +257,7 @@ public struct YouTubeExtractor: SiteExtractor {
 
     /// True when one sentence of a visible text block is one of `noticeSentences`.
     private static func isNotice(_ block: String) -> Bool {
-        block.replacingOccurrences(of: "’", with: "'")
+        block.replacingOccurrences(of: "’", with: "'").replacingOccurrences(of: "‘", with: "'")
             .split(whereSeparator: { ".!?".contains($0) })
             .contains { noticeSentences.contains($0.trimmingCharacters(in: .whitespaces)) }
     }
@@ -265,7 +267,8 @@ public struct YouTubeExtractor: SiteExtractor {
     private static func checkChallengeRedirect(_ url: URL) throws {
         let host = url.host?.lowercased() ?? ""
         let google = host == "google.com" || host.hasSuffix(".google.com")
-        if (google && url.path.hasPrefix("/sorry/")) || host == "accounts.google.com"
+        let path = URLComponents(url: url, resolvingAgainstBaseURL: true)?.path ?? ""
+        if (google && path.hasPrefix("/sorry/")) || host == "accounts.google.com"
             || host == "consent.youtube.com" || host == "consent.google.com" {
             throw ExtractorError.botGate("YouTube")
         }
@@ -319,10 +322,12 @@ public struct YouTubeExtractor: SiteExtractor {
             ctx.sts = ExtractorUtils.firstMatch("\"signatureTimestamp\"\\s*:\\s*(\\d+)", in: html).flatMap(Int.init)
         }
         if ctx.visitorData == nil,
-           let (sw, _) = try await ExtractorUtils.optionalRequest({ try await client.fetchText(url: "https://www.youtube.com/sw.js_data", includeCookies: false) }),
-           let v = ExtractorUtils.firstMatch("\"(Cgt[A-Za-z0-9_-]{10,})\"", in: sw) {
-            ctx.visitorData = v
-            await YTGuard.shared.saveVisitor(v)
+           let (sw, pageURL) = try await ExtractorUtils.optionalRequest({ try await client.fetchText(url: "https://www.youtube.com/sw.js_data", includeCookies: false) }) {
+            try Self.checkChallengeRedirect(pageURL)
+            if let v = ExtractorUtils.firstMatch("\"(Cgt[A-Za-z0-9_-]{10,})\"", in: sw) {
+                ctx.visitorData = v
+                await YTGuard.shared.saveVisitor(v)
+            }
         }
         return ctx
     }
@@ -616,11 +621,8 @@ public struct YouTubeExtractor: SiteExtractor {
                 return response
             } catch HTTPError.status(let code, _) where attempt < 2 && [500, 502, 503, 504].contains(code) {
                 attempt += 1
-            } catch let error as URLError where attempt < 2 && error.code != .cancelled {
-                // `responseBytes` turns every failure before the status into `noStatus`, except
-                // one that proves that the request never reached the server. Any other URLError
-                // here broke off the body of a 2xx answer, so the status is known and allows a
-                // new attempt, which waits for its own pacing permit.
+            } catch where attempt < 2 && HTTPClient.canRetryData(error) {
+                // An accepted body can fail after the status. Retrying still needs a permit.
                 attempt += 1
             }
         }

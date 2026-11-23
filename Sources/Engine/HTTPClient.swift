@@ -211,16 +211,34 @@ public final class HTTPClient: @unchecked Sendable {
         }
     }
 
+    /// `responseBytes` converts uncertain pre-status failures to `noStatus`. A POSIX reset
+    /// that reaches this check therefore interrupted a body after an accepted status.
+    static func canRetryData(_ error: Error) -> Bool {
+        if let transport = error as? URLError { return transport.code != .cancelled }
+        let cause = error as NSError
+        return cause.domain == NSPOSIXErrorDomain && cause.code == Int(ECONNRESET)
+    }
+
     /// True for a proxy URL that `init` can install: an http, https, socks, socks5 or socks5h
     /// scheme, a host, and no port or a TCP port from 1 to 65535. URLSession speaks SOCKS
     /// version 5 for every socks scheme, so socks4 and socks4a are refused. Any other string
     /// would leave the session without a working proxy, so callers reject it instead of
     /// sending the requests.
     public static func isValidProxy(_ proxy: String) -> Bool {
-        guard let url = URL(string: proxy), let host = url.host, !host.isEmpty,
-              let scheme = url.scheme?.lowercased() else { return false }
-        if let port = url.port, !(1...65535).contains(port) { return false }
-        return ["http", "https", "socks", "socks5", "socks5h"].contains(scheme)
+        proxySettings(proxy) != nil
+    }
+
+    private static func proxySettings(_ value: String) -> (host: String, port: Int, socks: Bool)? {
+        guard let parts = URLComponents(string: value), let host = parts.url?.host, !host.isEmpty,
+              let scheme = parts.scheme?.lowercased(),
+              ["http", "https", "socks", "socks5", "socks5h"].contains(scheme) else { return nil }
+        let socks = scheme.hasPrefix("socks")
+        if let port = parts.port {
+            guard (1...65535).contains(port) else { return nil }
+            return (host, port, socks)
+        }
+        guard parts.rangeOfPort == nil else { return nil }
+        return (host, socks ? 1080 : 8080, socks)
     }
 
     public let session: URLSession
@@ -230,6 +248,7 @@ public final class HTTPClient: @unchecked Sendable {
     public let userAgent: String
     /// The proxy URL this client routes through, or nil for a direct route.
     public let proxy: String?
+    private let invalidProxy: Bool
 
     public init(
         cookies: CookieVault = CookieVault(),
@@ -243,6 +262,8 @@ public final class HTTPClient: @unchecked Sendable {
         self.userAgent = (userAgent?.isEmpty == false) ? userAgent! : Self.defaultBrowserUA
         self.defaultHeaders = extraHeaders
         self.proxy = (proxy?.isEmpty == false) ? proxy : nil
+        let route = self.proxy.flatMap(Self.proxySettings)
+        self.invalidProxy = self.proxy != nil && route == nil
 
         let cfg = URLSessionConfiguration.ephemeral
         cfg.httpCookieAcceptPolicy = .never
@@ -252,9 +273,7 @@ public final class HTTPClient: @unchecked Sendable {
         cfg.timeoutIntervalForResource = 86400
         cfg.waitsForConnectivity = false
 
-        if let p = proxy, !p.isEmpty, let purl = URL(string: p), let host = purl.host {
-            let socks = purl.scheme?.lowercased().hasPrefix("socks") == true
-            let port = purl.port ?? (socks ? 1080 : 8080)
+        if let (host, port, socks) = route {
             if socks {
                 cfg.connectionProxyDictionary = [
                     kCFStreamPropertySOCKSProxyHost as String: host,
@@ -281,6 +300,7 @@ public final class HTTPClient: @unchecked Sendable {
         body: Data? = nil,
         includeCookies: Bool = true
     ) throws -> URLRequest {
+        guard !invalidProxy else { throw HTTPError.badURL("invalid proxy setting") }
         guard let u = URL(string: url) else { throw HTTPError.badURL(url) }
         var req = URLRequest(url: u)
         req.httpMethod = method
@@ -359,9 +379,7 @@ public final class HTTPClient: @unchecked Sendable {
                 throw CancellationError()
             } catch {
                 lastErr = error
-                // A URLError here either proved that the request never reached the server, or
-                // broke off the body of a 2xx answer. Neither hides a refusal.
-                if attempt + 1 < retries, let transport = error as? URLError, transport.code != .cancelled {
+                if attempt + 1 < retries, Self.canRetryData(error) {
                     try await Task.sleep(nanoseconds: UInt64(400_000_000 * (1 << attempt)))
                     continue
                 }
@@ -470,6 +488,7 @@ public final class HTTPClient: @unchecked Sendable {
 
         let initialDone = chunkState.downloadedBytes
         onProgress?(initialDone, total)
+        try Task.checkCancellation()
         if initialDone >= total {
             if FileManager.default.fileExists(atPath: destination.path) {
                 try FileManager.default.removeItem(at: destination)
@@ -517,6 +536,7 @@ public final class HTTPClient: @unchecked Sendable {
         }
 
         await workQueue.flushState()
+        try Task.checkCancellation()
         if FileManager.default.fileExists(atPath: destination.path) {
             try FileManager.default.removeItem(at: destination)
         }

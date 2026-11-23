@@ -166,7 +166,8 @@ public enum ExtractorUtils {
     /// receives the name and the attributes of each visible element.
     static func visibleTextBlocks(in html: String, onElement: (String, [String: String]) -> Void = { _, _ in }) -> [String] {
         let bytes = Array(html.utf8), n = bytes.count
-        var blocks: [String] = [], run: [UInt8] = []
+        var blocks: [String] = []
+        var run = ""
         // `hidden` applies to the content of the element. For a closed `<details>`, `outer` is
         // the state outside it, which its first `<summary>` keeps; `summarySeen` records that
         // the first `<summary>` child has opened.
@@ -186,8 +187,7 @@ public enum ExtractorUtils {
         }
         func flush() {
             guard !run.isEmpty else { return }
-            let text = SponsorAndSubtitles.decodeHTMLEntities(String(decoding: run, as: UTF8.self)).lowercased()
-                .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+            let text = run.lowercased().split(whereSeparator: \.isWhitespace).joined(separator: " ")
             if !text.isEmpty { blocks.append(text) }
             run.removeAll(keepingCapacity: true)
         }
@@ -197,7 +197,11 @@ public enum ExtractorUtils {
             guard bytes[i] == 0x3C else {
                 let start = i
                 while i < n, bytes[i] != 0x3C { i += 1 }
-                if !hidden { run.append(contentsOf: bytes[start..<i]) }
+                if !hidden {
+                    // A character reference cannot span two text nodes.
+                    let text = String(decoding: bytes[start..<i], as: UTF8.self)
+                    run.append(SponsorAndSubtitles.decodeHTMLEntities(text))
+                }
                 continue
             }
             if matches(commentOpen, at: i) {
@@ -214,7 +218,7 @@ public enum ExtractorUtils {
             while k < n, (0x61...0x7A).contains(lower(bytes[k])) || (0x30...0x39).contains(bytes[k]) || bytes[k] == 0x2D || bytes[k] == 0x3A { k += 1 }
             guard k > nameStart, (0x61...0x7A).contains(lower(bytes[nameStart])) else {
                 // A "<" that does not start a tag is text.
-                if !hidden { run.append(bytes[i]) }
+                if !hidden { run.append("<") }
                 i += 1
                 continue
             }
@@ -247,10 +251,11 @@ public enum ExtractorUtils {
                 if !attr.isEmpty { attributes[attr] = value }
             }
             i = min(k + 1, n)
-            let inline = inlineElements.contains(name)
-            if !inline { flush() } else if name == "br" && !hidden { run.append(0x20) }
             if closing {
-                if let index = open.lastIndex(where: { $0.name == name }) { open.removeSubrange(index...) }
+                if let index = open.lastIndex(where: { $0.name == name }) {
+                    if !open[index].outer && !inlineElements.contains(name) { flush() }
+                    open.removeSubrange(index...)
+                }
                 continue
             }
             let style = (attributes["style"] ?? "").lowercased().filter { !$0.isWhitespace }
@@ -262,11 +267,22 @@ public enum ExtractorUtils {
             let isHidden = inherited || attributes["hidden"] != nil || attributes["aria-hidden"]?.lowercased() == "true"
                 || style.contains("display:none") || style.contains("visibility:hidden")
                 || (name == "dialog" && attributes["open"] == nil) || name == "template" || name == "noscript"
-            if !isHidden { onElement(name, attributes) }
             if rawTextElements.contains(name) {
-                let end = find(Array("</\(name)".utf8), from: i)
-                i = end.flatMap { find([0x3E], from: $0) }.map { $0 + 1 } ?? n
+                if name == "iframe" && !isHidden { onElement(name, attributes) }
+                let close = Array("</\(name)".utf8)
+                var end = find(close, from: i)
+                while let hit = end {
+                    let after = hit + close.count
+                    if after == n || isSpace(bytes[after]) || bytes[after] == 0x3E || bytes[after] == 0x2F { break }
+                    end = find(close, from: after)
+                }
+                i = end.flatMap { find([0x3E], from: $0 + close.count) }.map { $0 + 1 } ?? n
                 continue
+            }
+            if !isHidden {
+                if name == "br" { run.append(" ") }
+                if !inlineElements.contains(name) { flush() }
+                onElement(name, attributes)
             }
             if !voidElements.contains(name) && !selfClosing {
                 let closedDetails = name == "details" && attributes["open"] == nil

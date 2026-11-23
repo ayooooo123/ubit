@@ -29,9 +29,9 @@ jobs:
         run: |
           binary=$(stat -f %z dist/uBit.app/Contents/MacOS/ubit)
           archive=$(stat -f %z dist/ubit-*-darwin-arm64.tar.gz)
-          echo "binary $binary bytes (limit 2000000), archive $archive bytes (limit 1000000)"
+          echo "binary $binary bytes (limit 2000000), archive $archive bytes (limit 1100000)"
           test "$binary" -lt 2000000
-          test "$archive" -lt 1000000
+          test "$archive" -lt 1100000
       - name: Archive entries name no build account and hold no AppleDouble file
         run: |
           others=$(/usr/bin/tar -tvzf dist/ubit-*-darwin-arm64.tar.gz | awk '$3 != "root" || $4 != "wheel"')

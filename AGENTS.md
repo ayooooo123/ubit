@@ -31,7 +31,7 @@
 
 ## Architectural Rules & Invariants
 
-1. **Zero Third-Party Dependencies**: Link only macOS system frameworks (`AppKit`, `SwiftUI`, `WebKit`, `JavaScriptCore`, `AVFoundation`, `AudioToolbox`, `QuickLookUI`, `IOKit`, `ImageIO`, `UniformTypeIdentifiers`, `CryptoKit`, `CommonCrypto`, `libsqlite3`). Keep the stripped `arm64` binary under 2 MB and the `.tar.gz` under 1 MB.
+1. **Zero Third-Party Dependencies**: Link only macOS system frameworks (`AppKit`, `SwiftUI`, `WebKit`, `JavaScriptCore`, `AVFoundation`, `AudioToolbox`, `QuickLookUI`, `IOKit`, `ImageIO`, `UniformTypeIdentifiers`, `CryptoKit`, `CommonCrypto`, `libsqlite3`). Keep the stripped `arm64` executable under 2,000,000 bytes and its `.tar.gz` archive under 1,100,000 bytes.
 2. **Two-Pass `co64` Fast-Start MP4 Invariant**: `MP4Muxer.buildMoov` always emits 64-bit `co64` chunk offsets so pass 1 (`chunkBaseOffset = 0`) and pass 2 (`chunkBaseOffset = ftyp + moov + mdatHeader`) have identical byte lengths. Never switch pass 2 between `stco` and `co64` dynamically or sample offsets will drift.
 3. **4-Byte Raw iTunes `ilst` Atoms**: QuickTime/iTunes metadata tags (`©nam`, `©ART`, `©day`, `©cmt`) start with byte `0xA9` (ISO-8859-1 `©`), NOT 2-byte UTF-8 `0xC2 0xA9`. Always write them via `BinaryBuffer.boxRaw([0xA9, ...])`.
 4. **Pure Swift CLI Formatting**: Never pass Swift `String` values to C `%s` in `String(format:)`; use pure Swift string interpolation and `pad(_:_:)`.

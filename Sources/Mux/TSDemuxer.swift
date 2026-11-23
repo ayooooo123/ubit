@@ -11,8 +11,12 @@ public enum TSDemuxer {
     }
 
     public static func demuxToTracks(tsFileURL: URL) throws -> [MP4Track] {
-        let data = try Data(contentsOf: tsFileURL, options: .mappedIfSafe)
-        guard data.count >= 188 else { return [] }
+        try demux(Data(contentsOf: tsFileURL, options: .mappedIfSafe)).tracks
+    }
+
+    /// The tracks, and the stream time (90 kHz) where the first sample of each track decodes.
+    static func demux(_ data: Data) -> (tracks: [MP4Track], starts: [UInt32: SectionTimeBase]) {
+        guard data.count >= 188 else { return ([], [:]) }
 
         // Locate initial 0x47 sync byte
         var startOff = 0
@@ -118,13 +122,16 @@ public enum TSDemuxer {
         flushAudioPES()
 
         var outTracks: [MP4Track] = []
-        if let vTrack = buildH264Track(from: vUnits) {
+        var starts: [UInt32: SectionTimeBase] = [:]
+        if let (vTrack, firstDTS) = buildH264Track(from: vUnits) {
             outTracks.append(vTrack)
+            starts[vTrack.trackID] = SectionTimeBase(ticks: firstDTS, timescale: 90_000)
         }
-        if let aTrack = buildAACTrack(from: aFrames) {
+        if let aTrack = buildAACTrack(from: aFrames), let first = aFrames.first {
             outTracks.append(aTrack)
+            starts[aTrack.trackID] = SectionTimeBase(ticks: first.pts90k, timescale: 90_000)
         }
-        return outTracks
+        return (outTracks, starts)
     }
 
     private static func parsePES(_ pes: Data) -> (pts: Int64, dts: Int64, es: Data)? {
@@ -187,11 +194,12 @@ public enum TSDemuxer {
         return nalus
     }
 
-    private static func buildH264Track(from units: [RawAccessUnit]) -> MP4Track? {
+    private static func buildH264Track(from units: [RawAccessUnit]) -> (MP4Track, firstDTS: Int64)? {
         guard !units.isEmpty else { return nil }
         var sps: Data?
         var pps: Data?
         var mp4Samples: [MP4Sample] = []
+        var firstDTS: Int64?
 
         for (idx, u) in units.enumerated() {
             let nalus = splitAnnexBNALUs(u.payload)
@@ -212,6 +220,7 @@ public enum TSDemuxer {
             }
             guard hasVCL, avccSample.count > 0 else { continue }
 
+            if firstDTS == nil { firstDTS = u.dts90k }
             let nextDTS = (idx + 1 < units.count) ? units[idx + 1].dts90k : (u.dts90k + 3000)
             let dur = UInt32(clamping: max(1, nextDTS - u.dts90k))
             let cts = Int32(clamping: u.pts90k - u.dts90k)
@@ -224,7 +233,7 @@ public enum TSDemuxer {
             ))
         }
 
-        guard let sps, sps.count >= 4, let pps, !mp4Samples.isEmpty else { return nil }
+        guard let sps, sps.count >= 4, let pps, let firstDTS, !mp4Samples.isEmpty else { return nil }
         let (width, height) = parseH264SPSDimensions(sps)
 
         var stsd = BinaryBuffer()
@@ -258,7 +267,7 @@ public enum TSDemuxer {
             }
         }
 
-        return MP4Track(
+        let track = MP4Track(
             trackID: 1,
             kind: .video,
             timescale: 90_000,
@@ -267,6 +276,7 @@ public enum TSDemuxer {
             stsdPayload: stsd.data,
             samples: mp4Samples
         )
+        return (track, firstDTS)
     }
 
     private static func parseH264SPSDimensions(_ sps: Data) -> (UInt16, UInt16) {

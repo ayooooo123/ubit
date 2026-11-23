@@ -299,8 +299,10 @@ public enum DASHEngine {
             return
         }
 
-        let workDir = destination.deletingLastPathComponent().appendingPathComponent(".\(destination.lastPathComponent).dsegs", isDirectory: true)
+        let workDir = destination.deletingLastPathComponent()
+            .appendingPathComponent(".segs-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workDir) }
 
         var initData: Data?
         if let initU = rep.initURL {
@@ -338,12 +340,6 @@ public enum DASHEngine {
                     while let idx = await cur.next() {
                         try Task.checkCancellation()
                         let f = workDir.appendingPathComponent(String(format: "%06d.m4s", idx))
-                        if let attrs = try? FileManager.default.attributesOfItem(atPath: f.path),
-                           let sz = attrs[.size] as? Int64, sz > 0 {
-                            let (b, est, frac) = await prog.record(sz)
-                            onProgress?(b, est, frac)
-                            continue
-                        }
                         let (d, _) = try await client.fetchData(url: segs[idx], headers: headers)
                         try d.write(to: f, options: .atomic)
                         let (b, est, frac) = await prog.record(Int64(d.count))
@@ -351,14 +347,15 @@ public enum DASHEngine {
                     }
                 }
             }
-            try await group.waitForAll()
+            for try await _ in group {}
         }
 
-        let partOut = destination.appendingPathExtension("part")
+        let partOut = workDir.appendingPathComponent("assembled")
         FileManager.default.createFile(atPath: partOut.path, contents: nil)
         let fh = try FileHandle(forWritingTo: partOut)
         if let initData { try fh.write(contentsOf: initData) }
         for idx in 0..<segs.count {
+            try Task.checkCancellation()
             let f = workDir.appendingPathComponent(String(format: "%06d.m4s", idx))
             try fh.write(contentsOf: try Data(contentsOf: f))
         }
@@ -367,6 +364,5 @@ public enum DASHEngine {
             try FileManager.default.removeItem(at: destination)
         }
         try FileManager.default.moveItem(at: partOut, to: destination)
-        try? FileManager.default.removeItem(at: workDir)
     }
 }

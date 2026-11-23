@@ -2,7 +2,7 @@
 
 `ubit` is designed as a deterministic, zero-paywall media acquisition and clip-extraction tool for autonomous agents, scripts, multimodal VLM workflows, and ASR pipelines.
 
-A single 1.6 MB native macOS `arm64` binary (`ubit`) handles extraction across 35+ sites, multi-connection work-stealing HTTP `Range` downloads, HLS/DASH segment assembly, `sidx` byte-range clip trimming, ISO-BMFF MP4/M4A muxing, and `AudioToolbox`/`AVFoundation` WAV/FLAC/MOV conversion — with **no Python, no `yt-dlp`, and no `ffmpeg` required** for standard containers.
+A native macOS `arm64` binary (`ubit`) handles extraction across 35+ sites, parallel HTTP range downloads, HLS and DASH, and MP4/M4A muxing. The macOS build limits are 2,000,000 bytes for the executable and 1,100,000 bytes for the archive. The Swift engine needs no Python, `yt-dlp` or `ffmpeg` for standard containers.
 
 ---
 
@@ -33,8 +33,11 @@ Prints **only** the final absolute path(s) on `stdout` (one path per line) and e
 VIDEO_PATH="$(ubit get -q 720 --no-library --quiet -o /tmp/work 'https://www.youtube.com/watch?v=aqz-KE-bpKQ')"
 ```
 
-### Pattern B: Fast Byte-Range Clip Extraction (`--section`) for Multimodal / VLM Inspection
-When an agent only needs to inspect or verify a specific timestamp window (e.g., `1:15` to `1:30` of a 2-hour video), `--section` reads the remote MP4 `sidx` Segment Index in the first 64 KB and fetches **only** the `init` box plus the overlapping byte ranges, cutting cleanly on the preceding sync keyframe:
+### Pattern B: Extract a Clip (`--section`)
+
+The macOS Swift engine starts video at the last sync picture at or before the requested start. It shows no picture whose presentation time is at or after the requested end. It can keep extra pictures for decoding without showing them.
+
+For direct MP4 downloads, a usable `sidx` and a server that supports byte ranges can reduce the bytes that uBit fetches. When uBit cannot use that index, it can fetch the whole file before trimming. For HLS, uBit fetches overlapping segments and can also fetch the initialization data, the first segment for timing and a preceding segment for decoding. For VOD HLS on one timeline with media timestamps, section time zero is the first presented time across picture and sound, including a separate audio rendition. DASH fetches the representation before trimming. Raw MP3 does not get a sample-level trim.
 
 ```sh
 ubit get -q 720 --section 1:15-1:30 --no-library --quiet -o /tmp/clips "$URL"
@@ -98,7 +101,7 @@ When `--json` is passed to `ubit get`, `stdout` emits strictly valid newline-del
 | `process` | Post-download stage begins | `stage` (`"Removing sponsors"`, `"Merging"`, `"Converting to WAV"`, etc.) |
 | `stopping` | First `SIGINT` received on a live stream | *(none — live recording is finalizing into a playable MP4)* |
 | `done` | Output file atomically committed | `path`, `size` (bytes), `seconds` (wall time) |
-| `stopped` | Download paused/interrupted (`SIGINT`) | `url` (`.part` + `.part.json` preserved for resume) |
+| `stopped` | Download interrupted (`SIGINT`) | `url` |
 | `error` | Recoverable or terminal failure | `url`, `error` (human-readable message) |
 
 ---
@@ -110,7 +113,7 @@ When `--json` is passed to `ubit get`, `stdout` emits strictly valid newline-del
 | `0` | All URLs succeeded | Read output path from `done.path` or `--quiet` stdout |
 | `1` | Extraction, auth, DRM, network, provider refusal, or challenge error | Inspect `error`. A provider refusal or challenge is terminal for that URL: do not retry with another identity or route. For ordinary auth-gated content, pass `--cookies` / `--cookies-from-browser firefox` or ask the user to sign in via `ubit browse <url>` |
 | `2` | Invalid CLI usage / flag syntax | Fix invocation flags (check `ubit get --help`) |
-| `130` | Interrupted (`SIGINT`) | Re-run the exact same command to resume from `.part` + `.part.json` |
+| `130` | Interrupted (`SIGINT`) | Re-run the same command. A direct HTTP transfer can resume if the `.part` and `.part.json` files identify bytes from the same resource and strong ETag. HLS and DASH start again. |
 
 ---
 

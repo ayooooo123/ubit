@@ -1,6 +1,6 @@
 # uBit Development Guide (`AGENTS.md`)
 
-`uBit` is an ultra-small (~1.6 MB binary, ~862 KB `.tar.gz`), zero-dependency native macOS (`arm64`) video/audio downloader app and CLI written in pure Swift. One executable (`uBit.app/Contents/MacOS/ubit`) serves both as the native `AppKit`/`SwiftUI`/`WebKit` desktop app (when launched with no arguments) and as the script/agent CLI (when invoked with arguments).
+`uBit` is a native macOS (`arm64`) video and audio downloader written in Swift. One executable (`uBit.app/Contents/MacOS/ubit`) serves as the AppKit/SwiftUI/WebKit app when launched with no arguments and as the CLI when invoked with arguments.
 
 ## Layout
 
@@ -11,10 +11,10 @@
 | `Sources/Core/Cookies.swift` | `CookieVault`: Netscape `cookies.txt` parser/writer, read-only Firefox `cookies.sqlite` importer (`libsqlite3`), Safari `Cookies.binarycookies` reader (`SafariBinaryCookies`), and `WKHTTPCookieStore` exporter; Chromium-family names throw `CookieError.browserNotSupported` |
 | `Sources/Core/QueueAndSubs.swift` | Thread-safe `LibraryStore`, `SubscriptionStore`, `@MainActor QueueManager`, `IOKit` idle-sleep assertion (`IOPMAssertionCreateWithName`), Dock progress badge, and `AF_UNIX` socket IPC (`LocalIPC`) |
 | `Sources/Engine/HTTPClient.swift` | Ephemeral `URLSession` client (SOCKS5/HTTP proxy, token-bucket `RateLimiter`, 5xx retry/backoff; a refusal status (401, 403, 407, 410, 429, 451) or a failure before the status ends the request, except a failure that proves no connection) and `WorkStealingQueue` multi-connection HTTP `Range` downloader (`pwrite` into `.part` + `.part.json`) |
-| `Sources/Engine/HLS.swift` | Master & media M3U8 parser (`#EXT-X-STREAM-INF`, `#EXT-X-MEDIA` separate audio renditions, `#EXT-X-MAP`, `#EXT-X-BYTERANGE`, `CommonCrypto` `AES-128-CBC` decryption, parallel segment worker pool, live HLS recorder) |
+| `Sources/Engine/HLS.swift` | Parses master and media playlists, keeps repeated reads in one edition, decrypts AES-128 segments and fetches live or on-demand media. For one-timeline VOD clips, the first presented picture or audio sample sets time zero. |
 | `Sources/Engine/DASH.swift` | MPEG-DASH `.mpd` XML parser (`AdaptationSet`, `Representation`, `SegmentTemplate` `$Number$`/`$Time$`, `SegmentTimeline`), parallel segment fetcher |
 | `Sources/Mux/MP4Box.swift` | Zero-dependency ISO-BMFF reader/writer: parses `stbl` + fragmented `moof`/`traf`/`trun` + `sidx`, plans byte-range sections, trims at sync keyframes, excises SponsorBlock sample intervals, builds `tx3g` subtitle & `chap`/`chpl` chapter tracks, writes `ilst` metadata (`©nam`, `©ART`, `©day`, `©cmt`, `desc`, `covr`), and emits fast-start MP4/M4A (`ftyp` + `moov` + `mdat`) |
-| `Sources/Mux/TSDemuxer.swift` | Pure-Swift 188-byte MPEG-TS (`PAT`/`PMT`/`PES`) demuxer converting Annex-B H.264 (`SPS`/`PPS` → `avcC`) and ADTS AAC (`esds`) into `MP4Track`s |
+| `Sources/Mux/TSDemuxer.swift` | Converts 188-byte MPEG-TS with H.264 Annex B and ADTS AAC to MP4 tracks. Reports the first decode time of each track on the transport clock for section trimming. |
 | `Sources/Engine/SponsorBlock.swift` | Privacy-preserving 4-hex SHA-256 prefix SponsorBlock client, description chapter parser, WebVTT/SRT/XML subtitle parser, and timeline squeezer |
 | `Sources/Engine/Converter.swift` | Native `AVFoundation`/`AudioToolbox` converter (`mov`, `m4a`, `wav`, `aiff`, `flac`), `ImageIO` baseline JPEG cover normalizer, `com.apple.metadata:kMDItemWhereFroms` binary plist `setxattr`, Music/TV AppleScript importer, and optional system `ffmpeg` passthrough (`mp3`, `opus`, `mkv`, `webm`) |
 | `Sources/Engine/DownloadEngine.swift` | Full download pipeline (`FormatSelector`, `sidx` fast section fetch, provider-refusal handling: HTTP 401, 403, 407, 410, 429, 451 or a playability challenge ends the operation; no stale refresh, identity fallback or route fallback; muxing, sidecars, `DownloadEventPayload` emission) |
@@ -29,6 +29,7 @@
 | `tests/home-paths.sh` | Fails when a binary or rlib holds the home-directory path of the machine that built it, or when it cannot read the file; CI runs it on the macOS, Linux and Android binaries and on the SDK rlibs. `tests/home-paths-selftest.sh` makes its own home directory and a symlink to it, and proves that the scan rejects both spellings, also for a file name that starts with `-`. The CI control build of the SDK without the remap must give at least one real path match and no unreadable file |
 | `sdk/cargo.sh` | Runs `cargo` with `--remap-path-prefix` (rustc) and `-ffile-prefix-map` plus `-fdebug-prefix-map` (C/C++ and the assembler; gcc before 12 needs the second for ring's `.S` files) for `$HOME` and the checkout, so that uBit and its dependencies build without home-directory paths |
 | `tests/swift/run.sh` | Builds `tests/swift/RegressionChecks.swift` with the app sources and runs each Swift regression case in its own process against a local `URLProtocol` fixture and loopback test servers (no external network) |
+| `tests/media/gate.py` | Generates MP4, M4A, HLS and DASH files with FFmpeg. Compares two Swift CLI builds on loopback and requires exact output pictures and bounded byte use. |
 
 ## Architectural Rules & Invariants
 
@@ -38,7 +39,7 @@
 4. **Pure Swift CLI Formatting**: Never pass Swift `String` values to C `%s` in `String(format:)`; use pure Swift string interpolation and `pad(_:_:)`.
 5. **CLI Machine Contract Compatibility**: Keep NDJSON event names (`start`, `info`, `progress`, `process`, `stopping`, `done`, `stopped`, `error`) and exit codes (`0`, `1`, `2`, `130`) stable; update `ubit --llms`, `docs/agents.md`, and `skills/ubit/SKILL.md` together whenever CLI flags or JSON fields change.
 6. **Terminal Provider Refusals (macOS Swift CLI)**: An HTTP 401, 403 (access denied), 407, 410, 429 or 451, or a playability or verification challenge ends that URL's operation, also for optional requests. Do not add a retry with a different URL, client identity or route after a refusal. A failure before the status is repeated only when it proves that the request never reached the server. Only the closed list of notice sentences in `docs/agents.md` counts as a visible YouTube notice; do not add guesses about other wording. Do not present a byte-range probe as a completed provider verification. Sign-in cookies remain valid for ordinary authenticated requests.
-7. **Platform Scope**: The invariants above describe the Swift macOS app and CLI. `linux/src/` is a separate C++ engine for the Linux, Termux/Android and WASM builds and the Rust SDK. Do not copy macOS refusal guarantees into the C++ engine docs.
+7. **Platform Scope**: The invariants above describe the Swift macOS app and CLI. `linux/src/` is a separate C++ engine for Linux, Termux/Android, WASM and the Rust SDK. Do not apply the Swift guarantees for refusals or sections to that engine.
 
 ## Build & E2E Verification Commands
 
@@ -56,6 +57,9 @@
 
 # Offline Swift regression checks (YouTube pacing/cache/sign-in, notices, provider refusals, proxy values, Safari cookies)
 ./tests/swift/run.sh
+
+# Offline media gate. BASE_UBIT and HEAD_UBIT are paths to built Swift CLIs.
+python3 tests/media/gate.py "$BASE_UBIT" "$HEAD_UBIT"
 
 # Live E2E: sidx byte-range clip download + native ISO-BMFF MP4 mux + metadata
 UBIT_CONFIG_DIR=/tmp/ubit-e2e ./dist/ubit get -q 720 --section 0:05-0:15 --no-library --json -o /tmp/ubit-e2e 'https://www.youtube.com/watch?v=aqz-KE-bpKQ'

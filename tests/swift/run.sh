@@ -48,7 +48,17 @@ CASES="${*:-optional-refusal metadata-refusal embed-disabled imgur-405 imgur-res
     transport-timeout lost-before-response cancel-slots cancel-middle pace-late-wake wall-unusable-cookie auth-header cache
     cache-context cache-scope cache-cancelled normal watch-flags cancel-download dash-refusal cancel-watch cancel-player cancel-probe
     hls-fallback hls-fallback-nowatch hls-fallback-watchlist hls-fallback-lateprofile cli-flags sigint-info sigint-formats sigint-get
-    proxy-values proxy-port-overflow proxy-stored safari-values safari-expiry-sentinels safari-infinite-expiry chromium}"
+    proxy-values proxy-port-overflow proxy-stored safari-values safari-expiry-sentinels safari-infinite-expiry chromium
+    edit-delay edit-negative-cts edit-sponsor-cut section-zero
+    hls-alias-changed hls-alias-stable hls-changed-edition hls-clock-mux hls-clock-short hls-decimal hls-dot-routes hls-dot-same
+    hls-event-oversized hls-event-ranged hls-event-whole hls-live-changed hls-live-dot-routes hls-live-dot-tagged hls-live-stable
+    hls-live-userinfo hls-live-v6-scope hls-live-whole hls-live-whole-changed hls-ntsc hls-raw-routes hls-raw-section
+    hls-redirect-live hls-redirect-vod hls-repeat-changed hls-repeat-stable hls-section-base hls-section-clip hls-section-outside
+    hls-short-range hls-untagged-edition hls-userinfo-changed hls-v6-forms hls-v6-scope http-raw-section
+    paired-clock paired-plain-a paired-plain-b paired-plain-changed paired-tagged-a paired-tagged-b paired-tagged-changed
+    parallel-cancel parallel-intact parallel-redirect parallel-short parallel-unvalidated range-ignored
+    sidx-boundaries sidx-cut sidx-fragments sidx-padding sidx-untagged-change sidx-untagged-grow
+    trim-boundaries trim-display-end trim-keyframe}"
 
 failed=""
 for case in $CASES; do
